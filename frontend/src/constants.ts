@@ -1,0 +1,6 @@
+// 前端常量：与 backend/.env 的 API_KEYS 对应
+// 本地开发默认 API Key（后端配置的合法 key），未手动配置时兜底使用
+export const DEFAULT_API_KEY = "sk-dev-key-1";
+export const API_KEY_STORAGE_KEY = "harness_api_key";
+export const MODEL_STORAGE_KEY = "harness_model";
+export const BASE_URL_STORAGE_KEY = "harness_base_url";

@@ -1,0 +1,56 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: harness-postgres
+    environment:
+      POSTGRES_USER: harness
+      POSTGRES_PASSWORD: harness
+      POSTGRES_DB: harness
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harness -d harness"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: harness-redis
+    ports:
+      - "6379:6379"
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: harness-backend
+    env_file:
+      - ../backend/.env.example
+    environment:
+      DATABASE_URL: postgresql+psycopg://harness:harness@postgres:5432/harness
+      REDIS_URL: redis://redis:6379/0
+      APP_ENV: dev
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: harness-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:

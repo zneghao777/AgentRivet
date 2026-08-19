@@ -1,0 +1,127 @@
+"""FastAPI 入口：CORS、路由挂载、启动钩子。"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from .agents.demo_subagent import build_demo_subagent
+from .agents.registry import agent_registry
+from .api import (
+    router_admin,
+    router_chat,
+    router_knowledge,
+    router_sessions,
+    router_skills,
+    router_tools,
+)
+from .config import settings
+from .harness.app_runtime import harness_app
+from .observability import audit
+from .observability.tracing import init_tracing
+from .skills.manager import skill_manager
+from .storage.checkpointer import get_checkpointer
+from .storage.db import AsyncSessionLocal, create_tables
+from .tools.registry import tool_registry
+
+logging.basicConfig(
+    level=logging.DEBUG if settings.DEBUG else logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """启动钩子：建表、初始化工具/Skill/Agent、编译图、初始化观测。"""
+    # 配置校验
+    _validate_config()
+
+    # 建表
+    await create_tables()
+
+    # 工具注册
+    tool_registry.register_builtin()
+
+    # Skill 发现
+    async with AsyncSessionLocal() as db:
+        await skill_manager.discover(db)
+
+    # 子 Agent 注册
+    agent_registry.register(build_demo_subagent())
+
+    # Checkpointer + 图编译
+    try:
+        checkpointer = await get_checkpointer()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Checkpointer 初始化失败（%s），使用无持久化模式", exc)
+        checkpointer = None
+    harness_app.build(tool_registry, checkpointer=checkpointer)
+
+    # 观测
+    init_tracing()
+    audit.init_audit(lambda: AsyncSessionLocal())
+
+    logger.info(
+        "Harness 就绪：app=%s env=%s tools=%d skills=%d multi_agent=%s",
+        settings.APP_NAME,
+        settings.APP_ENV,
+        len(tool_registry.snapshot()),
+        len(skill_manager.all()),
+        settings.MULTI_AGENT_ENABLED,
+    )
+    yield
+
+
+def _validate_config() -> None:
+    """启动时校验关键配置。"""
+    if settings.LLM_API_KEY == "":
+        logger.warning("LLM_API_KEY 未配置，接口调用将返回错误事件（允许启动）")
+    if not settings.api_keys_list:
+        logger.warning(
+            "API_KEYS 未配置；prod 环境将拒绝所有请求，dev 环境使用默认 key"
+        )
+    if settings.APP_ENV == "prod":
+        missing = []
+        if not settings.LLM_API_KEY:
+            missing.append("LLM_API_KEY")
+        if not settings.api_keys_list:
+            missing.append("API_KEYS")
+        if missing:
+            raise RuntimeError(f"prod 环境缺少关键配置: {', '.join(missing)}")
+
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version="0.1.0",
+    docs_url="/docs",
+    openapi_url="/openapi.json",
+    lifespan=lifespan,
+)
+
+# CORS（生产需限制白名单）
+ALLOWED_ORIGINS = ["*"] if settings.APP_ENV != "prod" else []
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+API = settings.API_PREFIX
+app.include_router(router_sessions.router, prefix=API)
+app.include_router(router_chat.router, prefix=API)
+app.include_router(router_skills.router, prefix=API)
+app.include_router(router_tools.router, prefix=API)
+app.include_router(router_knowledge.router, prefix=API)
+app.include_router(router_admin.router, prefix=API)
+
+
+@app.get("/")
+async def root():
+    return {"app": settings.APP_NAME, "env": settings.APP_ENV, "docs": "/docs"}
