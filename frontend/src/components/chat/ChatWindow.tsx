@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
+import { Select } from "antd";
 import MessageList from "./MessageList";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { streamChat } from "@/api/sse";
-import type { SkillItem } from "@/types/api";
+import { getData } from "@/api/http";
+import type { KnowledgeBaseItem, SkillItem } from "@/types/api";
 import { summarize } from "@/utils/format";
 
 export default function ChatWindow({
@@ -16,10 +18,18 @@ export default function ChatWindow({
     setSessionTitle } = useSessionStore();
   const apiKey = useSettingsStore((state) => state.apiKey);
   const [text, setText] = useState("");
+  const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseItem[]>([]);
+  const [selectedKbs, setSelectedKbs] = useState<string[]>([]);
   const abortRef = useRef<AbortController | null>(null);
   const deltaFrameRef = useRef<number | null>(null);
   const pendingDeltaRef = useRef("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    getData<KnowledgeBaseItem[]>("/knowledge-bases")
+      .then((items) => setKnowledgeBases(items.filter((kb) => kb.status === "active")))
+      .catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     if (currentSessionId) inputRef.current?.focus();
@@ -61,6 +71,7 @@ export default function ChatWindow({
       await streamChat(sessionId, {
         message,
         skills: skills.filter((skill) => skill.enabled).map((skill) => skill.name),
+        ...(selectedKbs.length > 0 ? { knowledge_bases: selectedKbs } : {}),
       }, {
         onMessageDelta: (delta) => {
           if (!isCurrent()) return;
@@ -103,6 +114,20 @@ export default function ChatWindow({
 
       <footer className="composer-area">
         {!currentSessionId ? <div className="composer-hint">请先新建或选择一个会话</div> : null}
+        <div className="composer-kb-bar">
+          <span className="material-symbols-rounded">database</span>
+          <Select
+            mode="multiple"
+            size="small"
+            allowClear
+            placeholder="绑定知识库（可选，Agent 将基于其检索回答）"
+            maxTagCount={3}
+            value={selectedKbs}
+            onChange={setSelectedKbs}
+            style={{ flex: 1, minWidth: 0, maxWidth: 560 }}
+            options={knowledgeBases.map((kb) => ({ value: kb.name, label: kb.name }))}
+          />
+        </div>
         <div className="composer">
           <button title="附加"><span className="material-symbols-rounded">add_circle</span></button>
           <textarea ref={inputRef} value={text} rows={1} disabled={streaming || !currentSessionId}

@@ -7,9 +7,10 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { formatTime, summarize } from "@/utils/format";
 
 const FEATURES = [
-  { label: "历史会话", icon: "history", path: "/sessions" },
+  { label: "观测台", icon: "monitoring", path: "/observability" },
   { label: "技能库", icon: "bolt", path: "/skills" },
   { label: "知识库", icon: "database", path: "/knowledge" },
+  { label: "记忆", icon: "memory", path: "/memory" },
   { label: "设置", icon: "settings", path: "/settings" },
 ];
 
@@ -116,11 +117,17 @@ export default function Sidebar() {
       </section>
       <section className="feature-section">
         <div className="eyebrow">功能区</div>
-        {FEATURES.map((item) => (
-          <button key={item.path} className={`feature-row${location.pathname === item.path ? " active" : ""}`} onClick={() => navigate(item.path)}>
-            <span className="material-symbols-rounded">{item.icon}</span>{item.label}
-          </button>
-        ))}
+        {FEATURES.map((item) => {
+          const active =
+            location.pathname === item.path ||
+            (item.path === "/observability" && location.pathname.startsWith("/observability")) ||
+            (item.path !== "/observability" && location.pathname.startsWith(`${item.path}/`));
+          return (
+            <button key={item.path} className={`feature-row${active ? " active" : ""}`} onClick={() => navigate(item.path)}>
+              <span className="material-symbols-rounded">{item.icon}</span>{item.label}
+            </button>
+          );
+        })}
       </section>
       <div className="profile-row">
         <div className="profile-avatar"><span className="material-symbols-rounded">person</span></div>

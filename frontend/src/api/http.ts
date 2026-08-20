@@ -67,6 +67,16 @@ export async function postData<T>(
   return (resp.data.data ?? null) as T;
 }
 
+export async function putData<T>(url: string, body?: unknown): Promise<T> {
+  const resp = await http.put<ApiResponse<T>>(url, body);
+  return (resp.data.data ?? null) as T;
+}
+
+export async function patchData<T>(url: string, body?: unknown): Promise<T> {
+  const resp = await http.patch<ApiResponse<T>>(url, body);
+  return (resp.data.data ?? null) as T;
+}
+
 export async function deleteData<T>(url: string): Promise<T> {
   const resp = await http.delete<ApiResponse<T>>(url);
   return (resp.data.data ?? null) as T;

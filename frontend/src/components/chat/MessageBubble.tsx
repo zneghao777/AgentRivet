@@ -1,6 +1,8 @@
 import { memo, useState } from "react";
 import type { ChatMessage } from "@/stores/sessionStore";
 import { formatTime } from "@/utils/format";
+import { parseReferenceAnchors } from "@/utils/trace";
+import SourceReferenceBadge from "@/components/knowledge/SourceReferenceBadge";
 import MarkdownRenderer from "./MarkdownRenderer";
 
 const SOURCE_RE = /来源[:：]\s*([^\s\])}]+)/g;
@@ -16,10 +18,45 @@ function parseSources(result: string): string[] {
   return sources;
 }
 
+function KnowledgeSources({ result }: { result: string }) {
+  // 溯源锚点优先：渲染可点击的来源徽标，点击跳转知识库分块页（SPEC §4.6-A）
+  const anchors = parseReferenceAnchors(result);
+  if (anchors.length > 0) {
+    return (
+      <div className="src-badge-row">
+        {anchors.map((anchor, index) => (
+          <SourceReferenceBadge
+            key={`${anchor.kbId}-${anchor.chunkId}-${index}`}
+            kbId={anchor.kbId}
+            chunkId={anchor.chunkId}
+            sourceFile={anchor.sourceFile ?? "来源"}
+            score={anchor.score}
+          />
+        ))}
+      </div>
+    );
+  }
+  // 旧数据无锚点：退化为普通来源文本标注
+  const sources = parseSources(result);
+  return (
+    <div className="kb-sources">
+      {sources.length ? (
+        sources.map((source, index) => (
+          <span className="kb-source" key={`${source}-${index}`}>
+            <span className="material-symbols-rounded">description</span>
+            {source}
+          </span>
+        ))
+      ) : (
+        <span className="kb-source">（未命中来源）</span>
+      )}
+    </div>
+  );
+}
+
 function ToolCall({ name, args, result }: { name: string; args?: Record<string, unknown>; result?: string }) {
   const [open, setOpen] = useState(false);
   const isKnowledgeSearch = name === "knowledge_search";
-  const sources = result ? parseSources(result) : [];
   return (
     <div className="tool-call">
       <button onClick={() => setOpen((value) => !value)}>
@@ -31,18 +68,7 @@ function ToolCall({ name, args, result }: { name: string; args?: Record<string, 
       {open && result ? (
         isKnowledgeSearch ? (
           <div className="tool-call-body">
-            <div className="kb-sources">
-              {sources.length ? (
-                sources.map((source, index) => (
-                  <span className="kb-source" key={`${source}-${index}`}>
-                    <span className="material-symbols-rounded">description</span>
-                    {source}
-                  </span>
-                ))
-              ) : (
-                <span className="kb-source">（未命中来源）</span>
-              )}
-            </div>
+            <KnowledgeSources result={result} />
             <pre>{result}</pre>
           </div>
         ) : (

@@ -92,9 +92,16 @@ export interface KnowledgeBaseItem {
 
 export interface KnowledgeDocItem {
   doc_id: number;
+  kb_id?: string | null;
   source_file: string;
+  file_size: number;
+  mime_type: string | null;
+  parse_status: "pending" | "parsing" | "parsed" | "failed" | "reparsing";
+  parse_source: "glm" | "local" | null;
   chunk_count: number;
+  error: string | null;
   created_at: string | null;
+  updated_at: string | null;
 }
 
 export interface KnowledgeBaseDetail {
@@ -106,6 +113,7 @@ export interface KnowledgeUploadResponse {
   kb_id: string;
   doc_id: number;
   source_file: string;
+  parse_status: string;
   chunk_count: number;
 }
 
@@ -119,4 +127,97 @@ export interface KnowledgeHit {
   source_file: string;
   chunk_index: number;
   score: number;
+  kb_id?: string | null;
+  chunk_id?: number | null;
+}
+
+// ---------- 分块治理（KB_MANAGEMENT_SPEC §4.8） ----------
+
+export interface KnowledgeChunkItem {
+  chunk_id: number;
+  kb_id: string;
+  doc_id: number | null;
+  source_file: string;
+  heading: string | null;
+  text: string;
+  char_count: number;
+  enabled: boolean;
+  chunk_index: number;
+  updated_at: string | null;
+}
+
+export interface ChunkListData {
+  items: KnowledgeChunkItem[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface ChunkPreviewItem {
+  index: number;
+  heading: string | null;
+  text: string;
+  char_count: number;
+}
+
+export interface RetrieveHit {
+  chunk_id: number;
+  kb_id: string;
+  source_file: string;
+  text: string;
+  score: number;
+  chunk_index: number;
+}
+
+// ---------- 长期记忆（MEMORY_SPEC §8.5） ----------
+
+export type MemoryType = "semantic" | "episodic";
+export type MemoryStatus = "active" | "pending" | "superseded" | "disabled" | "expired";
+
+export interface MemoryItem {
+  memory_id: number;
+  memory_type: MemoryType;
+  content: string;
+  status: MemoryStatus;
+  confidence: number;
+  source_session_id: string | null;
+  source_summary: string | null;
+  access_count: number;
+  last_accessed_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface MemoryListData {
+  items: MemoryItem[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface MemoryTimelineGroup {
+  date: string;
+  items: MemoryItem[];
+  count: number;
+}
+
+export interface MemoryTimelineData {
+  groups: MemoryTimelineGroup[];
+}
+
+export interface MemoryOverview {
+  total: number;
+  semantic_count: number;
+  episodic_count: number;
+  active_count: number;
+  pending_count: number;
+  disabled_count: number;
+  added_7d: number;
+  top_accessed: MemoryItem[];
+}
+
+export interface MemorySettings {
+  long_term_enabled: boolean;
+  auto_extract: boolean;
+  ttl_days: number;
 }
