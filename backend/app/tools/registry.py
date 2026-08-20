@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from langchain_core.tools import StructuredTool
 
+from ..config import settings
 from .builtin import builtin_calculator, builtin_echo, builtin_get_time
 from .knowledge_search import knowledge_search
 
@@ -56,12 +57,18 @@ class ToolRegistry:
 
     def register_builtin(self) -> None:
         """注册底座内置工具（幂等：已注册则跳过）。"""
-        for tool in (
+        tools = [
             builtin_echo,
             builtin_get_time,
             builtin_calculator,
             knowledge_search,
-        ):
+        ]
+        # memory_search 受 MEMORY_SEARCH_TOOL 开关控制
+        if settings.MEMORY_SEARCH_TOOL:
+            from .memory_search import memory_search
+
+            tools.append(memory_search)
+        for tool in tools:
             if tool.name not in self._tools:
                 self.register(tool, source="builtin")
 

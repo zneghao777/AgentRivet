@@ -30,5 +30,12 @@ dist/
 # 开发日志
 logs/
 
+# Runtime/test artifacts
+data/uploads/
+output/
+
 # LangGraph
 .langgraph_api/
+
+# 知识库上传文件落盘（KB_UPLOAD_DIR）
+backend/data/

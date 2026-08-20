@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from app.config import settings
-from app.knowledge.chunker import chunk_text
+from app.knowledge.chunker import chunk_text, preview_chunks
 
 
 def test_fixed_length_chunking():
@@ -46,6 +46,33 @@ def test_table_chunking():
     )
     chunks = chunk_text(md)
     assert any(c.text.startswith("|") for c in chunks)
+
+
+def test_custom_chunk_size():
+    """自定义 chunk_size 生效（默认 500，窗口可选 256/500/1000）。"""
+    text = "字" * 700
+    small = chunk_text(text, chunk_size=256)
+    large = chunk_text(text, chunk_size=1000)
+    assert all(len(c.text) <= 256 + settings.RAG_CHUNK_OVERLAP for c in small)
+    assert len(large) == 1  # 1000 覆盖全文
+
+
+def test_preview_chunks_pure_function():
+    """preview_chunks 返回 index/heading/text/char_count，不落库。"""
+    md = (
+        "# 第一章\n"
+        "内容一。\n\n"
+        "## 1.1\n"
+        "内容二。\n"
+    )
+    previews = preview_chunks(md)
+    assert len(previews) >= 2
+    assert previews[0]["index"] == 1
+    assert previews[0]["char_count"] == len(previews[0]["text"])
+    assert any(p["heading"] for p in previews)
+    # 不同 chunk_size 产生不同分块数量
+    small = preview_chunks(md, chunk_size=64)
+    assert len(small) >= len(previews)
 
 
 def test_empty_text():

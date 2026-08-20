@@ -15,13 +15,17 @@ from .api import (
     router_admin,
     router_chat,
     router_knowledge,
+    router_memory,
+    router_observability,
     router_sessions,
     router_skills,
     router_tools,
 )
 from .config import settings
 from .harness.app_runtime import harness_app
+from .memory.cleanup import start_ttl_scan, stop_ttl_scan
 from .observability import audit
+from .observability.aggregation import start_metric_worker, stop_metric_worker
 from .observability.tracing import init_tracing
 from .skills.manager import skill_manager
 from .storage.checkpointer import get_checkpointer
@@ -62,9 +66,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         checkpointer = None
     harness_app.build(tool_registry, checkpointer=checkpointer)
 
-    # 观测
-    init_tracing()
+    # 观测（OBSERVABILITY_SPEC）
+    init_tracing(lambda: AsyncSessionLocal())
     audit.init_audit(lambda: AsyncSessionLocal())
+    # 结构化日志 → observability_logs（§8.1）：WARN+ 自动注入 TraceContext
+    from .observability import log_export
+
+    log_export.install_log_handler()
 
     logger.info(
         "Harness 就绪：app=%s env=%s tools=%d skills=%d multi_agent=%s",
@@ -74,7 +82,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         len(skill_manager.all()),
         settings.MULTI_AGENT_ENABLED,
     )
+
+    # 长期记忆 TTL 过期扫描（后台常驻，MEMORY_SPEC §6.3.1）
+    start_ttl_scan()
+    # 可观测性：指标聚合 + span 保留清理（OBSERVABILITY_SPEC §2.4/§2.7）
+    if settings.OBSERVABILITY_ENABLED:
+        start_metric_worker()
+        from .observability.alerts import start_alert_worker
+
+        start_alert_worker()
     yield
+    from .observability.alerts import stop_alert_worker
+
+    await stop_alert_worker()
+    await stop_metric_worker()
+    await stop_ttl_scan()
+    # 采集器 flush（§5.5：进程关闭最多等 5 秒）
+    from .observability import tracing
+
+    await tracing.shutdown_tracing()
 
 
 def _validate_config() -> None:
@@ -119,7 +145,9 @@ app.include_router(router_chat.router, prefix=API)
 app.include_router(router_skills.router, prefix=API)
 app.include_router(router_tools.router, prefix=API)
 app.include_router(router_knowledge.router, prefix=API)
+app.include_router(router_memory.router, prefix=API)
 app.include_router(router_admin.router, prefix=API)
+app.include_router(router_observability.router, prefix=API)
 
 
 @app.get("/")

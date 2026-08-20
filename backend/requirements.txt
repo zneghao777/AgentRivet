@@ -9,8 +9,10 @@ langgraph-checkpoint-postgres>=2.0
 langchain-core>=0.3
 langchain-openai>=0.2
 
-# LangSmith
-langsmith>=0.1
+# 可观测性（本地 OpenLLMetry，OBSERVABILITY_SPEC §2.8）
+traceloop-sdk>=0.16
+opentelemetry-api>=1.24
+opentelemetry-sdk>=1.24
 
 # Data
 sqlalchemy>=2.0

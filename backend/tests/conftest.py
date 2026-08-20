@@ -12,6 +12,10 @@ os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault("API_KEYS", "test-key-1,test-key-2")
 os.environ.setdefault("LLM_API_KEY", "")
 os.environ.setdefault("LANGSMITH_TRACING", "false")
+# 测试默认关闭可观测性落库（OBSERVABILITY_SPEC §4.3），避免 span 写入干扰断言
+os.environ.setdefault("OBSERVABILITY_ENABLED", "false")
+# 测试禁用真实 GLM 解析（否则走真实网络/计费），统一回退本地解析
+os.environ.setdefault("GLM_FILES_API_KEY", "")
 
 
 @pytest_asyncio.fixture(scope="session", autouse=True)

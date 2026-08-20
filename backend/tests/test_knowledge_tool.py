@@ -60,20 +60,32 @@ def _clean_context():
     reset_tool_context()
 
 
+@pytest.fixture(autouse=True)
+def _no_background_parse(monkeypatch):
+    """禁用后台解析调度，测试改为手动 _run_parse（避免并发双跑）。"""
+    monkeypatch.setattr("app.knowledge.service._schedule_parse", lambda doc_id: None)
+
+
 async def _prepare_kb(*, tenant_id: str, name: str | None = None) -> str:
-    """直接经服务层创建知识库并摄取文档，返回 kb_id。"""
+    """直接经服务层创建知识库并摄取文档，返回 kb_id。
+
+    上传为异步解析；测试中同步执行解析任务以消除调度时序依赖。
+    """
+    from app.knowledge.service import _run_parse
+
     async with AsyncSessionLocal() as db:
         kb = await knowledge_service.create(
             db, tenant_id=tenant_id, name=name or _unique("产品手册")
         )
         assert kb is not None
-        await knowledge_service.upload_document(
+        doc = await knowledge_service.upload_document(
             db,
             tenant_id=tenant_id,
             kb_id=kb.id,
             filename="manual.md",
             content=DOC_MD.encode("utf-8"),
         )
+        await _run_parse(doc.id)
         return str(kb.id)
 
 

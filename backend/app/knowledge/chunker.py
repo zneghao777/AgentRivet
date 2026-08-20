@@ -27,6 +27,16 @@ class Chunk:
     heading: str | None = None
 
 
+@dataclass
+class ChunkPreview:
+    """分块预览（不落库）：供前端分块预览渲染（KB_MANAGEMENT_SPEC §3.4）。"""
+
+    index: int
+    heading: str | None
+    text: str
+    char_count: int
+
+
 def _split_by_tables(text: str) -> list[str]:
     """将文本中的表格块独立切出，其余按段返回。"""
     parts: list[str] = []
@@ -41,9 +51,9 @@ def _split_by_tables(text: str) -> list[str]:
     return [p for p in parts if p.strip()]
 
 
-def _fixed_length_chunk(text: str) -> list[str]:
+def _fixed_length_chunk(text: str, chunk_size: int) -> list[str]:
     """固定长度 + 重叠兜底切分。"""
-    size = settings.RAG_CHUNK_SIZE
+    size = chunk_size
     overlap = settings.RAG_CHUNK_OVERLAP
     step = max(1, size - overlap)
     if len(text) <= size:
@@ -55,11 +65,13 @@ def _fixed_length_chunk(text: str) -> list[str]:
     ]
 
 
-def chunk_text(text: str) -> list[Chunk]:
+def chunk_text(text: str, chunk_size: int | None = None) -> list[Chunk]:
     """将纯文本按标题层级 + 固定长度切分为 Chunk 列表。
 
+    chunk_size 可配置（默认 settings.RAG_CHUNK_SIZE，窗口可选 256/500/1000）。
     metadata（heading）由调用方结合 source_file 等补充。
     """
+    size = chunk_size or settings.RAG_CHUNK_SIZE
     chunks: list[Chunk] = []
     # 先按表格块切分
     for block in _split_by_tables(text):
@@ -70,7 +82,9 @@ def chunk_text(text: str) -> list[Chunk]:
         # 按标题层级切分
         matches = list(_HEADING_RE.finditer(block))
         if not matches:
-            chunks.extend(Chunk(text=c) for c in _fixed_length_chunk(block.strip()))
+            chunks.extend(
+                Chunk(text=c) for c in _fixed_length_chunk(block.strip(), size)
+            )
             continue
         positions = [(m.start(), m.group(1), m.group(2).strip()) for m in matches]
         for idx, (start, _level, heading) in enumerate(positions):
@@ -78,11 +92,26 @@ def chunk_text(text: str) -> list[Chunk]:
             section = block[start:end].strip()
             if not section:
                 continue
-            if len(section) <= settings.RAG_CHUNK_SIZE:
+            if len(section) <= size:
                 chunks.append(Chunk(text=section, heading=heading))
             else:
                 # 超长小节：去掉标题行后按固定长度切分
                 body = section
-                for c in _fixed_length_chunk(body):
+                for c in _fixed_length_chunk(body, size):
                     chunks.append(Chunk(text=c, heading=heading))
     return chunks
+
+
+def preview_chunks(
+    text: str, chunk_size: int | None = None
+) -> list[dict]:
+    """纯函数分块预览：不落库，返回 [{index, heading, text, char_count}]。"""
+    return [
+        {
+            "index": index,
+            "heading": chunk.heading,
+            "text": chunk.text,
+            "char_count": len(chunk.text),
+        }
+        for index, chunk in enumerate(chunk_text(text, chunk_size), start=1)
+    ]

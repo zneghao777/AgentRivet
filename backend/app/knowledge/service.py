@@ -1,26 +1,67 @@
-"""KnowledgeService 门面：面向路由与工具的统一入口。
+"""KnowledgeService 门面：文档任务 / 分块治理 / 测试检索（KB_MANAGEMENT_SPEC §3）。
 
 - 知识库 CRUD（租户隔离：所有查询带 tenant_id，越权返回 None 而非抛错泄露存在性）
-- 文档上传/删除
-- 检索（供 knowledge_search 工具与调试接口使用）
+- 文档上传（落盘 + DocumentMeta + 异步解析任务调度）与删除
+- 分块治理：列表 / 预览 / 编辑 / 启停 / 重新向量化
+- 检索（供 knowledge_search 工具与 test-search 调试接口使用）
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..storage.models import KnowledgeBase, KnowledgeChunk
-from .ingest import IngestError, delete_document_chunks, ingest_document
+from ..storage.models import DocumentMeta, KnowledgeBase, KnowledgeChunk
+from .chunker import preview_chunks
+from .embedder import EmbeddingError, embed_texts
+from .files import remove_upload, save_upload
+from .ingest import (
+    IngestError,
+    _refresh_stats,
+    parse_and_ingest,
+    validate_file,
+)
 from .retriever import Hit, retrieve
+
+logger = logging.getLogger(__name__)
+
+# 后台解析并发上限（SPEC §8：有界 Semaphore，如 3）
+PARSE_CONCURRENCY = 3
+_parse_semaphore = asyncio.Semaphore(PARSE_CONCURRENCY)
+_parse_tasks: set[asyncio.Task] = set()
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _schedule_parse(doc_id: int) -> None:
+    """调度后台解析任务（fire-and-forget，独立 session 执行）。"""
+    task = asyncio.create_task(_run_parse(doc_id))
+    _parse_tasks.add(task)
+    task.add_done_callback(_parse_tasks.discard)
+
+
+async def _run_parse(doc_id: int) -> None:
+    """后台解析任务：限并发 + 异常兜底（不向上抛）。"""
+    from ..storage.db import AsyncSessionLocal
+
+    async with _parse_semaphore:
+        try:
+            async with AsyncSessionLocal() as db:
+                doc = await db.get(DocumentMeta, doc_id)
+                if doc is None:
+                    logger.warning("后台解析：文档不存在 doc_id=%s", doc_id)
+                    return
+                await parse_and_ingest(db, doc)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("后台解析任务失败 doc_id=%s: %s", doc_id, exc)
 
 
 class KnowledgeService:
@@ -114,14 +155,26 @@ class KnowledgeService:
     async def delete(
         self, db: AsyncSession, *, tenant_id: str, kb_id: uuid.UUID
     ) -> bool:
-        """软删除知识库（状态置 deleted）；级联物理删除 chunks。"""
+        """软删除知识库（状态置 deleted）；级联物理删除 chunks 与文档元数据/文件。"""
         kb = await self.get(db, tenant_id=tenant_id, kb_id=kb_id)
         if kb is None:
             return False
-        from sqlalchemy import delete as sa_delete
-
+        docs = (
+            (
+                await db.execute(
+                    select(DocumentMeta).where(
+                        DocumentMeta.kb_id == kb_id,
+                        DocumentMeta.tenant_id == tenant_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for doc in docs:
+            await self._delete_doc_record(db, doc, commit=False)
         await db.execute(
-            sa_delete(KnowledgeChunk).where(
+            delete(KnowledgeChunk).where(
                 KnowledgeChunk.kb_id == kb_id,
                 KnowledgeChunk.tenant_id == tenant_id,
             )
@@ -134,34 +187,61 @@ class KnowledgeService:
     async def list_documents(
         self, db: AsyncSession, *, tenant_id: str, kb_id: uuid.UUID
     ) -> list[dict[str, Any]]:
-        """知识库详情 + 文档列表（按 source_file 聚合 chunk 数，doc_id 取首块 id）。"""
+        """文档列表（含 parse_status / chunk_count / 错误信息）。"""
         kb = await self.get(db, tenant_id=tenant_id, kb_id=kb_id)
         if kb is None:
             return []
-        from sqlalchemy import func
-
-        rows = await db.execute(
-            select(
-                KnowledgeChunk.source_file,
-                func.count(KnowledgeChunk.id),
-                func.min(KnowledgeChunk.id),
-                func.max(KnowledgeChunk.created_at),
+        rows = (
+            (
+                await db.execute(
+                    select(DocumentMeta, func.count(KnowledgeChunk.id))
+                    .outerjoin(
+                        KnowledgeChunk, KnowledgeChunk.doc_id == DocumentMeta.id
+                    )
+                    .where(
+                        DocumentMeta.kb_id == kb_id,
+                        DocumentMeta.tenant_id == tenant_id,
+                    )
+                    .group_by(DocumentMeta.id)
+                    .order_by(DocumentMeta.created_at.desc())
+                )
             )
-            .where(
-                KnowledgeChunk.kb_id == kb_id,
-                KnowledgeChunk.tenant_id == tenant_id,
-            )
-            .group_by(KnowledgeChunk.source_file)
+            .fetchall()
         )
         return [
             {
-                "doc_id": int(doc_id),
-                "source_file": source,
+                "doc_id": doc.id,
+                "kb_id": str(doc.kb_id),
+                "source_file": doc.source_file,
+                "file_size": doc.file_size,
+                "mime_type": doc.mime_type,
+                "parse_status": doc.parse_status,
+                "parse_source": doc.parse_source,
                 "chunk_count": count,
-                "created_at": created.isoformat() if created else None,
+                "error": doc.error,
+                "created_at": doc.created_at.isoformat() if doc.created_at else None,
+                "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
             }
-            for source, count, doc_id, created in rows.fetchall()
+            for doc, count in rows
         ]
+
+    async def get_document(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        kb_id: uuid.UUID,
+        doc_id: int,
+    ) -> DocumentMeta | None:
+        """按 doc_id + kb + 租户查询文档（越权返回 None）。"""
+        result = await db.execute(
+            select(DocumentMeta).where(
+                DocumentMeta.id == doc_id,
+                DocumentMeta.kb_id == kb_id,
+                DocumentMeta.tenant_id == tenant_id,
+            )
+        )
+        return result.scalar_one_or_none()
 
     async def upload_document(
         self,
@@ -172,41 +252,126 @@ class KnowledgeService:
         filename: str,
         content: bytes,
         replace: bool = True,
-    ) -> tuple[int, int]:
-        """上传并摄取文档，返回 (doc_id, chunk_count)。"""
+        mime_type: str | None = None,
+    ) -> DocumentMeta:
+        """上传文档：校验 → 落盘 → 建 DocumentMeta(pending) → 调度异步解析。
+
+        replace=True：同名文件先删除旧文档记录（含文件/chunks）再重建（幂等）。
+        返回 DocumentMeta（doc_id / source_file / parse_status）。
+        """
         kb = await self.get(db, tenant_id=tenant_id, kb_id=kb_id)
         if kb is None:
             raise IngestError("知识库不存在或无权访问")
-        return await ingest_document(
-            db,
+        ext = validate_file(filename, content)
+        rel_path = save_upload(tenant_id, kb_id, ext, content)
+        if replace:
+            await self._delete_docs_by_source(
+                db, tenant_id=tenant_id, kb_id=kb_id, source_file=filename
+            )
+        doc = DocumentMeta(
             kb_id=kb_id,
             tenant_id=tenant_id,
-            filename=filename,
-            content=content,
-            replace=replace,
+            source_file=filename,
+            file_path=rel_path,
+            file_size=len(content),
+            mime_type=mime_type or "application/octet-stream",
+            parse_status="pending",
         )
+        db.add(doc)
+        await db.flush()
+        await db.commit()
+        await db.refresh(doc)
+        # 调度后台解析（pending → parsing → parsed/failed）
+        _schedule_parse(doc.id)
+        logger.info("文档已上传并调度解析 doc=%s file=%s", doc.id, filename)
+        return doc
 
-    async def delete_document(
-        self, db: AsyncSession, *, tenant_id: str, kb_id: uuid.UUID, doc_id: int
-    ) -> bool:
-        """按 doc_id（该文档首块 id）删除单个文档的所有 chunks。"""
-        kb = await self.get(db, tenant_id=tenant_id, kb_id=kb_id)
-        if kb is None:
-            return False
-        result = await db.execute(
-            select(KnowledgeChunk.source_file).where(
-                KnowledgeChunk.id == doc_id,
+    async def reparse_document(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        kb_id: uuid.UUID,
+        doc_id: int,
+    ) -> DocumentMeta | None:
+        """重新解析：清旧 chunks → 状态 reparsing → 调度后台解析。"""
+        doc = await self.get_document(
+            db, tenant_id=tenant_id, kb_id=kb_id, doc_id=doc_id
+        )
+        if doc is None:
+            return None
+        await db.execute(
+            delete(KnowledgeChunk).where(
+                KnowledgeChunk.doc_id == doc.id,
                 KnowledgeChunk.kb_id == kb_id,
                 KnowledgeChunk.tenant_id == tenant_id,
             )
         )
-        source_file = result.scalar_one_or_none()
-        if source_file is None:
+        doc.parse_status = "reparsing"
+        doc.error = None
+        await db.commit()
+        await db.refresh(doc)
+        _schedule_parse(doc.id)
+        return doc
+
+    async def delete_document(
+        self, db: AsyncSession, *, tenant_id: str, kb_id: uuid.UUID, doc_id: int
+    ) -> bool:
+        """删除文档：文件 + 分块 + DocumentMeta 记录，并刷新统计。"""
+        kb = await self.get(db, tenant_id=tenant_id, kb_id=kb_id)
+        if kb is None:
             return False
-        await delete_document_chunks(
-            db, kb_id=kb_id, tenant_id=tenant_id, source_file=source_file
+        doc = await self.get_document(
+            db, tenant_id=tenant_id, kb_id=kb_id, doc_id=doc_id
         )
+        if doc is None:
+            return False
+        await self._delete_doc_record(db, doc, commit=False)
+        await _refresh_stats(db, kb_id, tenant_id)
+        await db.commit()
         return True
+
+    async def _delete_doc_record(
+        self, db: AsyncSession, doc: DocumentMeta, *, commit: bool = True
+    ) -> None:
+        """删除单个文档记录：文件落盘 + chunks + DocumentMeta。"""
+        if doc.file_path:
+            await asyncio.to_thread(remove_upload, doc.file_path)
+        await db.execute(
+            delete(KnowledgeChunk).where(
+                KnowledgeChunk.doc_id == doc.id,
+                KnowledgeChunk.kb_id == doc.kb_id,
+                KnowledgeChunk.tenant_id == doc.tenant_id,
+            )
+        )
+        await db.execute(delete(DocumentMeta).where(DocumentMeta.id == doc.id))
+        if commit:
+            await db.commit()
+
+    async def _delete_docs_by_source(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        kb_id: uuid.UUID,
+        source_file: str,
+    ) -> None:
+        """同名文件替换语义：删除旧 DocumentMeta 及其 chunks / 文件。"""
+        docs = (
+            (
+                await db.execute(
+                    select(DocumentMeta).where(
+                        DocumentMeta.kb_id == kb_id,
+                        DocumentMeta.tenant_id == tenant_id,
+                        DocumentMeta.source_file == source_file,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for doc in docs:
+            await self._delete_doc_record(db, doc, commit=False)
 
     async def search(
         self,
@@ -270,6 +435,176 @@ class KnowledgeService:
             kb_ids=kb_ids,
             top_k=top_k,
         )
+
+    # ---------- 分块治理（KB_MANAGEMENT_SPEC §3.5） ----------
+
+    async def _get_chunk(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        kb_id: uuid.UUID,
+        chunk_id: int,
+    ) -> KnowledgeChunk | None:
+        """按 chunk_id + kb + 租户查询分块（越权返回 None）。"""
+        result = await db.execute(
+            select(KnowledgeChunk).where(
+                KnowledgeChunk.id == chunk_id,
+                KnowledgeChunk.kb_id == kb_id,
+                KnowledgeChunk.tenant_id == tenant_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    def _chunk_to_dict(chunk: KnowledgeChunk) -> dict[str, Any]:
+        heading = (chunk.meta or {}).get("heading") if chunk.meta else None
+        return {
+            "chunk_id": int(chunk.id),
+            "kb_id": str(chunk.kb_id),
+            "doc_id": int(chunk.doc_id) if chunk.doc_id else None,
+            "source_file": chunk.source_file,
+            "heading": heading,
+            "text": chunk.chunk_text,
+            "char_count": len(chunk.chunk_text),
+            "enabled": bool(chunk.enabled),
+            "chunk_index": chunk.chunk_index,
+            "updated_at": chunk.updated_at.isoformat() if chunk.updated_at else None,
+        }
+
+    async def list_chunks(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        kb_id: uuid.UUID,
+        doc_id: int | None = None,
+        q: str | None = None,
+        enabled: bool | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]:
+        """分块列表：文档过滤 / 关键词过滤 / 启停过滤 + 分页。"""
+        kb = await self.get(db, tenant_id=tenant_id, kb_id=kb_id)
+        if kb is None:
+            return {"items": [], "total": 0, "page": page, "page_size": page_size}
+
+        filters = [
+            KnowledgeChunk.kb_id == kb_id,
+            KnowledgeChunk.tenant_id == tenant_id,
+        ]
+        if doc_id is not None:
+            filters.append(KnowledgeChunk.doc_id == doc_id)
+        if q:
+            filters.append(KnowledgeChunk.chunk_text.ilike(f"%{q}%"))
+        if enabled is not None:
+            filters.append(KnowledgeChunk.enabled == enabled)
+
+        total = (
+            await db.execute(select(func.count(KnowledgeChunk.id)).where(*filters))
+        ).scalar_one()
+        page = max(1, page)
+        page_size = max(1, min(page_size, 200))
+        rows = (
+            (
+                await db.execute(
+                    select(KnowledgeChunk)
+                    .where(*filters)
+                    .order_by(KnowledgeChunk.id.desc())
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return {
+            "items": [self._chunk_to_dict(c) for c in rows],
+            "total": int(total),
+            "page": page,
+            "page_size": page_size,
+        }
+
+    def preview_document(
+        self, *, text: str, chunk_size: int | None = None
+    ) -> list[dict[str, Any]]:
+        """分块预览（纯函数，不落库）。"""
+        return preview_chunks(text, chunk_size)
+
+    async def update_chunk(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        kb_id: uuid.UUID,
+        chunk_id: int,
+        text: str | None = None,
+        enabled: bool | None = None,
+    ) -> KnowledgeChunk | None:
+        """编辑分块：text 变更必须重新向量化（防向量漂移）；enabled 即时更新。"""
+        chunk = await self._get_chunk(
+            db, tenant_id=tenant_id, kb_id=kb_id, chunk_id=chunk_id
+        )
+        if chunk is None:
+            return None
+        if text is not None and text.strip() != chunk.chunk_text:
+            try:
+                vectors = await embed_texts([text])
+            except EmbeddingError as exc:
+                raise IngestError(str(exc)) from exc
+            chunk.chunk_text = text
+            chunk.embedding = vectors[0]
+        if enabled is not None:
+            chunk.enabled = enabled
+        chunk.updated_at = _now()
+        await db.commit()
+        await db.refresh(chunk)
+        return chunk
+
+    async def toggle_chunk(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        kb_id: uuid.UUID,
+        chunk_id: int,
+        enabled: bool,
+    ) -> KnowledgeChunk | None:
+        """启用 / 停用分块（不重算向量）。"""
+        chunk = await self._get_chunk(
+            db, tenant_id=tenant_id, kb_id=kb_id, chunk_id=chunk_id
+        )
+        if chunk is None:
+            return None
+        chunk.enabled = enabled
+        chunk.updated_at = _now()
+        await db.commit()
+        await db.refresh(chunk)
+        return chunk
+
+    async def reembed_chunk(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        kb_id: uuid.UUID,
+        chunk_id: int,
+    ) -> KnowledgeChunk | None:
+        """重新向量化单个分块（内容未变，仅重算 embedding）。"""
+        chunk = await self._get_chunk(
+            db, tenant_id=tenant_id, kb_id=kb_id, chunk_id=chunk_id
+        )
+        if chunk is None:
+            return None
+        try:
+            vectors = await embed_texts([chunk.chunk_text])
+        except EmbeddingError as exc:
+            raise IngestError(str(exc)) from exc
+        chunk.embedding = vectors[0]
+        chunk.updated_at = _now()
+        await db.commit()
+        await db.refresh(chunk)
+        return chunk
 
 
 knowledge_service = KnowledgeService()

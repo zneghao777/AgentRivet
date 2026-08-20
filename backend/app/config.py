@@ -40,11 +40,39 @@ class Settings(BaseSettings):
     AGENT_TIMEOUT_SECONDS: float = 120.0
     GRAPH_INTERRUPT_TOOLS: bool = False  # 工具调用前 HITL 审批（预留）
 
-    # --- LangSmith ---
-    LANGSMITH_TRACING: bool = True
+    # --- LangSmith（deprecated：可观测体系已切换到本地 OpenLLMetry，见 OBSERVABILITY_SPEC）---
+    LANGSMITH_TRACING: bool = False
     LANGSMITH_PROJECT: str = "agent-harness"
     LANGSMITH_ENDPOINT: str = ""
     LANGSMITH_API_KEY: str = ""
+
+    # --- 可观测性（本地 OpenLLMetry，OBSERVABILITY_SPEC §2.7）---
+    OBSERVABILITY_ENABLED: bool = True      # 总开关：tracing / 本地落库 / 聚合
+    TRACE_SAMPLE_RATE: float = 1.0          # 采样率（高并发可调 0.1）
+    TRACE_RETENTION_DAYS: int = 30          # span/trace 保留天数（后台清理）
+    LOG_RETENTION_DAYS: int = 14            # 结构化日志保留天数
+    HOURLY_RETENTION_DAYS: int = 90         # 小时聚合保留天数
+    DAILY_RETENTION_DAYS: int = 365         # 日聚合保留天数
+    AUDIT_RETENTION_DAYS: int = 365         # 审计日志保留天数
+    METRICS_AGG_CRON: str = "0 5 0 * * *"   # 每日聚合 cron 表达式（简单轮询实现）
+    # 内容采集模式：metadata_only / redacted / full（§6.3）
+    CONTENT_CAPTURE_MODE: str = "metadata_only"
+    REDACTION_VERSION: str = "1"            # 脱敏管线版本
+    OBS_QUEUE_CAPACITY: int = 10_000        # 采集队列容量（§5.5）
+    OBS_WRITE_BATCH_MAX: int = 100          # 每批最大条数
+    OBS_WRITE_BATCH_MS: int = 200           # 每批最大等待毫秒
+    OBS_LOG_MIN_LEVEL: str = "WARNING"      # 结构化日志转发最低级别（§8.1）
+    OTLP_EXPORT_ENABLED: bool = False       # 可选 OTLP 导出（§5.6）
+    OTLP_ENDPOINT: str = ""
+    # 默认 SLO（§10.2）
+    SLO_ERROR_RATE_BUDGET: float = 0.05     # 15min 错误率阈值
+    SLO_P95_LATENCY_MS: int = 15_000        # 15min P95 延迟阈值
+    SLO_P95_TTFT_MS: int = 3_000            # 15min P95 TTFT 阈值
+    SLO_COST_BUDGET: float = 0.0            # 1h 成本预算（0=禁用）
+    SLO_TOOL_ERROR_RATE: float = 0.10       # 工具错误率阈值
+    SLO_TOOL_MIN_CALLS: int = 20            # 工具错误率最小样本
+    SLO_QUALITY_REGRESSION: float = 0.15    # 质量相对 7 日基线下降幅度
+    SLO_QUEUE_USAGE: float = 0.80           # 采集队列使用率阈值
 
     # --- 会话 ---
     SESSION_MAX_HISTORY_MESSAGES: int = 100
@@ -54,17 +82,45 @@ class Settings(BaseSettings):
     # --- 多 Agent ---
     MULTI_AGENT_ENABLED: bool = False
 
-    # --- RAG / 向量检索 ---
-    EMBEDDING_MODEL: str = "text-embedding-3-small"
-    EMBEDDING_BASE_URL: str = ""  # 缺省复用 LLM_BASE_URL
-    EMBEDDING_API_KEY: str = ""  # 缺省复用 LLM_API_KEY
-    EMBEDDING_DIM: int = 1536
+    # --- RAG / 向量检索（BGE-M3 本地，1024 维）---
+    EMBEDDING_MODEL: str = "text-embedding-bge-m3"
+    EMBEDDING_BASE_URL: str = "http://192.168.31.185:1234/v1"
+    EMBEDDING_API_KEY: str = "local-bge-m3"  # 无鉴权占位
+    EMBEDDING_DIM: int = 1024
     RAG_TOP_K: int = 5
     RAG_SCORE_THRESHOLD: float = 0.0
     RAG_CHUNK_SIZE: int = 500
     RAG_CHUNK_OVERLAP: int = 50
     RAG_MAX_FILE_SIZE_MB: int = 20
     RAG_ALLOWED_EXTS: str = ".md,.txt,.pdf,.docx"
+
+    # --- GLM 文件解析（异步；multipart 直传文件，图片自动走 OCR）---
+    GLM_FILES_API_KEY: str = ""  # 智谱 key，空则回退本地解析
+    GLM_FILES_BASE_URL: str = "https://open.bigmodel.cn/api/paas/v4"
+    GLM_FILES_MODEL: str = "glm-files-parser"
+    # lite|expert|prime；expert 仅支持 pdf，图片 OCR 需 prime 或 lite
+    GLM_FILES_TOOL: str = "prime"
+    GLM_FILES_POLL_SECONDS: int = 3  # 异步轮询间隔
+    GLM_FILES_TIMEOUT_SECONDS: int = 180  # 单文件解析超时
+
+    # --- 上传 / 解析 ---
+    KB_UPLOAD_DIR: str = "data/uploads"  # 原文件落盘目录
+    KB_PUBLIC_BASE_URL: str = ""  # 预留：文件对外下载地址前缀（GLM 为 multipart 直传，无需 URL）
+
+    # --- 长期记忆（MEMORY_SPEC §6/§7） ---
+    MEMORY_ENABLED: bool = True            # 全局总开关（熔断用）
+    MEMORY_AUTO_INJECT: bool = True        # 对话前自动注入记忆
+    MEMORY_SEARCH_TOOL: bool = True        # 注册 memory_search 工具
+    MEMORY_TOP_K: int = 5                  # 单次注入/检索上限
+    MEMORY_SIM_DUP: float = 0.92           # 判重相似度阈值
+    MEMORY_SIM_CONFLICT: float = 0.70      # 冲突调和阈值下限
+    MEMORY_CONFIDENCE_PENDING: float = 0.6 # 低于此值进 pending
+    MEMORY_DEFAULT_TTL_DAYS: int = 90      # 默认 TTL（settings 表可覆盖）
+    MEMORY_EXTRACT_MAX_ITEMS: int = 10     # 单次对话最多提炼条数
+    MEMORY_STRENGTHEN_THRESHOLD: int = 3   # 强化阈值：access_count 达到则不因 TTL 过期
+
+    # --- 用户级记忆（MEMORY_SPEC §3.2 / §6.5） ---
+    ANONYMOUS_USER_ID: str = "__anonymous__"  # 未登录阶段的统一占位用户 ID（替换 deps.py 硬编码 "api-user"）
 
     @property
     def embedding_base_url(self) -> str:
