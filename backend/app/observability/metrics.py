@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import statistics
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -29,6 +30,49 @@ class MetricStore:
     tool_calls: dict[str, int] = field(default_factory=lambda: defaultdict(int))  # tool -> count
     latencies: dict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
     active_sessions: set[str] = field(default_factory=set)
+    # 采集器健康（§10.1 采集器 / §5.5）
+    spans_dropped_total: int = 0
+    spans_dropped_by_reason: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    write_failures: int = 0
+    queue_depth: int = 0
+    collector_started_at: float = 0.0
+
+    def record_spans_dropped(self, count: int = 1, *, reason: str = "unknown") -> None:
+        """采集器丢 span 计数。"""
+        with self.lock:
+            self.spans_dropped_total += count
+            self.spans_dropped_by_reason[reason] += count
+
+    def record_write_failure(self) -> None:
+        """写入失败计数。"""
+        with self.lock:
+            self.write_failures += 1
+
+    def set_queue_depth(self, depth: int) -> None:
+        with self.lock:
+            self.queue_depth = depth
+
+    def collector_health(self) -> dict:
+        with self.lock:
+            return {
+                "spans_dropped_total": self.spans_dropped_total,
+                "spans_dropped_by_reason": dict(self.spans_dropped_by_reason),
+                "write_failures": self.write_failures,
+                "queue_depth": self.queue_depth,
+                "active_sessions": len(self.active_sessions),
+                "uptime_seconds": (time.time() - self.collector_started_at)
+                if self.collector_started_at
+                else 0,
+            }
+
+    def queue_usage_ratio(self) -> float:
+        """采集队列使用率（§10.2 queue_usage 指标）。无队列信息时返回 0。"""
+        try:
+            from . import tracing
+
+            return tracing.queue_usage_ratio()
+        except Exception:  # noqa: BLE001
+            return 0.0
 
     def record_request(self, tenant: str, *, ok: bool, duration_ms: float, token_usage: dict | None = None) -> None:
         with self.lock:
@@ -53,6 +97,11 @@ class MetricStore:
     def session_close(self, session_id: str) -> None:
         with self.lock:
             self.active_sessions.discard(session_id)
+
+    def active_session_count(self) -> int:
+        """活跃会话数（内存态，跨租户全局）。"""
+        with self.lock:
+            return len(self.active_sessions)
 
     def summary(self, *, group_by: str | None = None) -> dict:
         with self.lock:

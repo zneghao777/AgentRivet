@@ -24,6 +24,9 @@ SYSTEM_PROMPT_TEMPLATE = """你是企业级 Agent Harness 底座中的通用助�
 
 # Skill 详细指令（首次触发时注入）
 {skill_bodies}
+
+# 长期记忆（MEMORY_SPEC §6.2 自动注入）
+{memory_context}
 """
 
 
@@ -38,10 +41,13 @@ def create_llm() -> BaseChatModel:
     )
 
 
-def build_system_prompt(skill_names: list[str]) -> str:
+def build_system_prompt(
+    skill_names: list[str], memory_context: str | None = None
+) -> str:
     """根据已加载的 Skill 构建 system prompt。
 
     渐进式：description 始终注入顶部；正文在会话首次触发时注入。
+    memory_context：对话前检索到的用户长期记忆（MEMORY_SPEC §6.2），注入在最底部。
     """
     descriptions: list[str] = []
     bodies: list[str] = []
@@ -58,10 +64,12 @@ def build_system_prompt(skill_names: list[str]) -> str:
             if skill.body_md:
                 bodies.append(f"### Skill: {skill.name}\n{skill.body_md}")
 
+    memory_block = memory_context.strip() if memory_context else "（无已检索到的长期记忆）"
     return SYSTEM_PROMPT_TEMPLATE.format(
         skill_descriptions="\n".join(descriptions)
         or "（无已加载 Skill）",
         skill_bodies="\n\n".join(bodies) or "（无）",
+        memory_context=memory_block,
     )
 
 
@@ -70,7 +78,8 @@ def agent_node(state: dict) -> dict:
     llm = state.get("_llm") or create_llm()
     messages = state.get("messages", [])
     skill_names = state.get("skill_loaded", [])
-    system_prompt = build_system_prompt(skill_names)
+    memory_context = state.get("memory_context")
+    system_prompt = build_system_prompt(skill_names, memory_context)
 
     tools = state.get("_tools", [])
     llm_with_tools = llm.bind_tools(tools) if tools else llm

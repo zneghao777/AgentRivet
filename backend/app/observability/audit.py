@@ -62,6 +62,9 @@ async def _write_loop(queue: asyncio.Queue) -> None:
                     session_id=item.get("session_id"),
                     detail=item.get("detail"),
                     ip=item.get("ip"),
+                    trace_id=item.get("trace_id"),
+                    request_id=item.get("request_id"),
+                    resource_id=item.get("resource_id"),
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("审计日志写入失败: %s", exc)
@@ -77,11 +80,25 @@ async def audit(
     session_id: str | uuid.UUID | None = None,
     detail: dict | None = None,
     ip: str | None = None,
+    trace_id: str | None = None,
+    request_id: str | None = None,
+    resource_id: str | None = None,
 ) -> None:
     """写入审计日志（异步队列）。
 
     detail 仅允许非敏感摘要。若队列已满（溢出），降级为同步写入。
+    trace_id / request_id 未显式传入时，从当前 TraceContext 自动注入（§8.2 C-12）。
     """
+    if (trace_id is None or request_id is None):
+        try:
+            from .tracing import get_trace_context
+
+            ctx = get_trace_context()
+            if ctx is not None:
+                trace_id = trace_id or ctx.trace_id
+                request_id = request_id or ctx.request_id
+        except Exception:  # noqa: BLE001
+            pass
     item = {
         "tenant_id": tenant_id,
         "action": action,
@@ -89,6 +106,9 @@ async def audit(
         "session_id": session_id,
         "detail": detail,
         "ip": ip,
+        "trace_id": trace_id,
+        "request_id": request_id,
+        "resource_id": resource_id,
     }
     try:
         queue, _ = _loop_state()

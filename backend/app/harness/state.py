@@ -16,3 +16,4 @@ class HarnessState(MessagesState):
     tool_calls_total: int = 0
     interrupt_count: int = 0
     final_answer: str = ""
+    memory_context: str = ""  # 对话前检索注入的用户长期记忆（MEMORY_SPEC §6.2）

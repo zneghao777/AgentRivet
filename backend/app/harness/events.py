@@ -25,6 +25,14 @@ def session_start(session_id: str, thread_id: str) -> str:
     return sse_frame("session_start", {"session_id": session_id, "thread_id": thread_id})
 
 
+def trace_start(*, trace_id: str, request_id: str | None, session_id: str | None) -> str:
+    """Trace 创建事件（OBSERVABILITY_SPEC §12.4）：SSE 必须发送。"""
+    return sse_frame(
+        "trace_start",
+        {"trace_id": trace_id, "request_id": request_id, "session_id": session_id},
+    )
+
+
 def message_start() -> str:
     return sse_frame("message_start", {"id": _new_id("msg"), "role": "assistant"})
 
