@@ -43,8 +43,11 @@ async def require_auth(
             detail="invalid or missing API key",
         )
     tenant = resolve_tenant(x_api_key, x_tenant_id)
-    # 用户 ID：第一版固定 "api-user"，可后续扩展
-    return AuthContext(tenant=tenant, user_id="api-user")
+    # 用户 ID：未登录阶段使用统一占位用户（MEMORY_SPEC §3.2/§6.5）
+    # 登录体系接入后改为从登录凭证解析真实 user_id，其余代码无需改动
+    from ..config import settings
+
+    return AuthContext(tenant=tenant, user_id=settings.ANONYMOUS_USER_ID)
 
 
 # 便于引用
