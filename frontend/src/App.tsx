@@ -1,20 +1,32 @@
-// 路由入口: 全站统一外壳 (左导航) + 各页面内容
+// 路由入口: 全站统一外壳 (左导航) + 按页面切分业务代码
+import { lazy, Suspense } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import AppShell from "@/components/layout/AppShell";
-import ChatPage from "@/pages/ChatPage";
-import KnowledgeCenterPage from "@/pages/KnowledgeCenterPage";
-import KnowledgeDetailPage from "@/pages/KnowledgeDetailPage";
-import MemoryPage from "@/pages/MemoryPage";
-import SkillsPage from "@/pages/SkillsPage";
-import SettingsPage from "@/pages/SettingsPage";
-import ObservabilityPage from "@/pages/observability/ObservabilityPage";
-import TraceDetailPage from "@/pages/observability/TraceDetailPage";
+import { GlassEmptyState } from "@/components/common/Glass";
+
+const ChatPage = lazy(() => import("@/pages/ChatPage"));
+const KnowledgeCenterPage = lazy(() => import("@/pages/KnowledgeCenterPage"));
+const KnowledgeDetailPage = lazy(() => import("@/pages/KnowledgeDetailPage"));
+const MemoryPage = lazy(() => import("@/pages/MemoryPage"));
+const SkillsPage = lazy(() => import("@/pages/SkillsPage"));
+const SettingsPage = lazy(() => import("@/pages/SettingsPage"));
+const ObservabilityPage = lazy(() => import("@/pages/observability/ObservabilityPage"));
+const TraceDetailPage = lazy(() => import("@/pages/observability/TraceDetailPage"));
+
+function RouteFallback() {
+  return (
+    <div className="route-fallback">
+      <GlassEmptyState icon="progress_activity" title="正在加载工作区" description="正在准备页面组件与数据…" />
+    </div>
+  );
+}
 
 export default function App() {
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route element={<AppShell />}>
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <Suspense fallback={<RouteFallback />}>
+        <Routes>
+          <Route element={<AppShell />}>
           <Route path="/" element={<ChatPage />} />
           <Route path="/observability" element={<ObservabilityPage />} />
           {/* 历史观测子页面统一重定向到观测台对应 tab，避免 404 与重复入口 */}
@@ -32,8 +44,9 @@ export default function App() {
           <Route path="/knowledge/:kbId" element={<KnowledgeDetailPage />} />
           <Route path="/memory" element={<MemoryPage />} />
           <Route path="/settings" element={<SettingsPage />} />
-        </Route>
-      </Routes>
+          </Route>
+        </Routes>
+      </Suspense>
     </BrowserRouter>
   );
 }

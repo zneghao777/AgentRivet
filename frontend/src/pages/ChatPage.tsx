@@ -2,8 +2,10 @@ import { useEffect, useState } from "react";
 import ChatWindow from "@/components/chat/ChatWindow";
 import ContextPanel from "@/components/layout/ContextPanel";
 import { getData } from "@/api/http";
+import { getTraceEvents } from "@/api/observability";
 import { useSessionStore } from "@/stores/sessionStore";
-import type { SkillItem } from "@/types/api";
+import type { HistoryMessage, SkillItem } from "@/types/api";
+import { traceEventsToChatRun } from "@/utils/chatRun";
 
 export default function ChatPage() {
   const { sessions, currentSessionId, setCurrentSession } = useSessionStore();
@@ -19,11 +21,28 @@ export default function ChatPage() {
     const sessionId = currentSessionId;
     const controller = new AbortController();
     setMessagesLoading(true);
-    getData<{ role: string; content: string; created_at: string | null }[]>(`/sessions/${sessionId}/messages`, { signal: controller.signal })
-      .then((messages) => {
+    getData<HistoryMessage[]>(`/sessions/${sessionId}/messages`, { signal: controller.signal })
+      .then(async (messages) => {
+        const traceIds = Array.from(new Set(messages
+          .filter((message) => message.role === "assistant" && message.trace_id)
+          .map((message) => message.trace_id as string)));
+        const replays = await Promise.all(traceIds.map(async (traceId) => {
+          try {
+            return [traceId, traceEventsToChatRun(await getTraceEvents(traceId))] as const;
+          } catch {
+            return [traceId, null] as const;
+          }
+        }));
+        const runByTrace = new Map(replays);
         if (useSessionStore.getState().currentSessionId !== sessionId) return;
         useSessionStore.getState().setMessages(messages.map((message) => ({
-          role: message.role as "user" | "assistant" | "system", content: message.content, createdAt: message.created_at ?? undefined,
+          id: message.id,
+          role: message.role as "user" | "assistant" | "system",
+          content: message.content,
+          createdAt: message.created_at ?? undefined,
+          run: message.role === "assistant" && message.trace_id
+            ? runByTrace.get(message.trace_id) ?? undefined
+            : undefined,
         })));
       })
       .catch((error) => {

@@ -1,84 +1,9 @@
-import { memo, useState } from "react";
+import { memo } from "react";
 import type { ChatMessage } from "@/stores/sessionStore";
 import { formatTime } from "@/utils/format";
-import { parseReferenceAnchors } from "@/utils/trace";
-import SourceReferenceBadge from "@/components/knowledge/SourceReferenceBadge";
 import MarkdownRenderer from "./MarkdownRenderer";
-
-const SOURCE_RE = /来源[:：]\s*([^\s\])}]+)/g;
-
-function parseSources(result: string): string[] {
-  const sources: string[] = [];
-  const re = new RegExp(SOURCE_RE.source, "g");
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(result)) !== null) {
-    const file = match[1].replace(/[)\]},]+$/, "");
-    if (file && !sources.includes(file)) sources.push(file);
-  }
-  return sources;
-}
-
-function KnowledgeSources({ result }: { result: string }) {
-  // 溯源锚点优先：渲染可点击的来源徽标，点击跳转知识库分块页（SPEC §4.6-A）
-  const anchors = parseReferenceAnchors(result);
-  if (anchors.length > 0) {
-    return (
-      <div className="src-badge-row">
-        {anchors.map((anchor, index) => (
-          <SourceReferenceBadge
-            key={`${anchor.kbId}-${anchor.chunkId}-${index}`}
-            kbId={anchor.kbId}
-            chunkId={anchor.chunkId}
-            sourceFile={anchor.sourceFile ?? "来源"}
-            score={anchor.score}
-          />
-        ))}
-      </div>
-    );
-  }
-  // 旧数据无锚点：退化为普通来源文本标注
-  const sources = parseSources(result);
-  return (
-    <div className="kb-sources">
-      {sources.length ? (
-        sources.map((source, index) => (
-          <span className="kb-source" key={`${source}-${index}`}>
-            <span className="material-symbols-rounded">description</span>
-            {source}
-          </span>
-        ))
-      ) : (
-        <span className="kb-source">（未命中来源）</span>
-      )}
-    </div>
-  );
-}
-
-function ToolCall({ name, args, result }: { name: string; args?: Record<string, unknown>; result?: string }) {
-  const [open, setOpen] = useState(false);
-  const isKnowledgeSearch = name === "knowledge_search";
-  return (
-    <div className="tool-call">
-      <button onClick={() => setOpen((value) => !value)}>
-        <span className="material-symbols-rounded">{open ? "expand_more" : "chevron_right"}</span>
-        <span className="material-symbols-rounded">{isKnowledgeSearch ? "database" : "build_circle"}</span>
-        {isKnowledgeSearch ? "知识库检索 · " + (String(args?.query ?? "") || name) : "工具调用 · " + name}
-        {!result ? <b>执行中</b> : null}
-      </button>
-      {open && result ? (
-        isKnowledgeSearch ? (
-          <div className="tool-call-body">
-            <KnowledgeSources result={result} />
-            <pre>{result}</pre>
-          </div>
-        ) : (
-          <pre>参数: {JSON.stringify(args ?? {}, null, 2)}{result ? `\n结果: ${result}` : ""}</pre>
-        )
-      ) : null}
-      {open && !result ? <pre>参数: {JSON.stringify(args ?? {}, null, 2)}</pre> : null}
-    </div>
-  );
-}
+import RunProcessPanel from "./RunProcessPanel";
+import AnswerSources from "./AnswerSources";
 
 function MessageBubble({ message, streaming }: { message: ChatMessage; streaming: boolean }) {
   if (message.role === "system") return null;
@@ -95,14 +20,17 @@ function MessageBubble({ message, streaming }: { message: ChatMessage; streaming
       <div className="assistant-avatar"><span className="material-symbols-rounded">smart_toy</span></div>
       <div className="assistant-stack">
         {message.createdAt ? <time>{formatTime(message.createdAt)}</time> : null}
-        {message.tools?.map((tool, index) => <ToolCall key={`${tool.name}-${index}`} name={tool.name} args={tool.arguments} result={tool.result} />)}
-        <div className="assistant-bubble">
-          <MarkdownRenderer
-            content={message.content || (streaming ? "" : "（仅工具调用，无文本回复）")}
-            streaming={streaming}
-          />
-          {streaming ? <i className="stream-caret" /> : null}
-        </div>
+        {message.run ? <RunProcessPanel run={message.run} /> : null}
+        {message.content || !streaming ? (
+          <div className="assistant-bubble">
+            <MarkdownRenderer
+              content={message.content || "（运行结束，无文本回复）"}
+              streaming={streaming}
+            />
+            {streaming ? <i className="stream-caret" /> : null}
+          </div>
+        ) : null}
+        {message.run && !streaming ? <AnswerSources run={message.run} /> : null}
       </div>
     </div>
   );

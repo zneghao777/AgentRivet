@@ -26,7 +26,6 @@ export default function MessageList({ messages, streaming }: { messages: ChatMes
         {messages.map((message, index) => (
           <MessageBubble key={`${message.createdAt ?? "local"}-${index}`} message={message} streaming={streaming && index === messages.length - 1} />
         ))}
-        {streaming ? <div className="thinking"><span className="material-symbols-rounded">auto_awesome</span>正在思考…</div> : null}
         <div ref={bottomRef} />
       </div>
     </div>

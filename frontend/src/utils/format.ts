@@ -1,19 +1,14 @@
 // 通用格式化工具
 
-/** 将 ISO 时间格式化为 "MM-DD HH:mm"；今天则显示 "今天 HH:mm" */
+/** 将 ISO 时间格式化为 "YYYY-MM-DD HH:mm"（始终包含日期，避免只有时间看不出是哪天） */
 export function formatTime(iso: string | null | undefined): string {
   if (!iso) return "";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
   const pad = (n: number) => String(n).padStart(2, "0");
+  const ymd = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
   const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  const now = new Date();
-  const sameDay =
-    d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate();
-  if (sameDay) return `今天 ${hm}`;
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;
+  return `${ymd} ${hm}`;
 }
 
 /** 取消息文本摘要作为会话标题 */

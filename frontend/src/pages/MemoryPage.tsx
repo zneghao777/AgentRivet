@@ -14,6 +14,7 @@ import {
 } from "antd";
 import { deleteData, getData, patchData } from "@/api/http";
 import type {
+  MemoryGraphData,
   MemoryItem,
   MemoryListData,
   MemoryOverview,
@@ -21,7 +22,9 @@ import type {
   MemoryTimelineData,
   MemoryType,
 } from "@/types/api";
+import { MemoryGraph } from "@/components/memory/MemoryGraph";
 import { formatDayLabel, formatTime } from "@/utils/format";
+import { InspectorField, MetricStrip, ResponsiveInspector, StatusDot, WorkspaceHeader } from "@/components/common/Workspace";
 
 const STATUS_LABELS: Record<string, string> = {
   active: "已启用",
@@ -46,7 +49,13 @@ function statusColor(status: string): string {
   }
 }
 
-type ViewMode = "timeline" | "list";
+type ViewMode = "timeline" | "list" | "graph";
+
+const VIEW_MODES: Array<{ value: ViewMode; label: string; icon: string }> = [
+  { value: "graph", label: "关系图谱", icon: "hub" },
+  { value: "timeline", label: "时间线", icon: "timeline" },
+  { value: "list", label: "列表", icon: "format_list_bulleted" },
+];
 
 export default function MemoryPage() {
   const [overview, setOverview] = useState<MemoryOverview | null>(null);
@@ -62,8 +71,9 @@ export default function MemoryPage() {
     page_size: 20,
   });
   const [timeline, setTimeline] = useState<MemoryTimelineData>({ groups: [] });
+  const [graph, setGraph] = useState<MemoryGraphData>({ nodes: [], edges: [], similarity_threshold: 0.72 });
   const [loading, setLoading] = useState(false);
-  const [view, setView] = useState<ViewMode>("timeline");
+  const [view, setView] = useState<ViewMode>("graph");
   const [typeFilter, setTypeFilter] = useState<MemoryType | "all">("all");
   const [statusFilter, setStatusFilter] = useState<string>("active");
   const [keyword, setKeyword] = useState("");
@@ -73,6 +83,8 @@ export default function MemoryPage() {
   const [editText, setEditText] = useState("");
   const [togglingId, setTogglingId] = useState<number | null>(null);
   const [clearing, setClearing] = useState(false);
+  const [selectedMemory, setSelectedMemory] = useState<MemoryItem | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
 
   const loadOverview = useCallback(async () => {
     try {
@@ -99,6 +111,16 @@ export default function MemoryPage() {
         if (view === "timeline") {
           const data = await getData<MemoryTimelineData>("/memory/timeline?days=30");
           setTimeline(data);
+          const first = data.groups.flatMap((group) => group.items).find((item) => item.status === "active") ?? data.groups[0]?.items[0] ?? null;
+          setSelectedMemory((current) => current && data.groups.some((group) => group.items.some((item) => item.memory_id === current.memory_id)) ? current : first);
+        } else if (view === "graph") {
+          const params = new URLSearchParams({ limit: "80", similarity_threshold: "0.72" });
+          if (typeFilter !== "all") params.set("memory_type", typeFilter);
+          params.set("status", showNonActive ? "" : "active");
+          if (keyword.trim()) params.set("q", keyword.trim());
+          const data = await getData<MemoryGraphData>(`/memory/graph?${params.toString()}`);
+          setGraph(data);
+          setSelectedMemory((current) => current && data.nodes.some((item) => item.memory_id === current.memory_id) ? current : data.nodes[0] ?? null);
         } else {
           const params = new URLSearchParams({
             page: append ? String(listData.page + 1) : "1",
@@ -111,6 +133,7 @@ export default function MemoryPage() {
           setListData((prev) =>
             append ? { ...data, items: [...prev.items, ...data.items] } : data
           );
+          if (!append) setSelectedMemory((current) => current && data.items.some((item) => item.memory_id === current.memory_id) ? current : data.items[0] ?? null);
         }
       } catch (e) {
         message.error(e instanceof Error ? e.message : "加载记忆失败");
@@ -119,7 +142,7 @@ export default function MemoryPage() {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [view, typeFilter, statusFilter, keyword]
+    [view, typeFilter, statusFilter, keyword, showNonActive]
   );
 
   useEffect(() => {
@@ -257,8 +280,13 @@ export default function MemoryPage() {
 
   const renderCard = (item: MemoryItem) => (
     <article
-      className={`kb-chunk-row${item.status !== "active" ? " disabled" : ""}`}
+      className={`kb-chunk-row memory-row${item.status !== "active" ? " disabled" : ""}${selectedMemory?.memory_id === item.memory_id ? " selected" : ""}`}
       key={item.memory_id}
+      role="option"
+      aria-selected={selectedMemory?.memory_id === item.memory_id}
+      onClick={() => { setSelectedMemory(item); setInspectorOpen(true); }}
+      tabIndex={0}
+      onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelectedMemory(item); setInspectorOpen(true); } }}
     >
       <div className="kb-chunk-head">
         <Tag
@@ -285,7 +313,7 @@ export default function MemoryPage() {
             {item.source_summary}
           </span>
         ) : null}
-        <div className="kb-chunk-actions">
+        <div className="kb-chunk-actions" onClick={(event) => event.stopPropagation()}>
           <Button size="small" type="text" onClick={() => openEdit(item)} title="编辑记忆">
             <span className="material-symbols-rounded" style={{ fontSize: 15 }}>edit_note</span>
           </Button>
@@ -325,16 +353,8 @@ export default function MemoryPage() {
   );
 
   return (
-    <div className="page-scroll">
-      <header className="page-header">
-        <div className="page-header-icon">
-          <span className="material-symbols-rounded">memory</span>
-        </div>
-        <div className="page-header-copy">
-          <h1>记忆</h1>
-          <p>跨会话长期记忆：Agent 从对话中学习的事实与偏好（用户级）</p>
-        </div>
-        <Switch
+    <div className="page-scroll workspace-page memory-page">
+      <WorkspaceHeader icon="memory" title="记忆" description="跨会话长期记忆：Agent 从对话中学习的事实与偏好（用户级）" actions={<><Switch
           checked={settings.long_term_enabled}
           onChange={(checked) => void toggleLongTerm(checked)}
           checkedChildren="长期记忆开"
@@ -349,7 +369,7 @@ export default function MemoryPage() {
           onConfirm={() => void clearAll()}
           disabled={stats.total === 0}
         >
-          <Button danger disabled={stats.total === 0} loading={clearing}>
+          <Button type="text" danger disabled={stats.total === 0} loading={clearing}>
             <span className="material-symbols-rounded" style={{ fontSize: 15 }}>delete_sweep</span>
             全部清除
           </Button>
@@ -357,30 +377,12 @@ export default function MemoryPage() {
         <Button icon={<span className="material-symbols-rounded" style={{ fontSize: 16 }}>refresh</span>} onClick={() => void load()}>
           刷新
         </Button>
-      </header>
+      </>} />
 
-      <div className="kb-grid" style={{ marginBottom: 20 }}>
-        {[
-          { label: "记忆总数", value: stats.total, icon: "memory" },
-          { label: "语义记忆", value: stats.semantic_count, icon: "lightbulb" },
-          { label: "情景记忆", value: stats.episodic_count, icon: "event_note" },
-          { label: "近7日新增", value: stats.added_7d, icon: "trending_up" },
-        ].map((card) => (
-          <article className="kb-card mem-stat-card" key={card.label}>
-            <div className="kb-card-head">
-              <div className="kb-card-icon">
-                <span className="material-symbols-rounded">{card.icon}</span>
-              </div>
-              <div className="kb-card-title">
-                <div className="kb-card-name">{card.label}</div>
-              </div>
-            </div>
-            <div className="mem-stat-value">{card.value}</div>
-          </article>
-        ))}
-      </div>
+      <MetricStrip items={[{ label: "记忆总数", value: stats.total, meta: `启用 ${stats.active_count}` }, { label: "语义记忆", value: stats.semantic_count, meta: "事实与偏好", tone: "teal" }, { label: "情景记忆", value: stats.episodic_count, meta: "事件与经历" }, { label: "近 7 日新增", value: stats.added_7d, meta: `待确认 ${stats.pending_count}`, tone: "warning" }]} />
 
-      <div className="kb-chunk-panel">
+      <div className="memory-workspace">
+      <div className="kb-chunk-panel memory-master">
         <div className="kb-panel-toolbar">
           <div className="kb-panel-title">
             <span className="material-symbols-rounded">psychology</span>
@@ -413,7 +415,7 @@ export default function MemoryPage() {
                   { value: "expired", label: "已过期" },
                 ]}
               />
-            ) : (
+            ) : view === "timeline" || view === "graph" ? (
               <Button
                 size="small"
                 type={showNonActive ? "primary" : "default"}
@@ -421,7 +423,7 @@ export default function MemoryPage() {
               >
                 查看非启用
               </Button>
-            )}
+            ) : null}
             <Input
               size="small"
               allowClear
@@ -431,25 +433,40 @@ export default function MemoryPage() {
               value={keyword}
               onChange={(event) => setKeyword(event.target.value)}
             />
-            <Select
-              size="small"
-              style={{ minWidth: 100 }}
-              value={view}
-              onChange={setView}
-              options={[
-                { value: "timeline", label: "时间线视图" },
-                { value: "list", label: "列表视图" },
-              ]}
-            />
           </div>
         </div>
 
-        {loading && listData.items.length === 0 ? (
+        <div className="memory-view-switch" role="group" aria-label="切换记忆显示模式">
+          {VIEW_MODES.map((mode) => (
+            <button
+              className={`memory-view-button ${mode.value}${view === mode.value ? " active" : ""}`}
+              key={mode.value}
+              type="button"
+              aria-pressed={view === mode.value}
+              onClick={() => setView(mode.value)}
+            >
+              <span className="material-symbols-rounded" aria-hidden="true">{mode.icon}</span>
+              <span>{mode.label}</span>
+            </button>
+          ))}
+        </div>
+
+        {loading && (
+          (view === "graph" && graph.nodes.length === 0)
+          || (view === "timeline" && timeline.groups.length === 0)
+          || (view === "list" && listData.items.length === 0)
+        ) ? (
           <div className="kb-skeleton">
             {Array.from({ length: 5 }).map((_, index) => (
               <div className="kb-skeleton-row" key={index} />
             ))}
           </div>
+        ) : view === "graph" ? (
+          <MemoryGraph
+            data={graph}
+            selectedId={selectedMemory?.memory_id}
+            onSelect={(item) => { setSelectedMemory(item); setInspectorOpen(true); }}
+          />
         ) : view === "timeline" ? (
           timelineGroups.length === 0 ? (
             <Empty description="暂无记忆。与 Agent 对话后，它将自动提炼值得长期记住的事实与偏好。" style={{ padding: 40 }} />
@@ -481,6 +498,10 @@ export default function MemoryPage() {
             ) : null}
           </div>
         )}
+      </div>
+      <ResponsiveInspector open={inspectorOpen && Boolean(selectedMemory)} onClose={() => setInspectorOpen(false)} title="记忆详情" subtitle={selectedMemory ? <StatusDot label={STATUS_LABELS[selectedMemory.status] ?? selectedMemory.status} tone={selectedMemory.status === "active" ? "success" : selectedMemory.status === "pending" ? "warning" : "neutral"} /> : undefined}>
+        {!selectedMemory ? <Empty description="选择一条记忆查看详情" /> : <><section className="inspector-section"><h3>内容</h3><p className="inspector-copy">{selectedMemory.content}</p></section><section className="inspector-section"><h3>属性</h3><InspectorField label="类型">{selectedMemory.memory_type === "semantic" ? "语义记忆" : "情景记忆"}</InspectorField><InspectorField label="置信度">{Math.round(selectedMemory.confidence * 100)}%</InspectorField><InspectorField label="命中次数">{selectedMemory.access_count}</InspectorField><InspectorField label="创建时间">{formatTime(selectedMemory.created_at)}</InspectorField><InspectorField label="更新时间">{formatTime(selectedMemory.updated_at ?? selectedMemory.created_at)}</InspectorField><InspectorField label="记忆 ID" mono>{selectedMemory.memory_id}</InspectorField></section>{selectedMemory.source_summary ? <section className="inspector-section"><h3>来源</h3><p className="inspector-copy">{selectedMemory.source_summary}</p></section> : null}<section className="inspector-section inspector-button-stack"><Button block onClick={() => openEdit(selectedMemory)}>编辑记忆内容</Button>{selectedMemory.status === "active" || selectedMemory.status === "disabled" ? <Button block loading={togglingId === selectedMemory.memory_id} onClick={() => void toggleItemStatus(selectedMemory)}>{selectedMemory.status === "disabled" ? "启用记忆" : "停用记忆"}</Button> : null}</section></>}
+      </ResponsiveInspector>
       </div>
 
       <Modal

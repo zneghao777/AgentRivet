@@ -5,6 +5,7 @@ import { useSearchParams } from "react-router-dom";
 import { getCalls } from "@/api/observability";
 import type { CallItem } from "@/api/observability";
 import { formatTime } from "@/utils/format";
+import { MetricStrip } from "@/components/common/Workspace";
 
 const TYPE_OPTIONS = [
   { value: "", label: "全部类型" },
@@ -30,6 +31,7 @@ export default function CallsPage({ hideHeader = false }: { hideHeader?: boolean
   const [spanType, setSpanType] = useState<string>(initialType);
   const [status, setStatus] = useState<string>("");
   const [keyword, setKeyword] = useState("");
+  const [searchKeyword, setSearchKeyword] = useState("");
   const [page, setPage] = useState(1);
   const [data, setData] = useState<{ items: CallItem[]; total: number; page: number; page_size: number }>({
     items: [],
@@ -59,14 +61,16 @@ export default function CallsPage({ hideHeader = false }: { hideHeader?: boolean
   }, []);
 
   useEffect(() => {
-    void load(page, status, keyword, spanType);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page]);
+    void load(page, status, searchKeyword, spanType);
+  }, [load, page, searchKeyword, spanType, status]);
 
-  const applyFilter = (p = 1) => {
-    setPage(p);
-    void load(p, status, keyword, spanType);
-  };
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setPage(1);
+      setSearchKeyword(keyword.trim());
+    }, 320);
+    return () => window.clearTimeout(timer);
+  }, [keyword]);
 
   const columns = [
     {
@@ -80,13 +84,16 @@ export default function CallsPage({ hideHeader = false }: { hideHeader?: boolean
       title: "调用",
       dataIndex: "span_name",
       key: "span_name",
+      width: 220,
       ellipsis: true,
+      render: (value: string, record: CallItem) => <span className="call-primary-cell"><b>{value}</b><small>{record.started_at ? formatTime(record.started_at) : "—"}</small></span>,
     },
     {
       title: "模型",
       dataIndex: "model",
       key: "model",
       width: 160,
+      responsive: ["xl" as const],
       render: (v: string | null, r: CallItem) => v || r.model_name_resolved || "—",
     },
     {
@@ -102,6 +109,7 @@ export default function CallsPage({ hideHeader = false }: { hideHeader?: boolean
       dataIndex: "ttft_ms",
       key: "ttft_ms",
       width: 80,
+      responsive: ["xl" as const],
       render: (v: number | null) => (v != null ? `${v}ms` : "—"),
     },
     {
@@ -109,6 +117,7 @@ export default function CallsPage({ hideHeader = false }: { hideHeader?: boolean
       dataIndex: "cost_total",
       key: "cost_total",
       width: 100,
+      responsive: ["xxl" as const],
       render: (v: number | null) => (v != null ? `$${v.toFixed(6)}` : "—"),
     },
     {
@@ -130,6 +139,7 @@ export default function CallsPage({ hideHeader = false }: { hideHeader?: boolean
       dataIndex: "started_at",
       key: "started_at",
       width: 160,
+      responsive: ["xxl" as const],
       render: (v: string | null) => (v ? formatTime(v) : "—"),
     },
     {
@@ -137,10 +147,15 @@ export default function CallsPage({ hideHeader = false }: { hideHeader?: boolean
       dataIndex: "trace_id",
       key: "trace_id",
       width: 130,
+      responsive: ["xxl" as const],
       ellipsis: true,
       render: (v: string) => <span style={{ fontFamily: "monospace", fontSize: 12 }}>{v.slice(0, 12)}…</span>,
     },
   ];
+  const typedCalls = data.items.filter((item) => item.span_type === "llm" || item.span_type === "tool").length;
+  const ttftValues = data.items.filter((item) => item.ttft_ms != null).map((item) => item.ttft_ms as number);
+  const averageTtft = ttftValues.length ? Math.round(ttftValues.reduce((sum, value) => sum + value, 0) / ttftValues.length) : 0;
+  const visibleCost = data.items.reduce((sum, item) => sum + (item.cost_total ?? 0), 0);
 
   return (
     <div className="page-scroll obs-tab-pane">
@@ -156,6 +171,7 @@ export default function CallsPage({ hideHeader = false }: { hideHeader?: boolean
         </header>
       ) : null}
 
+      <MetricStrip items={[{ label: "调用总数", value: data.total, meta: `当前页 LLM / 工具 ${typedCalls}` }, { label: "LLM / 工具", value: `${data.items.filter((item) => item.span_type === "llm").length} / ${data.items.filter((item) => item.span_type === "tool").length}`, meta: "当前页类型分布", tone: "teal" }, { label: "平均 TTFT", value: `${averageTtft}ms`, meta: `${ttftValues.length} 次有首 Token`, tone: "success" }, { label: "当前页成本", value: `$${visibleCost.toFixed(4)}`, meta: "仅已配置价格调用", tone: "warning" }]} />
       <div className="obs-panel">
         <div className="kb-panel-toolbar">
           <div className="kb-panel-title">
@@ -164,14 +180,14 @@ export default function CallsPage({ hideHeader = false }: { hideHeader?: boolean
             <Tag bordered={false}>{data.total} 条</Tag>
           </div>
           <div className="obs-filters">
-            <Select size="small" style={{ minWidth: 120 }} value={spanType} onChange={(v) => { setSpanType(v); applyFilter(1); }} options={TYPE_OPTIONS} />
-            <Select size="small" style={{ minWidth: 110 }} value={status} onChange={(v) => { setStatus(v); applyFilter(1); }} options={[
+            <Select size="small" style={{ minWidth: 120 }} value={spanType} onChange={(v) => { setSpanType(v); setPage(1); }} options={TYPE_OPTIONS} />
+            <Select size="small" style={{ minWidth: 110 }} value={status} onChange={(v) => { setStatus(v); setPage(1); }} options={[
               { value: "", label: "全部状态" },
               { value: "ok", label: "成功" },
               { value: "error", label: "错误" },
               { value: "timeout", label: "超时" },
             ]} />
-            <Input size="small" allowClear prefix={<span className="material-symbols-rounded" style={{ fontSize: 14 }}>search</span>} placeholder="模型 / 工具名…" style={{ width: 200 }} value={keyword} onChange={(e) => { setKeyword(e.target.value); applyFilter(1); }} />
+            <Input size="small" allowClear prefix={<span className="material-symbols-rounded" style={{ fontSize: 14 }}>search</span>} placeholder="模型 / 工具名…" style={{ width: 200 }} value={keyword} onChange={(e) => setKeyword(e.target.value)} />
           </div>
         </div>
         {data.items.length === 0 && !loading ? (
@@ -183,6 +199,7 @@ export default function CallsPage({ hideHeader = false }: { hideHeader?: boolean
             loading={loading}
             columns={columns}
             dataSource={data.items}
+            scroll={{ x: "max-content" }}
             pagination={{
               current: page,
               total: data.total,

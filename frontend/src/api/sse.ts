@@ -2,7 +2,11 @@
 // 因为使用 POST，不能用 EventSource
 import type {
   SessionStart,
+  TraceStart,
   MessageDelta,
+  RunStepStart,
+  RunStepUpdate,
+  RunStepEnd,
   ToolStart,
   ToolEnd,
   InterruptRequested,
@@ -14,7 +18,11 @@ import { API_KEY_STORAGE_KEY, DEFAULT_API_KEY } from "@/constants";
 
 export interface StreamHandlers {
   onSessionStart?(d: SessionStart): void;
+  onTraceStart?(d: TraceStart): void;
   onMessageDelta?(d: MessageDelta): void;
+  onRunStepStart?(d: RunStepStart): void;
+  onRunStepUpdate?(d: RunStepUpdate): void;
+  onRunStepEnd?(d: RunStepEnd): void;
   onToolStart?(d: ToolStart): void;
   onToolEnd?(d: ToolEnd): void;
   onInterrupt?(d: InterruptRequested): void;
@@ -69,8 +77,20 @@ export async function streamChat(
         case "session_start":
           handlers.onSessionStart?.(d as SessionStart);
           break;
+        case "trace_start":
+          handlers.onTraceStart?.(d as TraceStart);
+          break;
         case "message_delta":
           handlers.onMessageDelta?.(d as MessageDelta);
+          break;
+        case "run_step_start":
+          handlers.onRunStepStart?.(d as RunStepStart);
+          break;
+        case "run_step_update":
+          handlers.onRunStepUpdate?.(d as RunStepUpdate);
+          break;
+        case "run_step_end":
+          handlers.onRunStepEnd?.(d as RunStepEnd);
           break;
         case "tool_start":
           handlers.onToolStart?.(d as ToolStart);

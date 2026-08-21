@@ -34,12 +34,16 @@ export default function DocumentTaskRows({
   loading,
   onChanged,
   onPreviewDoc,
+  selectedDocId,
+  onSelectDoc,
 }: {
   kbId: string;
   documents: KnowledgeDocItem[];
   loading: boolean;
   onChanged: () => void;
   onPreviewDoc: (doc: KnowledgeDocItem) => void;
+  selectedDocId?: number | null;
+  onSelectDoc?: (doc: KnowledgeDocItem) => void;
 }) {
   const [uploading, setUploading] = useState(false);
   const [busyDoc, setBusyDoc] = useState<number | null>(null);
@@ -155,7 +159,7 @@ export default function DocumentTaskRows({
             const meta = PARSE_STATUS_META[doc.parse_status] ?? PARSE_STATUS_META.pending;
             const running = doc.parse_status === "parsing" || doc.parse_status === "reparsing";
             return (
-              <div className={`kb-doc-row${running ? " running" : ""}`} key={doc.doc_id}>
+              <div className={`kb-doc-row${running ? " running" : ""}${selectedDocId === doc.doc_id ? " selected" : ""}`} key={doc.doc_id} role={onSelectDoc ? "option" : undefined} aria-selected={onSelectDoc ? selectedDocId === doc.doc_id : undefined} onClick={() => onSelectDoc?.(doc)} tabIndex={onSelectDoc ? (selectedDocId === doc.doc_id ? 0 : -1) : undefined} onKeyDown={(event) => { if (onSelectDoc && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); onSelectDoc(doc); } }}>
                 <div className="kb-doc-icon">
                   <span className="material-symbols-rounded">{doc.source_file.endsWith(".pdf") ? "picture_as_pdf" : "description"}</span>
                 </div>
@@ -178,7 +182,7 @@ export default function DocumentTaskRows({
                     <span className="kb-doc-time">{formatTime(doc.updated_at ?? doc.created_at)}</span>
                   </div>
                 </div>
-                <div className="kb-doc-actions">
+                <div className="kb-doc-actions" onClick={(event) => event.stopPropagation()}>
                   {doc.parse_status === "failed" && doc.error ? (
                     <Tooltip title={doc.error}>
                       <Button size="small" type="text" danger onClick={() => void reparse(doc)} loading={busyDoc === doc.doc_id}>

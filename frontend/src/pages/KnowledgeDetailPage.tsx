@@ -7,15 +7,18 @@ import type { KnowledgeBaseDetail, KnowledgeDocItem } from "@/types/api";
 import DocumentTaskRows from "@/components/knowledge/DocumentTaskRows";
 import ChunkRecordsTable from "@/components/knowledge/ChunkRecordsTable";
 import TestRetrievePanel from "@/components/knowledge/TestRetrievePanel";
+import KnowledgeEvalPanel from "@/components/knowledge/KnowledgeEvalPanel";
 import { formatTime } from "@/utils/format";
+import { InspectorField, ResponsiveInspector, StatusDot } from "@/components/common/Workspace";
 
-type TabKey = "info" | "documents" | "chunks" | "test";
+type TabKey = "info" | "documents" | "chunks" | "test" | "eval";
 
 const TABS: { key: TabKey; label: string; icon: string }[] = [
   { key: "info", label: "知识库信息", icon: "info" },
   { key: "documents", label: "文档管理", icon: "folder_open" },
   { key: "chunks", label: "分块管理", icon: "grid_view" },
   { key: "test", label: "测试检索", icon: "travel_explore" },
+  { key: "eval", label: "检索评测", icon: "fact_check" },
 ];
 
 export default function KnowledgeDetailPage() {
@@ -39,6 +42,8 @@ export default function KnowledgeDetailPage() {
     return "documents";
   });
   const [showLocateTip, setShowLocateTip] = useState(false);
+  const [selectedDocId, setSelectedDocId] = useState<number | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
 
   const load = useCallback(async () => {
     if (!kbId) return;
@@ -105,6 +110,7 @@ export default function KnowledgeDetailPage() {
 
   const kb = detail?.kb ?? null;
   const documents = detail?.documents ?? [];
+  const selectedDocument = documents.find((doc) => doc.doc_id === selectedDocId) ?? documents[0] ?? null;
   const parsingCount = documents.filter(
     (doc) => doc.parse_status === "parsing" || doc.parse_status === "reparsing"
   ).length;
@@ -140,10 +146,13 @@ export default function KnowledgeDetailPage() {
         <div className="kb-detail-empty">知识库不存在或无权访问</div>
       ) : (
         <div className="kb-detail-body">
-          <nav className="kb-side-nav">
+          <nav className="kb-side-nav" role="tablist" aria-label="知识库详情功能区">
             {TABS.map((item) => (
               <button
                 key={item.key}
+                role="tab"
+                aria-selected={tab === item.key}
+                aria-controls="knowledge-tab-panel"
                 className={`kb-side-nav-item${tab === item.key ? " active" : ""}`}
                 onClick={() => switchTab(item.key)}
               >
@@ -153,7 +162,7 @@ export default function KnowledgeDetailPage() {
               </button>
             ))}
           </nav>
-          <section className="kb-detail-content">
+          <section className="kb-detail-content" id="knowledge-tab-panel" role="tabpanel">
             {showLocateTip && focusChunkId ? (
               <div className="kb-locate-tip">
                 <span className="material-symbols-rounded">near_me</span>
@@ -190,13 +199,12 @@ export default function KnowledgeDetailPage() {
             ) : null}
 
             {tab === "documents" ? (
-              <DocumentTaskRows
-                kbId={kbId}
-                documents={documents}
-                loading={loading}
-                onChanged={load}
-                onPreviewDoc={handlePreviewDoc}
-              />
+              <div className="knowledge-detail-master">
+                <DocumentTaskRows kbId={kbId} documents={documents} loading={loading} onChanged={load} onPreviewDoc={handlePreviewDoc} selectedDocId={selectedDocument?.doc_id ?? null} onSelectDoc={(doc) => { setSelectedDocId(doc.doc_id); setInspectorOpen(true); }} />
+                <ResponsiveInspector open={inspectorOpen && Boolean(selectedDocument)} onClose={() => setInspectorOpen(false)} title={selectedDocument?.source_file ?? "文档详情"} subtitle={selectedDocument ? <StatusDot label={selectedDocument.parse_status === "parsed" ? "已就绪" : selectedDocument.parse_status} tone={selectedDocument.parse_status === "parsed" ? "success" : selectedDocument.parse_status === "failed" ? "danger" : "warning"} /> : undefined}>
+                  {!selectedDocument ? <div className="kb-doc-empty"><span className="material-symbols-rounded">description</span><p>选择一个文档查看详情</p></div> : <><section className="inspector-section"><h3>文件信息</h3><InspectorField label="文件名">{selectedDocument.source_file}</InspectorField><InspectorField label="文件大小">{selectedDocument.file_size.toLocaleString()} B</InspectorField><InspectorField label="解析来源">{selectedDocument.parse_source || "—"}</InspectorField><InspectorField label="分块数">{selectedDocument.chunk_count}</InspectorField><InspectorField label="更新时间">{formatTime(selectedDocument.updated_at ?? selectedDocument.created_at)}</InspectorField><InspectorField label="文档 ID" mono>{selectedDocument.doc_id}</InspectorField></section>{selectedDocument.error ? <section className="inspector-section"><h3>解析错误</h3><p className="inspector-copy obs-err-text">{selectedDocument.error}</p></section> : null}<section className="inspector-section inspector-button-stack"><Button block onClick={() => handlePreviewDoc(selectedDocument)} disabled={selectedDocument.parse_status !== "parsed"}>查看分块</Button></section></>}
+                </ResponsiveInspector>
+              </div>
             ) : null}
 
             {tab === "chunks" ? (
@@ -210,6 +218,8 @@ export default function KnowledgeDetailPage() {
             ) : null}
 
             {tab === "test" ? <TestRetrievePanel kbId={kbId} /> : null}
+
+            {tab === "eval" ? <KnowledgeEvalPanel kbId={kbId} /> : null}
           </section>
         </div>
       )}

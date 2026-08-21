@@ -3,6 +3,7 @@ import { getData } from "@/api/http";
 import type {
   OverviewData,
   TimelineData,
+  TraceEventsData,
   ToolLogsData,
   ToolStatItem,
   TraceDetail,
@@ -40,6 +41,10 @@ export function getTraceDetail(traceId: string): Promise<TraceDetail> {
 
 export function getTraceTimeline(traceId: string): Promise<TimelineData> {
   return getData<TimelineData>(`/observability/traces/${traceId}/timeline`);
+}
+
+export function getTraceEvents(traceId: string): Promise<TraceEventsData> {
+  return getData<TraceEventsData>(`/observability/traces/${traceId}/events`);
 }
 
 export function getTraceLogs(traceId: string): Promise<{

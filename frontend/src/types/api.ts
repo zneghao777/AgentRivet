@@ -41,6 +41,10 @@ export interface HistoryMessage {
   role: "user" | "assistant" | "tool";
   content: string;
   tool_name: string | null;
+  token_usage: Record<string, number> | null;
+  trace_id: string | null;
+  request_id: string | null;
+  step_index: number | null;
   created_at: string | null;
 }
 
@@ -57,10 +61,18 @@ export interface SkillItem {
   tags: string[];
   enabled: boolean;
   path: string;
-  source?: SkillCategory;
+  source: SkillCategory;
+  file_count: number;
+  has_scripts: boolean;
 }
 
 export type SkillCategory = "builtin" | "external";
+
+export interface SkillImportResponse {
+  skills: SkillItem[];
+  replaced: string[];
+  warnings: string[];
+}
 
 export interface ToolItem {
   name: string;
@@ -167,6 +179,61 @@ export interface RetrieveHit {
   text: string;
   score: number;
   chunk_index: number;
+  strategy: string; // vector | keyword | hybrid | rerank
+  rerank_score: number | null;
+}
+
+// ---------- 混合检索 / 评测（AGENTIC_RAG_UPGRADE_SPEC §4） ----------
+
+export type RetrievalStrategy = "auto" | "vector" | "keyword" | "hybrid";
+
+export interface TestSearchRequest {
+  query: string;
+  top_k: number;
+  strategy: string;
+  rerank: boolean;
+  expand_query?: boolean;
+}
+
+export interface EvaluationCaseResult {
+  query: string;
+  hit: boolean;
+  rank: number; // 首个命中排名（0 = 未命中）
+  top_chunk_ids: number[];
+}
+
+export interface EvaluationVariantResult {
+  variant: string;
+  hit_rate: number;
+  mrr: number;
+  cases: EvaluationCaseResult[];
+}
+
+export interface EvaluationJudgeCase {
+  query: string;
+  faithfulness: number;
+  relevancy: number;
+}
+
+export interface EvaluationJudgeSummary {
+  avg_faithfulness: number;
+  avg_relevancy: number;
+  cases: EvaluationJudgeCase[];
+}
+
+export interface EvaluationResults {
+  variants: EvaluationVariantResult[];
+  judge: EvaluationJudgeSummary | null;
+  stats: { total: number; valid: number; skipped: number };
+}
+
+export interface EvaluationRunItem {
+  evaluation_id: number;
+  name: string;
+  status: string;
+  variants: string[] | null;
+  results: EvaluationResults | null;
+  created_at: string | null;
 }
 
 // ---------- 长期记忆（MEMORY_SPEC §8.5） ----------
@@ -203,6 +270,19 @@ export interface MemoryTimelineGroup {
 
 export interface MemoryTimelineData {
   groups: MemoryTimelineGroup[];
+}
+
+export interface MemoryGraphEdge {
+  source: number;
+  target: number;
+  relation: "semantic" | "same_source";
+  strength: number;
+}
+
+export interface MemoryGraphData {
+  nodes: MemoryItem[];
+  edges: MemoryGraphEdge[];
+  similarity_threshold: number;
 }
 
 export interface MemoryOverview {

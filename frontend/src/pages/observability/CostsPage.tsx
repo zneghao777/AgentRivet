@@ -1,6 +1,8 @@
 // 成本分析（OBSERVABILITY_SPEC §12.3 / §6.4）：总成本、按模型分组、价格版本
 import { useCallback, useEffect, useState } from "react";
 import { Empty, Select, Table, Tag, message } from "antd";
+import ReactApexChart from "react-apexcharts";
+import type { ApexAxisChartSeries, ApexOptions } from "apexcharts";
 import { getCosts, getModelPrices } from "@/api/observability";
 import { formatTime } from "@/utils/format";
 
@@ -45,6 +47,18 @@ export default function CostsPage({ hideHeader = false }: { hideHeader?: boolean
     effective_from: p.effective_from,
     version: p.version,
   }));
+  const costSeries: ApexAxisChartSeries = [{ name: "成本", data: groups.map((group) => Number(group.cost.toFixed(6))) }];
+  const costOptions: ApexOptions = {
+    chart: { type: "bar", background: "transparent", fontFamily: 'Inter, "Noto Sans SC", "PingFang SC", sans-serif', toolbar: { show: false }, parentHeightOffset: 0 },
+    colors: ["#2f7fe6"],
+    dataLabels: { enabled: false },
+    grid: { borderColor: "rgba(126, 166, 202, 0.22)", strokeDashArray: 4 },
+    legend: { show: false },
+    plotOptions: { bar: { horizontal: true, borderRadius: 6, borderRadiusApplication: "end", barHeight: "46%" } },
+    xaxis: { categories: groups.map((group) => group.key), labels: { formatter: (value) => `$${Number(value).toFixed(4)}` } },
+    yaxis: { labels: { maxWidth: 150, style: { fontSize: "11px", fontWeight: 600 } } },
+    tooltip: { shared: false, intersect: true, y: { formatter: (value) => `$${value.toFixed(6)}` } },
+  };
 
   return (
     <div className="page-scroll obs-tab-pane">
@@ -101,19 +115,16 @@ export default function CostsPage({ hideHeader = false }: { hideHeader?: boolean
         ) : groups.length === 0 ? (
           <Empty description="暂无成本数据" style={{ padding: 32 }} />
         ) : (
-          <div className="cost-group-list">
-            {groups.map((g) => (
-              <div className="cost-group-row" key={g.key}>
-                <div className="cost-group-name">{g.key}</div>
-                <div className="cost-group-bar">
-                  <div className="cost-group-fill" style={{ width: `${costData && costData.total_cost ? Math.min(100, (g.cost / costData.total_cost) * 100) : 0}%` }} />
+          <div className="cost-chart-layout">
+            <div className="cost-chart"><ReactApexChart type="bar" height="100%" options={costOptions} series={costSeries} /></div>
+            <div className="cost-group-list" aria-label="成本拆分文字摘要">
+              {groups.map((g) => (
+                <div className="cost-group-row" key={g.key}>
+                  <div className="cost-group-name">{g.key}</div>
+                  <div className="cost-group-val"><b>${g.cost.toFixed(4)}</b><small>{g.tokens.toLocaleString()} tokens · 输入 {g.input_tokens.toLocaleString()} / 输出 {g.output_tokens.toLocaleString()}</small></div>
                 </div>
-                <div className="cost-group-val">
-                  <b>${g.cost.toFixed(4)}</b>
-                  <small>{g.tokens.toLocaleString()} tokens · in {g.input_tokens.toLocaleString()} / out {g.output_tokens.toLocaleString()}</small>
-                </div>
-              </div>
-            ))}
+              ))}
+            </div>
           </div>
         )}
       </div>

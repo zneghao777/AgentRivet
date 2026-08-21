@@ -1,5 +1,5 @@
 // 知识库体系总览（KB_MANAGEMENT_SPEC §4.2）：context-cards 质感卡片网格
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Button,
   Empty,
@@ -7,20 +7,17 @@ import {
   Input,
   Modal,
   Popconfirm,
+  Select,
   Skeleton,
   Switch,
-  Tag,
   Upload,
   message,
 } from "antd";
 import { useNavigate } from "react-router-dom";
 import { deleteData, getData, patchData, postData } from "@/api/http";
-import type {
-  KnowledgeBaseDetail,
-  KnowledgeBaseItem,
-  KnowledgeUploadResponse,
-} from "@/types/api";
+import type { KnowledgeBaseItem, KnowledgeUploadResponse } from "@/types/api";
 import { formatTime } from "@/utils/format";
+import { InspectorField, MetricStrip, ResponsiveInspector, StatusDot, WorkspaceHeader } from "@/components/common/Workspace";
 
 const MAX_FILE_SIZE_MB = 50;
 const ACCEPT_EXTS = ".md,.txt,.pdf,.docx";
@@ -33,7 +30,10 @@ export default function KnowledgeCenterPage() {
   const [creating, setCreating] = useState(false);
   const [uploadingKb, setUploadingKb] = useState<string | null>(null);
   const [togglingKb, setTogglingKb] = useState<string | null>(null);
-  const [stats, setStats] = useState<Record<string, { docs: number; chunks: number; parsing: number }>>({});
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [keyword, setKeyword] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | "active" | "disabled">("all");
   const [form] = Form.useForm();
 
   const load = useCallback(async () => {
@@ -41,25 +41,7 @@ export default function KnowledgeCenterPage() {
     try {
       const data = await getData<KnowledgeBaseItem[]>("/knowledge-bases");
       setKbs(data);
-      // 并行拉取各库详情统计
-      const results = await Promise.allSettled(
-        data.map((kb) =>
-          getData<KnowledgeBaseDetail>(`/knowledge-bases/${kb.kb_id}`)
-        )
-      );
-      const next: Record<string, { docs: number; chunks: number; parsing: number }> = {};
-      results.forEach((result, index) => {
-        if (result.status === "fulfilled") {
-          const kb = data[index];
-          const docs = result.value.documents;
-          next[kb.kb_id] = {
-            docs: docs.length,
-            chunks: kb.chunk_count,
-            parsing: docs.filter((d) => d.parse_status === "parsing" || d.parse_status === "reparsing").length,
-          };
-        }
-      });
-      setStats(next);
+      setSelectedId((current) => current && data.some((item) => item.kb_id === current) ? current : data[0]?.kb_id ?? null);
     } catch (e) {
       message.error(e instanceof Error ? e.message : "加载知识库失败");
     } finally {
@@ -69,11 +51,6 @@ export default function KnowledgeCenterPage() {
 
   useEffect(() => {
     void load();
-    // 解析中任务自动刷新
-    const timer = window.setInterval(() => {
-      void load();
-    }, 5000);
-    return () => window.clearInterval(timer);
   }, [load]);
 
   const toggleKb = async (kb: KnowledgeBaseItem, enabled: boolean) => {
@@ -141,116 +118,41 @@ export default function KnowledgeCenterPage() {
     }
   };
 
-  return (
-    <div className="page-scroll">
-      <header className="page-header">
-        <div className="page-header-icon">
-          <span className="material-symbols-rounded">database</span>
-        </div>
-        <div className="page-header-copy">
-          <h1>知识库</h1>
-          <p>上传文档构建企业知识，让 Agent 基于知识回答并引用来源</p>
-        </div>
-        <Button
-          type="primary"
-          icon={<span className="material-symbols-rounded" style={{ fontSize: 16 }}>add</span>}
-          onClick={() => setCreateOpen(true)}
-        >
-          新建知识库
-        </Button>
-        <Button icon={<span className="material-symbols-rounded" style={{ fontSize: 16 }}>refresh</span>} onClick={() => void load()}>
-          刷新
-        </Button>
-      </header>
+  const visibleKbs = useMemo(() => {
+    const query = keyword.trim().toLowerCase();
+    return kbs.filter((kb) => {
+      const matchesStatus = statusFilter === "all" || kb.status === statusFilter;
+      const matchesQuery = !query || `${kb.name} ${kb.description ?? ""}`.toLowerCase().includes(query);
+      return matchesStatus && matchesQuery;
+    });
+  }, [kbs, keyword, statusFilter]);
+  const selected = kbs.find((kb) => kb.kb_id === selectedId) ?? null;
+  const totalDocs = kbs.reduce((sum, kb) => sum + kb.doc_count, 0);
+  const totalChunks = kbs.reduce((sum, kb) => sum + kb.chunk_count, 0);
 
-      {loading && kbs.length === 0 ? (
-        <div className="kb-grid">
-          {Array.from({ length: 6 }).map((_, index) => (
-            <div className="kb-card-skeleton" key={index}>
-              <Skeleton active avatar paragraph={{ rows: 3 }} />
-            </div>
-          ))}
-        </div>
-      ) : kbs.length === 0 ? (
-        <Empty description="暂无知识库，点击右上角「新建知识库」开始" style={{ marginTop: 64 }} />
-      ) : (
-        <div className="kb-grid">
-          {kbs.map((kb) => {
-            const stat = stats[kb.kb_id] ?? { docs: kb.doc_count, chunks: kb.chunk_count, parsing: 0 };
-            return (
-              <article
-                className="kb-card"
-                key={kb.kb_id}
-                onClick={() => navigate(`/knowledge/${kb.kb_id}`)}
-              >
-                <div className="kb-card-head">
-                  <div className="kb-card-icon">
-                    <span className="material-symbols-rounded">database</span>
-                  </div>
-                  <div className="kb-card-title">
-                    <div className="kb-card-name">{kb.name}</div>
-                    <Tag
-                      color={kb.status === "active" ? "success" : "default"}
-                      className="kb-card-status"
-                    >
-                      {kb.status === "active" ? "已启用" : "已停用"}
-                    </Tag>
-                  </div>
-                  <Switch
-                    size="small"
-                    checked={kb.status === "active"}
-                    loading={togglingKb === kb.kb_id}
-                    onChange={(checked) => void toggleKb(kb, checked)}
-                    onClick={(_checked, event) => event.stopPropagation()}
-                    aria-label={`${kb.status === "active" ? "停用" : "启用"}知识库 ${kb.name}`}
-                  />
-                </div>
-                <p className="kb-card-desc">{kb.description || "（无描述）"}</p>
-                <div className="kb-card-stats">
-                  <span><b>{stat.docs}</b> 文档</span>
-                  <span><b>{stat.chunks}</b> 分块</span>
-                  {stat.parsing > 0 ? (
-                    <span className="kb-card-parsing">
-                      <i className="spin" /> {stat.parsing} 解析中
-                    </span>
-                  ) : null}
-                  <span className="kb-card-time">{formatTime(kb.updated_at ?? kb.created_at)}</span>
-                </div>
-                <div className="kb-card-actions" onClick={(event) => event.stopPropagation()}>
-                  <Upload
-                    accept={ACCEPT_EXTS}
-                    showUploadList={false}
-                    beforeUpload={(file) => {
-                      void uploadFile(kb, file);
-                      return false;
-                    }}
-                  >
-                    <Button size="small" loading={uploadingKb === kb.kb_id} title="上传文档">
-                      <span className="material-symbols-rounded" style={{ fontSize: 15 }}>upload</span>
-                      上传
-                    </Button>
-                  </Upload>
-                  <Button size="small" type="primary" ghost onClick={() => navigate(`/knowledge/${kb.kb_id}`)}>
-                    详情
-                  </Button>
-                  <Popconfirm
-                    title="删除知识库"
-                    description="将删除该知识库全部文档与分块，确定？"
-                    okText="删除"
-                    cancelText="取消"
-                    okButtonProps={{ danger: true }}
-                    onConfirm={() => void removeKb(kb)}
-                  >
-                    <Button size="small" danger>
-                      <span className="material-symbols-rounded" style={{ fontSize: 15 }}>delete</span>
-                    </Button>
-                  </Popconfirm>
-                </div>
-              </article>
-            );
-          })}
-        </div>
-      )}
+  return (
+    <div className="page-scroll workspace-page knowledge-page">
+      <WorkspaceHeader icon="database" title="知识库" description="上传文档构建企业知识，让 Agent 基于知识回答并引用来源" actions={<><Button type="primary" icon={<span className="material-symbols-rounded">add</span>} onClick={() => setCreateOpen(true)}>新建知识库</Button><Button icon={<span className="material-symbols-rounded">refresh</span>} onClick={() => void load()}>刷新</Button></>} />
+      <MetricStrip items={[{ label: "知识库", value: kbs.length, meta: `已启用 ${kbs.filter((kb) => kb.status === "active").length}` }, { label: "文档", value: totalDocs, meta: "全部知识来源", tone: "teal" }, { label: "分块", value: totalChunks, meta: "可检索内容片段", tone: "warning" }]} />
+      <div className="workspace-toolbar"><Input allowClear prefix={<span className="material-symbols-rounded">search</span>} placeholder="搜索知识库名称或描述" value={keyword} onChange={(event) => setKeyword(event.target.value)} /><Select value={statusFilter} onChange={setStatusFilter} options={[{ value: "all", label: "全部状态" }, { value: "active", label: "已启用" }, { value: "disabled", label: "已停用" }]} /></div>
+      <div className="workspace-master-detail">
+        <section className="data-surface knowledge-master">
+          <div className="data-list-header knowledge-grid-row"><span>知识库名称 / 描述</span><span>状态</span><span className="numeric">文档</span><span className="numeric">分块</span><span>最后更新</span></div>
+          {loading && kbs.length === 0 ? <Skeleton active paragraph={{ rows: 6 }} /> : null}
+          {!loading && visibleKbs.length === 0 ? <Empty description="暂无匹配的知识库" /> : null}
+          {visibleKbs.map((kb) => { const active = kb.kb_id === selectedId; return (
+            <button type="button" key={kb.kb_id} className={`data-list-row knowledge-grid-row${active ? " selected" : ""}`} onClick={() => { setSelectedId(kb.kb_id); setInspectorOpen(true); }} onDoubleClick={() => navigate(`/knowledge/${kb.kb_id}`)} aria-selected={active}>
+              <span className="knowledge-primary-cell"><span className="row-leading-icon material-symbols-rounded">database</span><span><b>{kb.name}</b><small>{kb.description || "暂无描述"}</small></span></span>
+              <StatusDot label={kb.status === "active" ? "已启用" : "已停用"} tone={kb.status === "active" ? "success" : "neutral"} />
+              <span className="numeric">{kb.doc_count}</span><span className="numeric">{kb.chunk_count}</span><span className="subtle-label">{formatTime(kb.updated_at ?? kb.created_at)}</span>
+            </button>
+          ); })}
+          <footer className="data-list-footer">共 {visibleKbs.length} 个知识库</footer>
+        </section>
+        <ResponsiveInspector open={inspectorOpen && Boolean(selected)} onClose={() => setInspectorOpen(false)} title={selected?.name ?? "知识库详情"} subtitle={selected ? <StatusDot label={selected.status === "active" ? "已启用" : "已停用"} tone={selected.status === "active" ? "success" : "neutral"} /> : undefined} actions={selected ? <Switch checked={selected.status === "active"} loading={togglingKb === selected.kb_id} onChange={(checked) => void toggleKb(selected, checked)} /> : undefined}>
+          {!selected ? <Empty description="选择一个知识库查看详情" /> : <><section className="inspector-section"><h3>基本信息</h3><p className="inspector-copy">{selected.description || "暂无描述"}</p><InspectorField label="知识库 ID" mono>{selected.kb_id}</InspectorField><InspectorField label="创建时间">{formatTime(selected.created_at)}</InspectorField><InspectorField label="最后更新">{formatTime(selected.updated_at ?? selected.created_at)}</InspectorField></section><section className="inspector-section"><h3>统计信息</h3><InspectorField label="文档数">{selected.doc_count}</InspectorField><InspectorField label="分块数">{selected.chunk_count}</InspectorField></section><section className="inspector-section inspector-button-stack"><Upload accept={ACCEPT_EXTS} showUploadList={false} beforeUpload={(file) => { void uploadFile(selected, file); return false; }}><Button block loading={uploadingKb === selected.kb_id} icon={<span className="material-symbols-rounded">upload</span>}>上传文档</Button></Upload><Button block type="primary" onClick={() => navigate(`/knowledge/${selected.kb_id}`)}>进入详情</Button><Popconfirm title="删除知识库" description="将删除全部文档与分块，确定？" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => void removeKb(selected)}><Button block danger>删除知识库</Button></Popconfirm></section></>}
+        </ResponsiveInspector>
+      </div>
 
       <Modal
         title="新建知识库"

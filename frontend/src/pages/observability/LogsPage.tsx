@@ -5,6 +5,7 @@ import { useNavigate } from "react-router-dom";
 import { getLogs } from "@/api/observability";
 import type { LogItem } from "@/api/observability";
 import { formatTime } from "@/utils/format";
+import { MetricStrip, StatusDot } from "@/components/common/Workspace";
 
 const SEVERITY_COLOR: Record<string, string> = {
   DEBUG: "default",
@@ -18,6 +19,7 @@ export default function LogsPage({ hideHeader = false }: { hideHeader?: boolean 
   const navigate = useNavigate();
   const [severity, setSeverity] = useState<string>("");
   const [keyword, setKeyword] = useState("");
+  const [searchKeyword, setSearchKeyword] = useState("");
   const [data, setData] = useState<{ items: LogItem[]; next_cursor: number | null }>({ items: [], next_cursor: null });
   const [loading, setLoading] = useState(false);
   const [limit, setLimit] = useState(50);
@@ -25,18 +27,23 @@ export default function LogsPage({ hideHeader = false }: { hideHeader?: boolean 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const d = await getLogs({ severity: severity || undefined, keyword: keyword || undefined, limit });
+      const d = await getLogs({ severity: severity || undefined, keyword: searchKeyword || undefined, limit });
       setData(d);
     } catch (e) {
       message.error(e instanceof Error ? e.message : "加载日志失败");
     } finally {
       setLoading(false);
     }
-  }, [severity, keyword, limit]);
+  }, [severity, searchKeyword, limit]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSearchKeyword(keyword.trim()), 320);
+    return () => window.clearTimeout(timer);
+  }, [keyword]);
 
   const columns = [
     {
@@ -100,6 +107,8 @@ export default function LogsPage({ hideHeader = false }: { hideHeader?: boolean 
         ),
     },
   ];
+  const errorCount = data.items.filter((item) => item.severity_text === "ERROR" || item.severity_text === "FATAL").length;
+  const warningCount = data.items.filter((item) => item.severity_text === "WARN").length;
 
   return (
     <div className="page-scroll obs-tab-pane">
@@ -115,6 +124,7 @@ export default function LogsPage({ hideHeader = false }: { hideHeader?: boolean 
         </header>
       ) : null}
 
+      <MetricStrip items={[{ label: "日志条数", value: data.items.length, meta: `本批最多 ${limit} 条` }, { label: "错误", value: errorCount, meta: "ERROR / FATAL", tone: errorCount ? "danger" : "success" }, { label: "警告", value: warningCount, meta: "WARN", tone: warningCount ? "warning" : "success" }, { label: "状态", value: <StatusDot label="实时采集" tone="success" />, meta: "按结构化字段关联 Trace", tone: "teal" }]} />
       <div className="obs-panel">
         <div className="kb-panel-toolbar">
           <div className="kb-panel-title">

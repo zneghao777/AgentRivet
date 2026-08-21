@@ -1,11 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { Select } from "antd";
 import MessageList from "./MessageList";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { streamChat } from "@/api/sse";
-import { getData } from "@/api/http";
-import type { KnowledgeBaseItem, SkillItem } from "@/types/api";
+import type { SkillItem } from "@/types/api";
 import { summarize } from "@/utils/format";
 
 export default function ChatWindow({
@@ -14,22 +12,15 @@ export default function ChatWindow({
   skills: SkillItem[];
 }) {
   const { currentSessionId, messages, streaming, lastError, setStreaming, setError,
-    pushMessage, updateLastAssistant, addToolCall, completeToolCall, removeEmptyAssistant,
+    pushMessage, updateLastAssistant, removeEmptyAssistant, beginRun, startRunStep,
+    updateRunStep, endRunStep, setRunTokenUsage, finishRun, failRun, cancelRun,
     setSessionTitle } = useSessionStore();
   const apiKey = useSettingsStore((state) => state.apiKey);
   const [text, setText] = useState("");
-  const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseItem[]>([]);
-  const [selectedKbs, setSelectedKbs] = useState<string[]>([]);
   const abortRef = useRef<AbortController | null>(null);
   const deltaFrameRef = useRef<number | null>(null);
   const pendingDeltaRef = useRef("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
-
-  useEffect(() => {
-    getData<KnowledgeBaseItem[]>("/knowledge-bases")
-      .then((items) => setKnowledgeBases(items.filter((kb) => kb.status === "active")))
-      .catch(() => undefined);
-  }, []);
 
   useEffect(() => {
     if (currentSessionId) inputRef.current?.focus();
@@ -54,7 +45,11 @@ export default function ChatWindow({
     }
     setText("");
     pushMessage({ role: "user", content: message });
-    pushMessage({ role: "assistant", content: "" });
+    pushMessage({
+      role: "assistant",
+      content: "",
+      run: { status: "running", startedAt: Date.now(), steps: [] },
+    });
     const controller = new AbortController();
     abortRef.current = controller;
     setStreaming(true);
@@ -71,8 +66,11 @@ export default function ChatWindow({
       await streamChat(sessionId, {
         message,
         skills: skills.filter((skill) => skill.enabled).map((skill) => skill.name),
-        ...(selectedKbs.length > 0 ? { knowledge_bases: selectedKbs } : {}),
       }, {
+        onTraceStart: (event) => { if (isCurrent()) beginRun(event); },
+        onRunStepStart: (event) => { if (isCurrent()) startRunStep(event); },
+        onRunStepUpdate: (event) => { if (isCurrent()) updateRunStep(event); },
+        onRunStepEnd: (event) => { if (isCurrent()) endRunStep(event); },
         onMessageDelta: (delta) => {
           if (!isCurrent()) return;
           pendingDeltaRef.current += delta.content;
@@ -80,19 +78,29 @@ export default function ChatWindow({
             deltaFrameRef.current = window.requestAnimationFrame(flushPendingDelta);
           }
         },
-        onToolStart: (tool) => { if (isCurrent()) addToolCall(tool); },
-        onToolEnd: (tool) => { if (isCurrent()) completeToolCall(tool); },
-        onError: (error) => { if (isCurrent()) setError(error.message); },
+        onMessageEnd: (event) => { if (isCurrent()) setRunTokenUsage(event); },
+        onRunEnd: (event) => { if (isCurrent()) finishRun(event); },
+        onError: (error) => {
+          if (!isCurrent()) return;
+          setError(error.message);
+          failRun();
+        },
       }, controller.signal);
     } catch (error) {
-      if (!controller.signal.aborted && isCurrent()) setError(error instanceof Error ? error.message : "连接中断");
+      if (isCurrent()) {
+        if (controller.signal.aborted) cancelRun();
+        else {
+          setError(error instanceof Error ? error.message : "连接中断");
+          failRun();
+        }
+      }
     } finally {
       if (isCurrent()) {
         if (deltaFrameRef.current !== null) window.cancelAnimationFrame(deltaFrameRef.current);
         flushPendingDelta();
         const currentMessages = useSessionStore.getState().messages;
         const last = currentMessages[currentMessages.length - 1];
-        if (last?.role === "assistant" && !last.content && !last.tools?.length) removeEmptyAssistant();
+        if (last?.role === "assistant" && !last.content && !last.run) removeEmptyAssistant();
         setStreaming(false);
       }
       abortRef.current = null;
@@ -106,39 +114,25 @@ export default function ChatWindow({
           <div className="header-icon"><span className="material-symbols-rounded">forum</span></div>
           <h1>与 Harness Agent 对话</h1>
         </div>
-        <div className={`status-pill${currentSessionId ? " active" : ""}`}><i />{streaming ? "正在生成" : currentSessionId ? "当前状态: 活跃" : "等待会话"}</div>
+        <div className={`status-pill${currentSessionId ? " active" : ""}`} aria-live="polite"><i />{streaming ? "正在生成" : currentSessionId ? "当前状态: 活跃" : "等待会话"}</div>
       </header>
 
-      {lastError ? <div className="chat-error"><span className="material-symbols-rounded">error</span>{lastError}<button onClick={() => setError(null)}>×</button></div> : null}
+      {lastError ? <div className="chat-error" role="alert"><span className="material-symbols-rounded" aria-hidden="true">error</span>{lastError}<button type="button" aria-label="关闭错误提示" onClick={() => setError(null)}>×</button></div> : null}
       <MessageList messages={messages} streaming={streaming} />
 
       <footer className="composer-area">
         {!currentSessionId ? <div className="composer-hint">请先新建或选择一个会话</div> : null}
-        <div className="composer-kb-bar">
-          <span className="material-symbols-rounded">database</span>
-          <Select
-            mode="multiple"
-            size="small"
-            allowClear
-            placeholder="绑定知识库（可选，Agent 将基于其检索回答）"
-            maxTagCount={3}
-            value={selectedKbs}
-            onChange={setSelectedKbs}
-            style={{ flex: 1, minWidth: 0, maxWidth: 560 }}
-            options={knowledgeBases.map((kb) => ({ value: kb.name, label: kb.name }))}
-          />
-        </div>
         <div className="composer">
-          <button title="附加"><span className="material-symbols-rounded">add_circle</span></button>
+          <button type="button" title="附加" aria-label="附加内容"><span className="material-symbols-rounded" aria-hidden="true">add_circle</span></button>
           <textarea ref={inputRef} value={text} rows={1} disabled={streaming || !currentSessionId}
+            aria-label="发送给 Harness Agent 的消息"
             placeholder="输入消息，Enter 发送，Shift+Enter 换行"
             onChange={(event) => { setText(event.target.value); if (lastError) setError(null); }}
             onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} />
           {streaming ? (
-            <button className="send-button stop" title="停止生成" onClick={() => abortRef.current?.abort()}><span className="material-symbols-rounded">stop</span></button>
+            <button type="button" className="send-button stop" title="停止生成" aria-label="停止生成" onClick={() => abortRef.current?.abort()}><span className="material-symbols-rounded" aria-hidden="true">stop</span></button>
           ) : (
-            <><button title="语音输入"><span className="material-symbols-rounded">mic</span></button>
-            <button className="send-button" title="发送" disabled={!currentSessionId || !text.trim()} onClick={() => void send()}><span className="material-symbols-rounded">arrow_upward</span></button></>
+            <button type="button" className="send-button" title="发送" aria-label="发送消息" disabled={!currentSessionId || !text.trim()} onClick={() => void send()}><span className="material-symbols-rounded" aria-hidden="true">arrow_upward</span></button>
           )}
         </div>
         <small className="ai-notice">内容由 AI 生成，请注意甄别。</small>
