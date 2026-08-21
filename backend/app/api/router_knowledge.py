@@ -7,13 +7,17 @@
 from __future__ import annotations
 
 import uuid
+from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import settings
 from ..knowledge.embedder import EmbeddingError
 from ..knowledge.ingest import IngestError
+from ..knowledge.jobs import index_job_service, job_to_dict
+from ..knowledge.policy import IndexPolicyError
 from ..knowledge.service import knowledge_service
 from ..observability import audit
 from ..storage.db import get_db
@@ -26,6 +30,7 @@ from .schemas import (
     ChunkPreviewItem,
     ChunkPreviewRequest,
     ChunkUpdateRequest,
+    DocumentGraphOverrideRequest,
     EvaluateRequest,
     KnowledgeBaseCreateRequest,
     KnowledgeBaseResponse,
@@ -33,6 +38,8 @@ from .schemas import (
     KnowledgeChunkItem,
     KnowledgeDocResponse,
     KnowledgeHit,
+    KnowledgeIndexModeTransitionRequest,
+    KnowledgeIndexSettingsRequest,
     KnowledgeSearchRequest,
     KnowledgeUploadResponse,
     TestSearchRequest,
@@ -41,13 +48,23 @@ from .schemas import (
 router = APIRouter(prefix="/knowledge-bases", tags=["knowledge"])
 
 
-def _to_kb_resp(kb) -> KnowledgeBaseResponse:
+def _to_kb_resp(kb, *, active_job_count: int = 0) -> KnowledgeBaseResponse:
+    graph_meta = kb.graph_meta or {}
     return KnowledgeBaseResponse(
         kb_id=str(kb.id),
         name=kb.name,
         description=kb.description,
         doc_count=kb.doc_count,
         chunk_count=kb.chunk_count,
+        index_mode=kb.index_mode,
+        graph_build_policy=kb.graph_build_policy,
+        index_status=kb.index_status,
+        graph_status=kb.graph_status,
+        graph_version=kb.graph_version,
+        graph_meta=graph_meta,
+        settings=kb.settings or {},
+        entity_count=int(graph_meta.get("entities", 0) or 0),
+        active_job_count=active_job_count,
         status=kb.status,
         created_at=kb.created_at.isoformat() if kb.created_at else None,
         updated_at=kb.updated_at.isoformat() if kb.updated_at else None,
@@ -62,7 +79,17 @@ def _to_doc_resp(doc: dict) -> KnowledgeDocResponse:
         file_size=doc.get("file_size", 0),
         mime_type=doc.get("mime_type"),
         parse_status=doc.get("parse_status", "pending"),
+        parse_method=doc.get("parse_method", "text"),
         parse_source=doc.get("parse_source"),
+        graph_override=doc.get("graph_override", "inherit"),
+        vector_status=doc.get("vector_status", "pending"),
+        graph_status=doc.get("graph_status", "excluded"),
+        vector_error=doc.get("vector_error"),
+        graph_error=doc.get("graph_error"),
+        vector_indexed_at=doc.get("vector_indexed_at"),
+        graph_indexed_at=doc.get("graph_indexed_at"),
+        graph_version=doc.get("graph_version"),
+        content_hash=doc.get("content_hash"),
         chunk_count=doc.get("chunk_count", 0),
         error=doc.get("error"),
         created_at=doc.get("created_at"),
@@ -81,6 +108,9 @@ def _to_chunk_resp(chunk: dict) -> KnowledgeChunkItem:
         char_count=chunk["char_count"],
         enabled=chunk["enabled"],
         chunk_index=chunk["chunk_index"],
+        has_embedding=chunk.get("has_embedding", False),
+        metadata=chunk.get("metadata") or {},
+        created_at=chunk.get("created_at"),
         updated_at=chunk.get("updated_at"),
     )
 
@@ -100,7 +130,13 @@ async def list_knowledge_bases(
 ):
     """知识库列表（含 doc_count / chunk_count）。"""
     items = await knowledge_service.list(db, tenant_id=auth.tenant.tenant_id)
-    return ApiResponse(data=[_to_kb_resp(kb) for kb in items])
+    responses = []
+    for kb in items:
+        active = await index_job_service.list(
+            db, tenant_id=auth.tenant.tenant_id, kb_id=kb.id, status="active"
+        )
+        responses.append(_to_kb_resp(kb, active_job_count=len(active)))
+    return ApiResponse(data=responses)
 
 
 @router.post("", response_model=ApiResponse)
@@ -110,21 +146,53 @@ async def create_knowledge_base(
     db: AsyncSession = Depends(get_db),
 ):
     """创建知识库。"""
-    kb = await knowledge_service.create(
-        db,
-        tenant_id=auth.tenant.tenant_id,
-        name=body.name,
-        description=body.description,
-    )
+    if body.index_mode == "graph_enhanced" and not settings.GRAPH_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "GRAPH_PLATFORM_DISABLED", "message": "当前环境未启用图谱服务"},
+        )
+    try:
+        kb = await knowledge_service.create(
+            db,
+            tenant_id=auth.tenant.tenant_id,
+            name=body.name,
+            description=body.description,
+            index_mode=body.index_mode,
+            graph_build_policy=body.graph_build_policy,
+        )
+    except IndexPolicyError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
     if kb is None:
         raise HTTPException(status_code=409, detail="知识库名称已存在")
     await audit.audit(
         auth.tenant.tenant_id,
         "knowledge.create",
         user_id=auth.user_id,
-        detail={"kb": kb.name},
+        detail={
+            "kb": kb.name,
+            "kb_id": str(kb.id),
+            "index_mode": kb.index_mode,
+            "graph_build_policy": kb.graph_build_policy,
+        },
     )
     return ApiResponse(data=_to_kb_resp(kb))
+
+
+@router.get("/capabilities", response_model=ApiResponse)
+async def knowledge_capabilities(
+    auth: AuthContext = Depends(require_auth),
+):
+    return ApiResponse(
+        data={
+            "index_mode_enabled": settings.KB_INDEX_MODE_ENABLED,
+            "index_jobs_enabled": settings.KB_INDEX_JOBS_ENABLED,
+            "unified_retrieval_enabled": settings.KB_UNIFIED_RETRIEVAL_ENABLED,
+            "graph_workspace_enabled": settings.KB_GRAPH_WORKSPACE_ENABLED,
+            "graph_enabled": settings.GRAPH_ENABLED,
+        }
+    )
 
 
 @router.get("/{kb_id}", response_model=ApiResponse)
@@ -144,6 +212,70 @@ async def get_knowledge_base(
             "documents": [_to_doc_resp(doc) for doc in docs],
         }
     )
+
+
+@router.patch("/{kb_id}/index-settings", response_model=ApiResponse)
+async def update_index_settings(
+    kb_id: uuid.UUID,
+    body: KnowledgeIndexSettingsRequest,
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    await _require_kb(auth, db, kb_id)
+    try:
+        kb = await knowledge_service.update_index_settings(
+            db,
+            tenant_id=auth.tenant.tenant_id,
+            kb_id=kb_id,
+            graph_build_policy=body.graph_build_policy,
+            settings_patch=body.settings,
+        )
+    except IndexPolicyError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    await audit.audit(
+        auth.tenant.tenant_id,
+        "knowledge.index_settings_update",
+        user_id=auth.user_id,
+        detail={"kb_id": str(kb_id), "new": body.model_dump(exclude_none=True)},
+    )
+    return ApiResponse(data=_to_kb_resp(kb))
+
+
+@router.post("/{kb_id}/index-mode-transition", response_model=ApiResponse)
+async def transition_index_mode(
+    kb_id: uuid.UUID,
+    body: KnowledgeIndexModeTransitionRequest,
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    kb = await _require_kb(auth, db, kb_id)
+    if body.target_mode == "graph_enhanced" and not settings.GRAPH_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "GRAPH_PLATFORM_DISABLED", "message": "当前环境未启用图谱服务"},
+        )
+    try:
+        data = await knowledge_service.transition_index_mode(
+            db,
+            tenant_id=auth.tenant.tenant_id,
+            kb_id=kb_id,
+            target_mode=body.target_mode,
+            graph_build_policy=body.graph_build_policy,
+            build_existing_documents=body.build_existing_documents,
+        )
+    except IndexPolicyError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    await audit.audit(
+        auth.tenant.tenant_id,
+        "knowledge.index_mode_transition",
+        user_id=auth.user_id,
+        detail={"kb_id": str(kb_id), "old": kb.index_mode, "new": body.target_mode, **(data or {})},
+    )
+    return ApiResponse(data=data)
 
 
 @router.patch("/{kb_id}/status", response_model=ApiResponse)
@@ -196,6 +328,8 @@ async def _do_upload(
     kb_id: uuid.UUID,
     file: UploadFile,
     replace: bool,
+    parse_method: Literal["text", "ocr"],
+    graph_override: str,
     auth: AuthContext,
     db: AsyncSession,
 ):
@@ -209,9 +343,15 @@ async def _do_upload(
             kb_id=kb_id,
             filename=file.filename or "unnamed",
             content=content,
+            parse_method=parse_method,
             replace=replace,
             mime_type=file.content_type,
+            graph_override=graph_override,
         )
+    except IndexPolicyError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
     except IngestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -219,15 +359,23 @@ async def _do_upload(
         auth.tenant.tenant_id,
         "knowledge.upload",
         user_id=auth.user_id,
-        detail={"kb": str(kb_id), "file": file.filename, "doc_id": doc.id},
+        detail={"kb": str(kb_id), "file": file.filename, "doc_id": doc.id, "parse_method": parse_method},
     )
+    jobs = await index_job_service.list(
+        db, tenant_id=auth.tenant.tenant_id, kb_id=kb_id, status="active"
+    )
+    doc_jobs = [job for job in jobs if job.doc_id == doc.id]
     return ApiResponse(
         data=KnowledgeUploadResponse(
             kb_id=str(kb_id),
             doc_id=doc.id,
             source_file=doc.source_file,
             parse_status=doc.parse_status,
+            parse_method=doc.parse_method,
+            vector_status=doc.vector_status,
+            graph_status=doc.graph_status,
             chunk_count=0,
+            job_ids=[str(job.id) for job in doc_jobs],
         )
     )
 
@@ -237,11 +385,13 @@ async def upload_document(
     kb_id: uuid.UUID,
     file: UploadFile = File(...),
     replace: bool = Form(True),
+    parse_method: Literal["text", "ocr"] = Form(...),
+    graph_override: str = Form("inherit"),
     auth: AuthContext = Depends(require_auth),
     db: AsyncSession = Depends(get_db),
 ):
     """上传文档并触发异步解析（multipart）。返回 pending 状态，解析后台进行。"""
-    return await _do_upload(kb_id, file, replace, auth, db)
+    return await _do_upload(kb_id, file, replace, parse_method, graph_override, auth, db)
 
 
 @router.post("/{kb_id}/documents", response_model=ApiResponse)
@@ -249,11 +399,13 @@ async def upload_document_legacy(
     kb_id: uuid.UUID,
     file: UploadFile = File(...),
     replace: bool = Form(True),
+    parse_method: Literal["text", "ocr"] = Form(...),
+    graph_override: str = Form("inherit"),
     auth: AuthContext = Depends(require_auth),
     db: AsyncSession = Depends(get_db),
 ):
     """兼容旧路径 /documents：等价于 /documents/upload。"""
-    return await _do_upload(kb_id, file, replace, auth, db)
+    return await _do_upload(kb_id, file, replace, parse_method, graph_override, auth, db)
 
 
 @router.post("/{kb_id}/documents/{doc_id}/reparse", response_model=ApiResponse)
@@ -277,6 +429,166 @@ async def reparse_document(
         detail={"kb": str(kb_id), "doc_id": doc_id, "file": doc.source_file},
     )
     return ApiResponse(data={"kb_id": str(kb_id), "doc_id": doc_id, "parse_status": doc.parse_status})
+
+
+@router.get("/{kb_id}/documents/{doc_id}/index-status", response_model=ApiResponse)
+async def document_index_status(
+    kb_id: uuid.UUID,
+    doc_id: int,
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    await _require_kb(auth, db, kb_id)
+    doc = await knowledge_service.get_document(
+        db, tenant_id=auth.tenant.tenant_id, kb_id=kb_id, doc_id=doc_id
+    )
+    if doc is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    jobs = await index_job_service.list(
+        db, tenant_id=auth.tenant.tenant_id, kb_id=kb_id, limit=100
+    )
+    return ApiResponse(
+        data={
+            "doc_id": doc.id,
+            "parse_status": doc.parse_status,
+            "vector_status": doc.vector_status,
+            "graph_status": doc.graph_status,
+            "vector_error": doc.vector_error,
+            "graph_error": doc.graph_error,
+            "vector_indexed_at": doc.vector_indexed_at.isoformat() if doc.vector_indexed_at else None,
+            "graph_indexed_at": doc.graph_indexed_at.isoformat() if doc.graph_indexed_at else None,
+            "jobs": [job_to_dict(job) for job in jobs if job.doc_id == doc.id],
+        }
+    )
+
+
+@router.patch("/{kb_id}/documents/{doc_id}/graph-override", response_model=ApiResponse)
+async def update_document_graph_override(
+    kb_id: uuid.UUID,
+    doc_id: int,
+    body: DocumentGraphOverrideRequest,
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    await _require_kb(auth, db, kb_id)
+    try:
+        doc = await knowledge_service.update_graph_override(
+            db,
+            tenant_id=auth.tenant.tenant_id,
+            kb_id=kb_id,
+            doc_id=doc_id,
+            graph_override=body.graph_override,
+        )
+    except IndexPolicyError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    if doc is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    await audit.audit(
+        auth.tenant.tenant_id,
+        "knowledge.document_graph_override",
+        user_id=auth.user_id,
+        detail={"kb_id": str(kb_id), "doc_id": doc_id, "new": body.graph_override},
+    )
+    return ApiResponse(
+        data={
+            "doc_id": doc.id,
+            "graph_override": doc.graph_override,
+            "graph_status": doc.graph_status,
+        }
+    )
+
+
+@router.post("/{kb_id}/documents/{doc_id}/graph/build", response_model=ApiResponse)
+async def build_document_graph(
+    kb_id: uuid.UUID,
+    doc_id: int,
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    from ..knowledge.graph.service import graph_service
+
+    await _require_kb(auth, db, kb_id)
+    try:
+        data = await graph_service.trigger_document_build(
+            db, tenant_id=auth.tenant.tenant_id, kb_id=kb_id, doc_id=doc_id
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="document not found")
+    except IndexPolicyError as exc:
+        status_code = 503 if exc.code == "GRAPH_PLATFORM_DISABLED" else 409
+        raise HTTPException(
+            status_code=status_code, detail={"code": exc.code, "message": str(exc)}
+        ) from exc
+    return ApiResponse(data=data)
+
+
+@router.post("/{kb_id}/documents/{doc_id}/retry", response_model=ApiResponse)
+async def retry_document_index(
+    kb_id: uuid.UUID,
+    doc_id: int,
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    from ..knowledge.graph.service import graph_service
+
+    await _require_kb(auth, db, kb_id)
+    doc = await knowledge_service.get_document(
+        db, tenant_id=auth.tenant.tenant_id, kb_id=kb_id, doc_id=doc_id
+    )
+    if doc is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    if doc.graph_status == "failed":
+        data = await graph_service.trigger_document_build(
+            db, tenant_id=auth.tenant.tenant_id, kb_id=kb_id, doc_id=doc_id
+        )
+    elif doc.parse_status == "failed" or doc.vector_status == "failed":
+        retried = await knowledge_service.reparse_document(
+            db, tenant_id=auth.tenant.tenant_id, kb_id=kb_id, doc_id=doc_id
+        )
+        data = {"doc_id": doc_id, "stage": "parse" if doc.parse_status == "failed" else "vectorize", "status": retried.parse_status}
+    else:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "DOCUMENT_INDEX_NOT_FAILED", "message": "当前文档没有可重试的失败阶段"},
+        )
+    return ApiResponse(data=data)
+
+
+@router.get("/{kb_id}/jobs", response_model=ApiResponse)
+async def list_index_jobs(
+    kb_id: uuid.UUID,
+    status: str | None = None,
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    await _require_kb(auth, db, kb_id)
+    jobs = await index_job_service.list(
+        db, tenant_id=auth.tenant.tenant_id, kb_id=kb_id, status=status
+    )
+    return ApiResponse(data=[job_to_dict(job) for job in jobs])
+
+
+@router.post("/{kb_id}/jobs/{job_id}/cancel", response_model=ApiResponse)
+async def cancel_index_job(
+    kb_id: uuid.UUID,
+    job_id: uuid.UUID,
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    await _require_kb(auth, db, kb_id)
+    job = await index_job_service.get(
+        db, tenant_id=auth.tenant.tenant_id, kb_id=kb_id, job_id=job_id
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="index job not found")
+    if not await index_job_service.cancel(db, job):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "INDEX_JOB_NOT_CANCELLABLE", "message": "只有排队中的任务可以取消"},
+        )
+    return ApiResponse(data=job_to_dict(job))
 
 
 @router.delete("/{kb_id}/documents/{doc_id}", response_model=ApiResponse)
@@ -492,7 +804,39 @@ async def test_search_knowledge_base(
     （默认值 auto/True/False 兼容旧前端）。
     """
     kb = await _require_kb(auth, db, kb_id)
+    if body.mode in {"graph", "fused"} and kb.index_mode == "standard":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "INDEX_MODE_CONFLICT",
+                "message": "标准知识库仅支持文本检索，可在设置中升级索引模式",
+            },
+        )
     try:
+        if body.mode is not None:
+            result = await knowledge_service.retrieve_unified(
+                db,
+                tenant_id=auth.tenant.tenant_id,
+                query=body.query,
+                kb_ids=[kb_id],
+                mode=body.mode,
+                top_k=body.top_k,
+                rerank=body.rerank,
+                expand_query=body.expand_query,
+                graph_hop=body.graph_hop,
+            )
+            await audit.audit(
+                auth.tenant.tenant_id,
+                "knowledge.retrieve",
+                user_id=auth.user_id,
+                detail={
+                    "kb_id": str(kb_id),
+                    "mode": body.mode,
+                    "resolved_mode": result["resolved_mode"],
+                    "degradations": result["degradations"],
+                },
+            )
+            return ApiResponse(data=result)
         hits = await knowledge_service.retrieve_v2(
             db,
             tenant_id=auth.tenant.tenant_id,

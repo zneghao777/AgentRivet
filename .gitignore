@@ -33,6 +33,7 @@ logs/
 # Runtime/test artifacts
 data/uploads/
 output/
+.playwright-cli/
 
 # LangGraph
 .langgraph_api/

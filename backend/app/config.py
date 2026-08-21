@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = ""
     LLM_TEMPERATURE: float = 0.7
     LLM_MAX_TOKENS: int = 4096
+    LLM_ALLOWED_BASE_HOSTS: str = "api.deepseek.com"
+
+    # --- 聊天附件 ---
+    CHAT_ATTACHMENT_MAX_SIZE_MB: int = 20
 
     # --- 数据库 ---
     DATABASE_URL: str = (
@@ -81,6 +85,21 @@ class Settings(BaseSettings):
 
     # --- Skill 资源读取 ---
     SKILL_FILE_READ_MAX_BYTES: int = 256 * 1024
+
+    # --- Skill + MCP 统一能力中心（MCP_SKILL_ECOSYSTEM_SPEC）---
+    CAPABILITY_HUB_ENABLED: bool = True
+    CAPABILITY_MAX_TOOLS_PER_RUN: int = 32
+    MCP_ENABLED: bool = False
+    MCP_REMOTE_HTTP_ENABLED: bool = True
+    MCP_STDIO_ENABLED: bool = False
+    MCP_AUTO_HEALTHCHECK_ENABLED: bool = True
+    MCP_HEALTHCHECK_INTERVAL_SECONDS: int = 60
+    MCP_CONNECT_TIMEOUT_SECONDS: float = 10.0
+    MCP_DISCOVERY_TIMEOUT_SECONDS: float = 20.0
+    MCP_TOOL_TIMEOUT_SECONDS: float = 60.0
+    MCP_MAX_OUTPUT_BYTES: int = 1024 * 1024
+    MCP_SECRET_KEY: str = ""
+    MCP_ALLOWED_HOSTS: str = ""
 
     # --- 多 Agent ---
     MULTI_AGENT_ENABLED: bool = False
@@ -143,6 +162,28 @@ class Settings(BaseSettings):
     # --- 用户级记忆（MEMORY_SPEC §3.2 / §6.5） ---
     # 未登录阶段的统一占位用户 ID（替换 deps.py 硬编码 "api-user"）
     ANONYMOUS_USER_ID: str = "__anonymous__"
+
+    # --- Graph RAG 知识图谱（GRAPH_RAG_SPEC §7） ---
+    GRAPH_ENABLED: bool = True                  # 图谱总开关
+    GRAPH_EXTRACT_MODEL: str = "glm-4-flash"    # 抽取模型（默认低成本模型）
+    GRAPH_EXTRACT_BASE_URL: str = "https://open.bigmodel.cn/api/paas/v4"  # 智谱 GLM chat
+    GRAPH_EXTRACT_API_KEY: str = ""             # 智谱 key，空则回退本地 LLM（LLM_BASE_URL/LLM_API_KEY）
+    GRAPH_BATCH_SIZE: int = 4                   # 每批合并 chunk 数（小批量提升抽取成功率）
+    GRAPH_MAX_ENTITIES_PER_CHUNK: int = 30      # 单 chunk 实体上限（防爆炸）
+    GRAPH_ENTITY_VECTOR_MODEL: str = "text-embedding-bge-m3"  # 复用现有向量模型
+    GRAPH_ALIAS_SIMILARITY_THRESHOLD: float = 0.90  # 实体合并向量阈值
+    GRAPH_MAX_HOP: int = 3                      # 图扩散最大跳数
+    GRAPH_COMMUNITY_ENABLED: bool = True        # 社区摘要开关
+    GRAPH_CONCURRENCY: int = 4                  # 异步抽取并发
+    GRAPH_BUILD_MAX_CHUNKS: int = 400           # 单次图谱构建最多处理 chunk 数（长文档保护）
+    GRAPH_MIN_SIMILARITY: float = 0.35          # 实体语义召回最低相似度
+
+    # --- KBX 灰度开关 ---
+    KB_INDEX_MODE_ENABLED: bool = True
+    KB_INDEX_JOBS_ENABLED: bool = True
+    KB_UNIFIED_RETRIEVAL_ENABLED: bool = True
+    KB_GRAPH_WORKSPACE_ENABLED: bool = True
+    KB_INDEX_JOB_STALE_SECONDS: int = 300
 
     @property
     def embedding_base_url(self) -> str:

@@ -144,6 +144,15 @@ async def add_message(
         step_index=step_index,
     )
     db.add(msg)
+    # 写入消息视为会话活跃：同步刷新会话的 updated_at，
+    # 保证最近会话列表（按 updated_at 倒序）能正确地把当前对话的会话置顶，
+    # 避免活跃会话因时间未刷新而被新会话挤出列表。
+    now = datetime.now(UTC)
+    await db.execute(
+        update(Session)
+        .where(Session.id == session_id)
+        .values(updated_at=now)
+    )
     await db.commit()
     await db.refresh(msg)
     return msg

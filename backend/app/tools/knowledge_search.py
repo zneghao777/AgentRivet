@@ -36,6 +36,10 @@ class KnowledgeSearchArgs(BaseModel):
         default=None, description="知识库名称；不指定则检索当前租户全部已启用知识库"
     )
     top_k: int = Field(default=5, description="返回片段数，1-10")
+    mode: str = Field(
+        default="auto",
+        description="统一检索模式：auto|text|graph|fused；默认 auto 由索引状态确定路由",
+    )
     strategy: str = Field(
         default="auto",
         description=(
@@ -61,6 +65,7 @@ async def _knowledge_search_async(
     strategy: str = "auto",
     rerank: bool = True,
     expand_query: bool = False,
+    mode: str = "auto",
 ) -> str:
     """异步实现：读取工具上下文 → KnowledgeService.retrieve_v2 → 拼 markdown（带策略标注）。"""
     ctx = get_tool_context()
@@ -81,6 +86,7 @@ async def _knowledge_search_async(
                 strategy=strategy,
                 rerank=rerank,
                 expand_query=expand_query,
+                mode=mode,
             )
     except EmbeddingError as exc:
         return f"（检索失败: {exc}）"
@@ -96,6 +102,7 @@ async def _knowledge_search_async(
             "top_k": top_k,
             "strategy": strategy,
             "rerank": rerank,
+            "mode": mode,
         },
     )
     return hits_to_markdown(hits)
@@ -108,11 +115,12 @@ def _knowledge_search(
     strategy: str = "auto",
     rerank: bool = True,
     expand_query: bool = False,
+    mode: str = "auto",
 ) -> str:
     """同步入口（非 async 环境 fallback，如本地脚本）。"""
     return asyncio.run(
         _knowledge_search_async(
-            query, knowledge_base, top_k, strategy, rerank, expand_query
+            query, knowledge_base, top_k, strategy, rerank, expand_query, mode
         )
     )
 
@@ -122,8 +130,9 @@ knowledge_search = StructuredTool.from_function(
     coroutine=_knowledge_search_async,
     name="knowledge_search",
     description=(
-        "在企业知识库中进行混合检索（向量 + 关键词 + 可选精排）。"
+        "在企业知识库中统一编排文本与知识图谱检索（可自动融合和降级）。"
         "当用户询问文档、制度、FAQ、内部知识，或需要基于给定文档回答时使用。"
+        "人物关系、婚姻亲属、师徒归属等关系问题优先使用 mode=fused，同时检索文本与图谱。"
         "返回片段会标注来源文件与检索策略；专有名词/型号类问题建议指定 strategy=hybrid 或 keyword。"
     ),
     args_schema=KnowledgeSearchArgs,

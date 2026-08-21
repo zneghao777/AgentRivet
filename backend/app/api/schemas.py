@@ -47,16 +47,37 @@ class SessionListData(BaseModel):
 # ---------- 消息 ----------
 
 
+class CapabilityRefRequest(BaseModel):
+    kind: Literal["skill", "mcp_tool"]
+    id: str
+
+
 class MessageSendRequest(BaseModel):
     message: str = Field(min_length=1)
     skills: list[str] | None = None  # 本次会话使用的 Skill 白名单
     knowledge_bases: list[str] | None = None  # 本次会话绑定的知识库名称白名单（默认不启用 RAG）
+    capabilities: list[CapabilityRefRequest] | None = None
+    model: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:/-]+$",
+    )
+    attachment_ids: list[str] | None = None
 
 
 class MessageStreamRequest(BaseModel):
     message: str = Field(min_length=1)
     skills: list[str] | None = None
     knowledge_bases: list[str] | None = None
+    capabilities: list[CapabilityRefRequest] | None = None
+    model: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:/-]+$",
+    )
+    attachment_ids: list[str] | None = None
 
 
 class MessageResponse(BaseModel):
@@ -65,6 +86,15 @@ class MessageResponse(BaseModel):
     token_usage: dict[str, int] = Field(default_factory=dict)
     tool_calls: int = 0
     duration_ms: int = 0
+
+
+class ModelConnectionTestRequest(BaseModel):
+    model: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:/-]+$",
+    )
+    base_url: str | None = Field(default=None, max_length=2048)
 
 
 class HistoryMessage(BaseModel):
@@ -109,6 +139,74 @@ class ToolResponse(BaseModel):
     source: str
 
 
+# ---------- MCP / Capability hub ----------
+
+
+class McpAuthRequest(BaseModel):
+    type: Literal["none", "bearer", "headers"] = "none"
+    secret_value: str | None = None
+    headers: dict[str, str] | None = None
+
+
+class McpServerCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = None
+    transport: Literal["streamable_http"] = "streamable_http"
+    endpoint_url: str = Field(min_length=1, max_length=2048)
+    auth: McpAuthRequest = Field(default_factory=McpAuthRequest)
+
+
+class McpServerUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    description: str | None = None
+    endpoint_url: str | None = Field(default=None, min_length=1, max_length=2048)
+    auth: McpAuthRequest | None = None
+
+
+class McpCapabilityUpdateRequest(BaseModel):
+    enabled: bool | None = None
+    approval_policy: Literal["never", "write", "always"] | None = None
+
+
+class McpServerResponse(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    transport: str
+    endpoint_url: str
+    auth_type: str
+    credential_configured: bool
+    enabled: bool
+    health_status: str
+    protocol_version: str | None = None
+    capability_revision: int
+    tool_count: int = 0
+    enabled_tool_count: int = 0
+    pending_tool_count: int = 0
+    last_checked_at: str | None = None
+    last_error_code: str | None = None
+    last_error_message: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class McpCapabilityResponse(BaseModel):
+    id: str
+    server_id: str
+    kind: str
+    remote_name: str
+    effective_name: str
+    title: str | None = None
+    description: str
+    input_schema: dict
+    annotations: dict
+    enabled: bool
+    risk_level: str
+    approval_policy: str
+    review_status: str
+    removed_at: str | None = None
+
+
 # ---------- Audit ----------
 
 
@@ -129,6 +227,8 @@ class AuditResponse(BaseModel):
 class KnowledgeBaseCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     description: str | None = None
+    index_mode: Literal["standard", "graph_enhanced"] = "standard"
+    graph_build_policy: Literal["auto", "manual"] = "manual"
 
 
 class KnowledgeBaseStatusRequest(BaseModel):
@@ -141,6 +241,15 @@ class KnowledgeBaseResponse(BaseModel):
     description: str | None = None
     doc_count: int = 0
     chunk_count: int = 0
+    index_mode: str = "standard"
+    graph_build_policy: str = "manual"
+    index_status: str = "empty"
+    graph_status: str = "disabled"
+    graph_version: int = 1
+    graph_meta: dict = Field(default_factory=dict)
+    settings: dict = Field(default_factory=dict)
+    entity_count: int = 0
+    active_job_count: int = 0
     status: str
     created_at: str | None = None
     updated_at: str | None = None
@@ -153,7 +262,17 @@ class KnowledgeDocResponse(BaseModel):
     file_size: int = 0
     mime_type: str | None = None
     parse_status: str = "pending"
+    parse_method: Literal["text", "ocr"] = "text"
     parse_source: str | None = None
+    graph_override: str = "inherit"
+    vector_status: str = "pending"
+    graph_status: str = "excluded"
+    vector_error: str | None = None
+    graph_error: str | None = None
+    vector_indexed_at: str | None = None
+    graph_indexed_at: str | None = None
+    graph_version: int | None = None
+    content_hash: str | None = None
     chunk_count: int = 0
     error: str | None = None
     created_at: str | None = None
@@ -182,7 +301,26 @@ class KnowledgeUploadResponse(BaseModel):
     doc_id: int
     source_file: str
     parse_status: str = "pending"
+    parse_method: Literal["text", "ocr"]
+    vector_status: str = "pending"
+    graph_status: str = "excluded"
     chunk_count: int = 0
+    job_ids: list[str] = Field(default_factory=list)
+
+
+class KnowledgeIndexSettingsRequest(BaseModel):
+    graph_build_policy: Literal["auto", "manual"] | None = None
+    settings: dict | None = None
+
+
+class KnowledgeIndexModeTransitionRequest(BaseModel):
+    target_mode: Literal["standard", "graph_enhanced"]
+    graph_build_policy: Literal["auto", "manual"] = "manual"
+    build_existing_documents: bool = True
+
+
+class DocumentGraphOverrideRequest(BaseModel):
+    graph_override: Literal["inherit", "include", "exclude"]
 
 
 # ---------- 分块治理（KB_MANAGEMENT_SPEC §3.5） ----------
@@ -198,6 +336,9 @@ class KnowledgeChunkItem(BaseModel):
     char_count: int
     enabled: bool = True
     chunk_index: int = 0
+    has_embedding: bool = False
+    metadata: dict = Field(default_factory=dict)
+    created_at: str | None = None
     updated_at: str | None = None
 
 
@@ -234,8 +375,10 @@ class TestSearchRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=10)
     # 混合检索 / Rerank / Query 改写（AGENTIC_RAG_UPGRADE_SPEC §3.8；默认值兼容旧前端）
     strategy: str = Field(default="auto")  # auto | vector | keyword | hybrid
+    mode: Literal["auto", "text", "graph", "fused"] | None = None
     rerank: bool = True
     expand_query: bool = False
+    graph_hop: int = Field(default=2, ge=1, le=3)
 
 
 # ---------- 检索评测（AGENTIC_RAG_UPGRADE_SPEC §3.8） ----------

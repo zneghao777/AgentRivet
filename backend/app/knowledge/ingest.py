@@ -53,50 +53,99 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+async def _resolve_graph_after_vector(db: AsyncSession, doc: DocumentMeta) -> None:
+    """文本就绪后按知识库策略设置图谱状态，并按需创建持久化任务。"""
+
+    from .jobs import index_job_service
+    from .policy import resolve_graph_action
+    from .status import refresh_kb_status
+
+    kb = await db.get(KnowledgeBase, doc.kb_id)
+    if kb is None or kb.tenant_id != doc.tenant_id:
+        return
+    action = resolve_graph_action(
+        platform_enabled=settings.GRAPH_ENABLED,
+        index_mode=kb.index_mode,
+        build_policy=kb.graph_build_policy,
+        graph_override=doc.graph_override,
+    )
+    doc.graph_error = None
+    if action == "excluded":
+        doc.graph_status = "excluded"
+    elif action == "pending":
+        doc.graph_status = "pending"
+    else:
+        doc.graph_status = "pending"
+        job, created = await index_job_service.enqueue(
+            db,
+            tenant_id=doc.tenant_id,
+            kb_id=doc.kb_id,
+            doc_id=doc.id,
+            job_type="graph_build",
+            meta={
+                "content_hash": doc.content_hash,
+                "graph_version": kb.graph_version,
+            },
+        )
+        if created:
+            from .graph.builder import schedule_build
+
+            schedule_build(
+                db=None,
+                kb_id=doc.kb_id,
+                tenant_id=doc.tenant_id,
+                full=False,
+                doc_id=doc.id,
+                job_id=job.id,
+            )
+    await refresh_kb_status(
+        db, tenant_id=doc.tenant_id, kb_id=doc.kb_id, commit=True
+    )
+
+
 async def _resolve_text(doc: DocumentMeta) -> tuple[str, str, str]:
     """解析文档文本，返回 (text, parse_source, parser_tool)。
 
-    - 有 GLM key 且工具支持该类型 → GLM 异步解析（multipart 直传文件字节），
-      图片（PNG/JPG/JPEG…）由 GLM OCR 识别文本。
-    - GLM 失败 / 无 key → 本地解析降级（parse_source="local"）；
-      本地无法解析（如图片）且 GLM 不可用时抛 IngestError 明确提示。
+    - parse_method=text：仅使用本地文本提取，不把文件发送到远程 OCR。
+    - parse_method=ocr：仅使用 GLM 文件解析/OCR，不静默回退本地解析。
     """
     ext = doc.source_file.rsplit(".", 1)[-1].lower() if "." in doc.source_file else ""
     content = read_upload(doc.file_path or "") if doc.file_path else b""
-    tool = settings.GLM_FILES_TOOL
-    if settings.GLM_FILES_API_KEY and ext in GLM_SUPPORTED_EXTS and tool_supports(tool, ext):
+    if doc.parse_method == "text":
         try:
-            from .parser.glm_parser import GlmParseError, parse_file
+            return parse_local(doc.source_file, content), "local", ""
+        except LocalParseError as exc:
+            raise IngestError(str(exc)) from exc
 
-            result = await parse_file(
-                settings.GLM_FILES_API_KEY,
-                content,
-                doc.source_file,
-                tool,
-            )
-            if not result.text:
-                raise GlmParseError("GLM 解析结果为空")
-            logger.info(
-                "GLM 解析成功 doc=%s source=%s tool=%s",
-                doc.id,
-                doc.source_file,
-                result.tool_type,
-            )
-            return result.text, "glm", result.tool_type
-        except GlmParseError as exc:
-            # 记录原因，降级本地解析
-            logger.warning("GLM 解析失败，回退本地解析 doc=%s: %s", doc.id, exc)
-            doc.error = f"GLM 解析失败已回退本地: {exc}"
+    if doc.parse_method != "ocr":
+        raise IngestError(f"不支持的解析方式: {doc.parse_method}")
+
+    tool = settings.GLM_FILES_TOOL
+    if not settings.GLM_FILES_API_KEY:
+        raise IngestError("OCR 解析不可用：未配置 GLM_FILES_API_KEY")
+    if ext not in GLM_SUPPORTED_EXTS or not tool_supports(tool, ext):
+        raise IngestError(f"OCR 工具 {tool} 不支持 .{ext} 文件")
+
+    from .parser.glm_parser import GlmParseError, parse_file
+
     try:
-        text = parse_local(doc.source_file, content)
-    except LocalParseError as exc:
-        if settings.GLM_FILES_API_KEY:
-            raise IngestError(
-                f"文件类型 .{ext} 无法本地解析，且 GLM 工具 {tool} 不支持该类型"
-                "（图片 OCR 请配置 GLM_FILES_TOOL=prime 或 lite）"
-            ) from exc
-        raise IngestError(str(exc)) from exc
-    return text, "local", ""
+        result = await parse_file(
+            settings.GLM_FILES_API_KEY,
+            content,
+            doc.source_file,
+            tool,
+        )
+    except GlmParseError as exc:
+        raise IngestError(f"OCR 解析失败: {exc}") from exc
+    if not result.text:
+        raise IngestError("OCR 解析结果为空")
+    logger.info(
+        "OCR 解析成功 doc=%s source=%s tool=%s",
+        doc.id,
+        doc.source_file,
+        result.tool_type,
+    )
+    return result.text, "glm", result.tool_type
 
 
 async def _embed_chunks(
@@ -165,6 +214,11 @@ async def _refresh_stats(db: AsyncSession, kb_id, tenant_id: str) -> None:
         )
         .values(doc_count=doc_count, chunk_count=chunk_count)
     )
+    from .status import refresh_kb_status
+
+    await refresh_kb_status(
+        db, tenant_id=tenant_id, kb_id=kb_id, commit=False
+    )
     await db.commit()
 
 
@@ -174,27 +228,71 @@ async def parse_and_ingest(db: AsyncSession, doc: DocumentMeta) -> int:
     doc 需已加载（kb_id / tenant_id / source_file / file_path）。
     成功 → parse_status=parsed；失败 → parse_status=failed + error（允许重试）。
     """
+    from .jobs import index_job_service
+    from .status import refresh_kb_status
+
+    job = await index_job_service.active_for_doc(db, doc_id=doc.id, job_type="parse")
+    await index_job_service.update(
+        db, job, status="running", stage="parsing", progress=5
+    )
     doc.parse_status = "parsing"
+    doc.vector_status = "pending"
     doc.error = None
+    doc.vector_error = None
     await db.commit()
     try:
         text, source, tool = await _resolve_text(doc)
-    except (LocalParseError, OSError) as exc:
+    except (IngestError, LocalParseError, OSError) as exc:
         doc.parse_status = "failed"
         doc.error = f"解析失败: {exc}"
+        doc.vector_status = "failed"
+        doc.vector_error = "文档解析失败，无法建立文本索引"
+        await index_job_service.update(
+            db,
+            job,
+            status="failed",
+            stage="parse_failed",
+            progress=100,
+            error_code="INDEX_JOB_FAILED",
+            error_message=str(exc),
+            commit=False,
+        )
         await db.commit()
+        await refresh_kb_status(
+            db, tenant_id=doc.tenant_id, kb_id=doc.kb_id, commit=True
+        )
         logger.error("解析失败 doc=%s: %s", doc.id, exc)
         raise IngestError(str(exc)) from exc
 
     if not text.strip():
         doc.parse_status = "failed"
         doc.error = "文件内容为空，无可摄取文本"
+        doc.vector_status = "failed"
+        doc.vector_error = doc.error
+        await index_job_service.update(
+            db,
+            job,
+            status="failed",
+            stage="parse_failed",
+            progress=100,
+            error_code="INDEX_JOB_FAILED",
+            error_message=doc.error,
+            commit=False,
+        )
         await db.commit()
+        await refresh_kb_status(
+            db, tenant_id=doc.tenant_id, kb_id=doc.kb_id, commit=True
+        )
         raise IngestError("文件内容为空，无可摄取文本")
 
     doc.raw_text = text
     doc.parse_source = source
     doc.parser_tool = tool or None
+    doc.parse_status = "parsed"
+    doc.vector_status = "building"
+    await index_job_service.update(
+        db, job, stage="vectorizing", progress=35, commit=False
+    )
     await db.commit()
 
     try:
@@ -219,11 +317,23 @@ async def parse_and_ingest(db: AsyncSession, doc: DocumentMeta) -> int:
         )
         db.add_all(rows)
         await db.flush()
-        doc.parse_status = "parsed"
+        doc.vector_status = "ready"
+        doc.vector_error = None
+        doc.vector_indexed_at = _now()
         doc.updated_at = _now()
+        await index_job_service.update(
+            db,
+            job,
+            status="succeeded",
+            stage="completed",
+            progress=100,
+            meta={"chunk_count": len(rows)},
+            commit=False,
+        )
         await db.commit()
         # 统计需在 parse_status=parsed 提交后计算（doc_count 依赖该状态）
         await _refresh_stats(db, doc.kb_id, doc.tenant_id)
+        await _resolve_graph_after_vector(db, doc)
         logger.info(
             "解析完成 doc=%s file=%s chunks=%d source=%s",
             doc.id,
@@ -233,7 +343,20 @@ async def parse_and_ingest(db: AsyncSession, doc: DocumentMeta) -> int:
         )
         return len(rows)
     except IngestError:
-        doc.parse_status = "failed"
-        doc.error = doc.error or "摄取失败"
+        doc.vector_status = "failed"
+        doc.vector_error = doc.vector_error or "文本索引建立失败"
+        await index_job_service.update(
+            db,
+            job,
+            status="failed",
+            stage="vector_failed",
+            progress=100,
+            error_code="INDEX_JOB_FAILED",
+            error_message=doc.vector_error,
+            commit=False,
+        )
         await db.commit()
+        await refresh_kb_status(
+            db, tenant_id=doc.tenant_id, kb_id=doc.kb_id, commit=True
+        )
         raise

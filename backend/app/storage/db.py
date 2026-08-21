@@ -34,6 +34,8 @@ async def create_tables() -> None:
     建表后额外创建 pgvector HNSW 索引（加速余弦相似度检索）。
     对旧表（knowledge_chunks）做幂等 ALTER 补齐新列，支持开发期平滑升级（SPEC §8）。
     """
+    # 导入图谱 ORM，使 create_all 一并建表（GRAPH_RAG_SPEC §2.2）
+    from ..knowledge.graph import models as _graph_models  # noqa: F401
     from .models import Base
 
     async with engine.begin() as conn:
@@ -89,6 +91,148 @@ async def create_tables() -> None:
             text(
                 "CREATE INDEX IF NOT EXISTS ix_memory_hnsw "
                 "ON memory_entries USING hnsw (embedding vector_cosine_ops)"
+            )
+        )
+        # KBX：知识库模式、文档三阶段状态与持久化任务。
+        for ddl in (
+            "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS graph_status VARCHAR(16) NOT NULL DEFAULT 'none'",
+            "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS graph_meta JSONB NOT NULL DEFAULT '{}'::jsonb",
+            "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS index_mode VARCHAR(24) NOT NULL DEFAULT 'standard'",
+            "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS graph_build_policy VARCHAR(16) NOT NULL DEFAULT 'manual'",
+            "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS index_status VARCHAR(16) NOT NULL DEFAULT 'empty'",
+            "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS graph_version INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb",
+            "ALTER TABLE document_meta ADD COLUMN IF NOT EXISTS graph_override VARCHAR(16) NOT NULL DEFAULT 'inherit'",
+            "ALTER TABLE document_meta ADD COLUMN IF NOT EXISTS parse_method VARCHAR(16) NOT NULL DEFAULT 'text'",
+            "ALTER TABLE document_meta ADD COLUMN IF NOT EXISTS vector_status VARCHAR(16) NOT NULL DEFAULT 'pending'",
+            "ALTER TABLE document_meta ADD COLUMN IF NOT EXISTS graph_status VARCHAR(16) NOT NULL DEFAULT 'excluded'",
+            "ALTER TABLE document_meta ADD COLUMN IF NOT EXISTS vector_error TEXT",
+            "ALTER TABLE document_meta ADD COLUMN IF NOT EXISTS graph_error TEXT",
+            "ALTER TABLE document_meta ADD COLUMN IF NOT EXISTS vector_indexed_at TIMESTAMPTZ",
+            "ALTER TABLE document_meta ADD COLUMN IF NOT EXISTS graph_indexed_at TIMESTAMPTZ",
+            "ALTER TABLE document_meta ADD COLUMN IF NOT EXISTS graph_version INTEGER",
+            "ALTER TABLE document_meta ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64)",
+            "CREATE INDEX IF NOT EXISTS ix_document_meta_content_hash ON document_meta (content_hash)",
+            "CREATE INDEX IF NOT EXISTS ix_kb_jobs_tenant_kb ON knowledge_index_jobs (tenant_id, kb_id, created_at)",
+            "CREATE INDEX IF NOT EXISTS ix_kb_jobs_doc_type ON knowledge_index_jobs (doc_id, job_type, status)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_kb_jobs_active ON knowledge_index_jobs "
+            "(tenant_id, kb_id, COALESCE(doc_id, 0), job_type) WHERE status IN ('queued', 'running')",
+        ):
+            await conn.execute(text(ddl))
+        # 非破坏回填：已有图数据的库保留为图谱增强，其他库按标准模式处理。
+        await conn.execute(
+            text(
+                "UPDATE knowledge_bases kb SET index_mode = 'graph_enhanced', "
+                "graph_build_policy = 'manual' "
+                "WHERE kb.graph_status NOT IN ('none', 'disabled') "
+                "OR EXISTS (SELECT 1 FROM graph_entities ge WHERE ge.kb_id = kb.id)"
+            )
+        )
+        await conn.execute(
+            text(
+                "UPDATE knowledge_bases SET graph_status = 'disabled' "
+                "WHERE index_mode = 'standard'"
+            )
+        )
+        await conn.execute(
+            text(
+                "UPDATE document_meta d SET vector_status = CASE "
+                "WHEN d.parse_status = 'parsed' AND EXISTS "
+                "(SELECT 1 FROM knowledge_chunks c WHERE c.doc_id = d.id) THEN 'ready' "
+                "WHEN d.parse_status = 'failed' THEN 'failed' ELSE 'pending' END, "
+                "vector_indexed_at = CASE WHEN d.parse_status = 'parsed' THEN d.updated_at ELSE NULL END"
+            )
+        )
+        await conn.execute(
+            text(
+                "UPDATE document_meta d SET graph_status = CASE "
+                "WHEN kb.index_mode = 'standard' THEN 'excluded' "
+                "WHEN EXISTS (SELECT 1 FROM graph_entities ge WHERE ge.kb_id = d.kb_id "
+                "AND (ge.doc_id = d.id OR EXISTS (SELECT 1 FROM unnest(COALESCE(ge.chunk_ids, ARRAY[]::bigint[])) cid "
+                "JOIN knowledge_chunks c ON c.id = cid WHERE c.doc_id = d.id))) THEN 'ready' "
+                "ELSE 'stale' END "
+                "FROM knowledge_bases kb WHERE kb.id = d.kb_id"
+            )
+        )
+        await conn.execute(
+            text(
+                "UPDATE knowledge_bases kb SET index_status = CASE "
+                "WHEN NOT EXISTS (SELECT 1 FROM document_meta d WHERE d.kb_id = kb.id) THEN 'empty' "
+                "WHEN EXISTS (SELECT 1 FROM document_meta d WHERE d.kb_id = kb.id "
+                "AND d.vector_status IN ('pending', 'building')) THEN 'indexing' "
+                "WHEN NOT EXISTS (SELECT 1 FROM document_meta d WHERE d.kb_id = kb.id "
+                "AND d.vector_status <> 'ready') THEN 'ready' "
+                "WHEN EXISTS (SELECT 1 FROM document_meta d WHERE d.kb_id = kb.id "
+                "AND d.vector_status = 'ready') AND EXISTS (SELECT 1 FROM document_meta d "
+                "WHERE d.kb_id = kb.id AND d.vector_status IN ('failed', 'stale')) THEN 'partial' "
+                "WHEN NOT EXISTS (SELECT 1 FROM document_meta d WHERE d.kb_id = kb.id "
+                "AND d.vector_status <> 'failed') THEN 'failed' "
+                "WHEN EXISTS (SELECT 1 FROM document_meta d WHERE d.kb_id = kb.id "
+                "AND d.vector_status = 'stale') THEN 'stale' ELSE 'failed' END"
+            )
+        )
+        await conn.execute(
+            text(
+                "UPDATE knowledge_bases kb SET graph_status = CASE "
+                "WHEN kb.index_mode = 'standard' THEN 'disabled' "
+                "WHEN NOT EXISTS (SELECT 1 FROM document_meta d WHERE d.kb_id = kb.id "
+                "AND d.graph_status <> 'excluded') THEN 'none' "
+                "WHEN EXISTS (SELECT 1 FROM document_meta d WHERE d.kb_id = kb.id "
+                "AND d.graph_status = 'building') THEN 'building' "
+                "WHEN EXISTS (SELECT 1 FROM document_meta d WHERE d.kb_id = kb.id "
+                "AND d.graph_status = 'pending') THEN 'pending' "
+                "WHEN NOT EXISTS (SELECT 1 FROM document_meta d WHERE d.kb_id = kb.id "
+                "AND d.graph_status NOT IN ('ready', 'excluded')) THEN 'ready' "
+                "WHEN EXISTS (SELECT 1 FROM document_meta d WHERE d.kb_id = kb.id "
+                "AND d.graph_status = 'ready') AND EXISTS (SELECT 1 FROM document_meta d "
+                "WHERE d.kb_id = kb.id AND d.graph_status IN ('failed', 'stale')) THEN 'partial' "
+                "WHEN NOT EXISTS (SELECT 1 FROM document_meta d WHERE d.kb_id = kb.id "
+                "AND d.graph_status NOT IN ('failed', 'excluded')) THEN 'failed' "
+                "WHEN EXISTS (SELECT 1 FROM document_meta d WHERE d.kb_id = kb.id "
+                "AND d.graph_status = 'stale') THEN 'stale' ELSE 'failed' END"
+            )
+        )
+        # graph_meta 是派生统计；旧数据可能只留有历史计数而实际图表已为空。
+        # 启动时以当前租户、当前知识库的真实表数据校准，避免 UI 展示幽灵实体。
+        await conn.execute(
+            text(
+                "UPDATE knowledge_bases kb SET graph_meta = "
+                "COALESCE(kb.graph_meta, '{}'::jsonb) || jsonb_build_object("
+                "'entities', (SELECT COUNT(*) FROM graph_entities ge "
+                "WHERE ge.kb_id = kb.id AND ge.tenant_id = kb.tenant_id), "
+                "'relations', (SELECT COUNT(*) FROM graph_relations gr "
+                "WHERE gr.kb_id = kb.id AND gr.tenant_id = kb.tenant_id), "
+                "'events', (SELECT COUNT(*) FROM graph_events gev "
+                "WHERE gev.kb_id = kb.id AND gev.tenant_id = kb.tenant_id), "
+                "'communities', (SELECT COUNT(*) FROM graph_communities gc "
+                "WHERE gc.kb_id = kb.id AND gc.tenant_id = kb.tenant_id))"
+            )
+        )
+        # create_all 不会为旧表补 CHECK；以命名约束幂等追加。
+        for name, clause, table in (
+            ("ck_kb_index_mode", "index_mode IN ('standard', 'graph_enhanced')", "knowledge_bases"),
+            ("ck_kb_graph_build_policy", "graph_build_policy IN ('auto', 'manual')", "knowledge_bases"),
+            ("ck_kb_standard_manual_policy", "index_mode = 'graph_enhanced' OR graph_build_policy = 'manual'", "knowledge_bases"),
+            ("ck_doc_graph_override", "graph_override IN ('inherit', 'include', 'exclude')", "document_meta"),
+            ("ck_doc_parse_method", "parse_method IN ('text', 'ocr')", "document_meta"),
+        ):
+            await conn.execute(
+                text(
+                    f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '{name}') "
+                    f"THEN ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({clause}); END IF; END $$"
+                )
+            )
+        # Graph RAG（GRAPH_RAG_SPEC §2.2/§3.2 步骤 6）：实体向量 HNSW + name BM25（pg_trgm）
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_graph_entities_vec "
+                "ON graph_entities USING hnsw (embedding vector_cosine_ops)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_graph_entities_name_trgm "
+                "ON graph_entities USING gin (canonical_name gin_trgm_ops)"
             )
         )
         # 可观测性 v2 迁移：agent_spans 新增列（OBSERVABILITY_SPEC §9.2）

@@ -49,7 +49,7 @@ def main() -> None:
     resp = client.post(
         f"{BASE}/knowledge-bases/{kb_id}/documents/upload",
         files={"file": ("manual.md", DOC_MD.encode("utf-8"), "text/markdown")},
-        data={"replace": "true"},
+        data={"replace": "true", "parse_method": "text"},
         headers=HEADERS,
     )
     check(resp.status_code == 200 and resp.json()["data"]["parse_status"] == "pending", "上传返回 pending")

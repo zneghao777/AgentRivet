@@ -44,7 +44,7 @@ def main() -> None:
     resp = client.post(
         f"{BASE}/knowledge-bases/{kb_id}/documents/upload",
         files={"file": ("ocr_manual.png", image_bytes, "image/png")},
-        data={"replace": "true"},
+        data={"replace": "true", "parse_method": "ocr"},
         headers=HEADERS,
     )
     check(resp.status_code == 200, "上传图片成功")

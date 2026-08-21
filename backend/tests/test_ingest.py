@@ -62,6 +62,7 @@ async def test_ingest_document_full_flow():
             kb_id=kb.id,
             filename="manual.md",
             content=DOC_MD.encode("utf-8"),
+            parse_method="text",
         )
         assert doc.parse_status == "pending"
         await _run_parse(doc.id)
@@ -70,7 +71,8 @@ async def test_ingest_document_full_flow():
         fresh = await db.get(DocumentMeta, doc.id)
         assert fresh is not None
         assert fresh.parse_status == "parsed"
-        assert fresh.parse_source in ("glm", "local")
+        assert fresh.parse_method == "text"
+        assert fresh.parse_source == "local"
         assert fresh.raw_text == DOC_MD
         chunks = (
             (
@@ -87,6 +89,44 @@ async def test_ingest_document_full_flow():
 
 
 @pytest.mark.asyncio
+async def test_ingest_ocr_method_uses_remote_parser(monkeypatch):
+    """只有显式选择 OCR 时才调用远程解析，并记录对应解析来源。"""
+    from app.knowledge.parser import glm_parser
+
+    class FakeResult:
+        text = "扫描件识别结果"
+        tool_type = "prime"
+
+    async def fake_parse_file(*args, **kwargs):
+        return FakeResult()
+
+    monkeypatch.setattr(settings, "GLM_FILES_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "GLM_FILES_TOOL", "prime")
+    monkeypatch.setattr(glm_parser, "parse_file", fake_parse_file)
+
+    tenant = f"ocr-{uuid.uuid4().hex[:6]}"
+    async with AsyncSessionLocal() as db:
+        kb = await knowledge_service.create(db, tenant_id=tenant, name="扫描件库")
+        assert kb is not None
+        doc = await knowledge_service.upload_document(
+            db,
+            tenant_id=tenant,
+            kb_id=kb.id,
+            filename="scan.pdf",
+            content=b"%PDF-1.4 fake scan",
+            parse_method="ocr",
+        )
+        await _run_parse(doc.id)
+
+    async with AsyncSessionLocal() as db:
+        fresh = await db.get(DocumentMeta, doc.id)
+        assert fresh is not None
+        assert fresh.parse_method == "ocr"
+        assert fresh.parse_source == "glm"
+        assert fresh.raw_text == "扫描件识别结果"
+
+
+@pytest.mark.asyncio
 async def test_ingest_reparse_is_idempotent():
     """同文档重算幂等：chunk 数不变，不产生重复。"""
     tenant = f"reparse-{uuid.uuid4().hex[:6]}"
@@ -99,6 +139,7 @@ async def test_ingest_reparse_is_idempotent():
             kb_id=kb.id,
             filename="manual.md",
             content=DOC_MD.encode("utf-8"),
+            parse_method="text",
         )
         await _run_parse(doc.id)
         await _run_parse(doc.id)  # 再次解析（replace 语义）
@@ -140,6 +181,7 @@ async def test_ingest_empty_text_fails():
             kb_id=kb.id,
             filename="empty.md",
             content="   \n\n  ".encode("utf-8"),
+            parse_method="text",
         )
         await _run_parse(doc.id)
 
@@ -163,6 +205,7 @@ async def test_chunk_edit_recomputes_embedding():
             kb_id=kb.id,
             filename="manual.md",
             content=DOC_MD.encode("utf-8"),
+            parse_method="text",
         )
         await _run_parse(doc.id)
         chunk = (
@@ -204,6 +247,7 @@ async def test_chunk_toggle_keeps_embedding():
             kb_id=kb.id,
             filename="manual.md",
             content=DOC_MD.encode("utf-8"),
+            parse_method="text",
         )
         await _run_parse(doc.id)
         chunk = (

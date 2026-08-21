@@ -94,6 +94,7 @@ async def _upload_doc(client, kb_id: str, *, tenant: dict[str, str], filename: s
     resp = await client.post(
         f"/api/v1/knowledge-bases/{kb_id}/documents/upload",
         files={"file": (filename, DOC_MD.encode("utf-8"), "text/markdown")},
+        data={"parse_method": "text"},
         headers=tenant,
     )
     assert resp.status_code == 200
@@ -189,7 +190,8 @@ async def test_upload_document_updates_stats(app_client):
     kb_id = await _create_kb(app_client, tenant=AUTH_A, name=_unique("统计手册"))
     doc = await _upload_doc(app_client, kb_id, tenant=AUTH_A)
     assert doc["parse_status"] == "parsed"
-    assert doc["parse_source"] in ("glm", "local")
+    assert doc["parse_method"] == "text"
+    assert doc["parse_source"] == "local"
     assert doc["chunk_count"] >= 3  # 标题分块产生多个
 
     # 详情统计
@@ -221,6 +223,7 @@ async def test_upload_invalid_extension(app_client):
     resp = await app_client.post(
         f"/api/v1/knowledge-bases/{kb_id}/documents/upload",
         files={"file": ("evil.exe", b"MZ...", "application/octet-stream")},
+        data={"parse_method": "text"},
         headers=AUTH_A,
     )
     assert resp.status_code == 400
@@ -276,8 +279,14 @@ async def test_chunk_list_preview_update_toggle_reembed(app_client):
     data = resp.json()["data"]
     assert data["total"] == doc["chunk_count"]
     assert data["items"][0]["kb_id"] == kb_id
+    assert [item["chunk_index"] for item in data["items"]] == sorted(
+        item["chunk_index"] for item in data["items"]
+    )
     chunk = data["items"][0]
     assert chunk["enabled"] is True
+    assert chunk["has_embedding"] is True
+    assert isinstance(chunk["metadata"], dict)
+    assert chunk["created_at"] is not None
 
     # 关键词过滤
     resp = await app_client.get(
@@ -437,7 +446,7 @@ async def test_delete_knowledge_base(app_client):
 async def test_knowledge_audit_records(app_client):
     """upload / search / chunk 治理均有审计记录。"""
     kb_id = await _create_kb(app_client, tenant=AUTH_A, name=_unique("审计库"))
-    doc = await _upload_doc(app_client, kb_id, tenant=AUTH_A)
+    await _upload_doc(app_client, kb_id, tenant=AUTH_A)
     await app_client.post(
         f"/api/v1/knowledge-bases/{kb_id}/test-search",
         json={"query": "休假制度", "top_k": 3},

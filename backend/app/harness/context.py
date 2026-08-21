@@ -13,6 +13,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
+from langchain_core.tools import BaseTool
+
 
 @dataclass
 class ToolContext:
@@ -22,6 +24,11 @@ class ToolContext:
     user_id: str = ""
     # 知识库白名单；None 表示使用全部已启用知识库，空列表表示全部停用
     allowed_kb_ids: list[uuid.UUID] | None = None
+    # 请求态动态工具只驻留 ContextVar，不进入 LangGraph checkpoint。
+    dynamic_tools: list[BaseTool] | None = None
+    # 请求级模型与附件仅驻留 ContextVar，避免把二进制内容写入 checkpoint。
+    model_id: str | None = None
+    attachments: list[dict[str, Any]] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -32,6 +39,9 @@ class ToolContext:
                 if self.allowed_kb_ids is not None
                 else None
             ),
+            "dynamic_tool_names": [tool.name for tool in self.dynamic_tools or []],
+            "model_id": self.model_id,
+            "attachment_names": [item.get("name", "") for item in self.attachments or []],
         }
 
 

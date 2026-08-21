@@ -9,12 +9,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
@@ -23,6 +24,7 @@ from ..storage.models import (
     EvaluationRun,
     KnowledgeBase,
     KnowledgeChunk,
+    KnowledgeIndexJob,
     TraceScore,
 )
 from .chunker import preview_chunks
@@ -34,6 +36,8 @@ from .ingest import (
     parse_and_ingest,
     validate_file,
 )
+from .jobs import index_job_service
+from .policy import GRAPH_OVERRIDES, IndexPolicyError, validate_index_settings
 from .retriever import Hit, retrieve, retrieve_hybrid
 
 logger = logging.getLogger(__name__)
@@ -75,7 +79,14 @@ class KnowledgeService:
     """知识库服务门面。"""
 
     async def create(
-        self, db: AsyncSession, *, tenant_id: str, name: str, description: str | None = None
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        name: str,
+        description: str | None = None,
+        index_mode: str = "standard",
+        graph_build_policy: str = "manual",
     ) -> KnowledgeBase | None:
         """创建知识库；同名已存在返回 None（幂等保护）。"""
         name = name.strip()
@@ -84,10 +95,15 @@ class KnowledgeService:
         existing = await self.get_by_name(db, tenant_id=tenant_id, name=name)
         if existing is not None and existing.status == "active":
             return None
+        validate_index_settings(index_mode, graph_build_policy)
         kb = KnowledgeBase(
             tenant_id=tenant_id,
             name=name,
             description=description,
+            index_mode=index_mode,
+            graph_build_policy=graph_build_policy,
+            index_status="empty",
+            graph_status="none" if index_mode == "graph_enhanced" else "disabled",
             status="active",
         )
         db.add(kb)
@@ -159,6 +175,168 @@ class KnowledgeService:
         await db.refresh(kb)
         return kb
 
+    async def update_index_settings(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        kb_id: uuid.UUID,
+        graph_build_policy: str | None = None,
+        settings_patch: dict[str, Any] | None = None,
+    ) -> KnowledgeBase | None:
+        kb = await self.get(db, tenant_id=tenant_id, kb_id=kb_id)
+        if kb is None:
+            return None
+        policy = graph_build_policy or kb.graph_build_policy
+        validate_index_settings(kb.index_mode, policy)
+        kb.graph_build_policy = policy
+        if settings_patch is not None:
+            allowed = {"chunk_size", "chunk_overlap", "graph_max_hop", "graph_entity_types"}
+            kb.settings = {
+                **(kb.settings or {}),
+                **{key: value for key, value in settings_patch.items() if key in allowed},
+            }
+        kb.updated_at = _now()
+        await db.commit()
+        await db.refresh(kb)
+        return kb
+
+    async def transition_index_mode(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        kb_id: uuid.UUID,
+        target_mode: str,
+        graph_build_policy: str = "manual",
+        build_existing_documents: bool = True,
+    ) -> dict[str, Any] | None:
+        from .graph.builder import schedule_build
+        from .status import refresh_kb_status
+
+        kb = await self.get(db, tenant_id=tenant_id, kb_id=kb_id)
+        if kb is None:
+            return None
+        validate_index_settings(target_mode, graph_build_policy)
+        docs = list(
+            (
+                await db.execute(
+                    select(DocumentMeta).where(
+                        DocumentMeta.kb_id == kb_id,
+                        DocumentMeta.tenant_id == tenant_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        estimated_chunks = int(
+            (
+                await db.execute(
+                    select(func.count(KnowledgeChunk.id)).where(
+                        KnowledgeChunk.kb_id == kb_id,
+                        KnowledgeChunk.tenant_id == tenant_id,
+                    )
+                )
+            ).scalar_one()
+        )
+        kb.index_mode = target_mode
+        kb.graph_build_policy = graph_build_policy
+        job_ids: list[str] = []
+        if target_mode == "standard":
+            for doc in docs:
+                active = await index_job_service.active_for_doc(
+                    db, doc_id=doc.id, job_type="graph_build"
+                )
+                if active is not None and active.status == "queued":
+                    await index_job_service.cancel(db, active)
+        else:
+            for doc in docs:
+                if doc.graph_override == "exclude":
+                    doc.graph_status = "excluded"
+                    continue
+                if doc.vector_status != "ready":
+                    doc.graph_status = "pending"
+                    continue
+                if doc.graph_status != "ready":
+                    doc.graph_status = "pending"
+                if (
+                    build_existing_documents
+                    and graph_build_policy == "auto"
+                    and settings.GRAPH_ENABLED
+                    and doc.graph_status != "ready"
+                ):
+                    job, created = await index_job_service.enqueue(
+                        db,
+                        tenant_id=tenant_id,
+                        kb_id=kb_id,
+                        doc_id=doc.id,
+                        job_type="graph_build",
+                        meta={"reason": "mode_transition", "graph_version": kb.graph_version},
+                    )
+                    job_ids.append(str(job.id))
+                    if created:
+                        schedule_build(
+                            db, kb_id, tenant_id, full=False, doc_id=doc.id, job_id=job.id
+                        )
+        await db.commit()
+        await refresh_kb_status(db, tenant_id=tenant_id, kb_id=kb_id, commit=True)
+        return {
+            "transition_id": str(uuid.uuid4()),
+            "affected_documents": len(docs),
+            "estimated_chunks": estimated_chunks,
+            "job_ids": job_ids,
+        }
+
+    async def update_graph_override(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        kb_id: uuid.UUID,
+        doc_id: int,
+        graph_override: str,
+    ) -> DocumentMeta | None:
+        from .graph.builder import schedule_build
+        from .graph.repository import repository
+        from .policy import resolve_graph_action
+        from .status import refresh_kb_status
+
+        kb = await self.get(db, tenant_id=tenant_id, kb_id=kb_id)
+        doc = await self.get_document(
+            db, tenant_id=tenant_id, kb_id=kb_id, doc_id=doc_id
+        )
+        if kb is None or doc is None:
+            return None
+        action = resolve_graph_action(
+            platform_enabled=settings.GRAPH_ENABLED,
+            index_mode=kb.index_mode,
+            build_policy=kb.graph_build_policy,
+            graph_override=graph_override,
+        )
+        doc.graph_override = graph_override
+        if action == "excluded":
+            await repository.delete_by_doc(
+                db, tenant_id=tenant_id, kb_id=kb_id, doc_id=doc_id
+            )
+            doc.graph_status = "excluded"
+        elif doc.vector_status == "ready":
+            doc.graph_status = "pending"
+            if action == "enqueue":
+                job, created = await index_job_service.enqueue(
+                    db, tenant_id=tenant_id, kb_id=kb_id, doc_id=doc_id,
+                    job_type="graph_build",
+                    meta={"content_hash": doc.content_hash, "graph_version": kb.graph_version},
+                )
+                if created:
+                    schedule_build(
+                        db, kb_id, tenant_id, full=False, doc_id=doc_id, job_id=job.id
+                    )
+        await db.commit()
+        await refresh_kb_status(db, tenant_id=tenant_id, kb_id=kb_id, commit=True)
+        await db.refresh(doc)
+        return doc
+
     async def delete(
         self, db: AsyncSession, *, tenant_id: str, kb_id: uuid.UUID
     ) -> bool:
@@ -223,7 +401,21 @@ class KnowledgeService:
                 "file_size": doc.file_size,
                 "mime_type": doc.mime_type,
                 "parse_status": doc.parse_status,
+                "parse_method": doc.parse_method,
                 "parse_source": doc.parse_source,
+                "graph_override": doc.graph_override,
+                "vector_status": doc.vector_status,
+                "graph_status": doc.graph_status,
+                "vector_error": doc.vector_error,
+                "graph_error": doc.graph_error,
+                "vector_indexed_at": (
+                    doc.vector_indexed_at.isoformat() if doc.vector_indexed_at else None
+                ),
+                "graph_indexed_at": (
+                    doc.graph_indexed_at.isoformat() if doc.graph_indexed_at else None
+                ),
+                "graph_version": doc.graph_version,
+                "content_hash": doc.content_hash,
                 "chunk_count": count,
                 "error": doc.error,
                 "created_at": doc.created_at.isoformat() if doc.created_at else None,
@@ -258,8 +450,10 @@ class KnowledgeService:
         kb_id: uuid.UUID,
         filename: str,
         content: bytes,
+        parse_method: str,
         replace: bool = True,
         mime_type: str | None = None,
+        graph_override: str = "inherit",
     ) -> DocumentMeta:
         """上传文档：校验 → 落盘 → 建 DocumentMeta(pending) → 调度异步解析。
 
@@ -269,6 +463,12 @@ class KnowledgeService:
         kb = await self.get(db, tenant_id=tenant_id, kb_id=kb_id)
         if kb is None:
             raise IngestError("知识库不存在或无权访问")
+        if parse_method not in {"text", "ocr"}:
+            raise IngestError("解析方式必须是 text 或 ocr")
+        if graph_override not in GRAPH_OVERRIDES:
+            raise IndexPolicyError("无效的文档图谱参与方式")
+        if kb.index_mode == "standard" and graph_override == "include":
+            raise IndexPolicyError("标准知识库中的文档不能强制参与图谱构建")
         ext = validate_file(filename, content)
         rel_path = save_upload(tenant_id, kb_id, ext, content)
         if replace:
@@ -283,11 +483,24 @@ class KnowledgeService:
             file_size=len(content),
             mime_type=mime_type or "application/octet-stream",
             parse_status="pending",
+            parse_method=parse_method,
+            graph_override=graph_override,
+            vector_status="pending",
+            graph_status=("excluded" if kb.index_mode == "standard" or graph_override == "exclude" else "pending"),
+            content_hash=hashlib.sha256(content).hexdigest(),
         )
         db.add(doc)
         await db.flush()
         await db.commit()
         await db.refresh(doc)
+        await index_job_service.enqueue(
+            db,
+            tenant_id=tenant_id,
+            kb_id=kb_id,
+            doc_id=doc.id,
+            job_type="parse",
+            meta={"source_file": filename, "content_hash": doc.content_hash, "parse_method": parse_method},
+        )
         # 调度后台解析（pending → parsing → parsed/failed）
         _schedule_parse(doc.id)
         logger.info("文档已上传并调度解析 doc=%s file=%s", doc.id, filename)
@@ -307,6 +520,14 @@ class KnowledgeService:
         )
         if doc is None:
             return None
+        from .graph.repository import repository
+
+        doc.vector_status = "stale"
+        doc.graph_status = "excluded" if doc.graph_status == "excluded" else "stale"
+        await db.flush()
+        await repository.delete_by_doc(
+            db, tenant_id=tenant_id, kb_id=kb_id, doc_id=doc.id
+        )
         await db.execute(
             delete(KnowledgeChunk).where(
                 KnowledgeChunk.doc_id == doc.id,
@@ -316,8 +537,18 @@ class KnowledgeService:
         )
         doc.parse_status = "reparsing"
         doc.error = None
+        doc.vector_error = None
+        doc.graph_error = None
         await db.commit()
         await db.refresh(doc)
+        await index_job_service.enqueue(
+            db,
+            tenant_id=tenant_id,
+            kb_id=kb_id,
+            doc_id=doc.id,
+            job_type="parse",
+            meta={"source_file": doc.source_file, "reason": "reparse", "parse_method": doc.parse_method},
+        )
         _schedule_parse(doc.id)
         return doc
 
@@ -342,8 +573,25 @@ class KnowledgeService:
         self, db: AsyncSession, doc: DocumentMeta, *, commit: bool = True
     ) -> None:
         """删除单个文档记录：文件落盘 + chunks + DocumentMeta。"""
-        if doc.file_path:
-            await asyncio.to_thread(remove_upload, doc.file_path)
+        from .graph.repository import repository
+
+        await db.execute(
+            update(KnowledgeIndexJob)
+            .where(
+                KnowledgeIndexJob.doc_id == doc.id,
+                KnowledgeIndexJob.tenant_id == doc.tenant_id,
+                KnowledgeIndexJob.kb_id == doc.kb_id,
+            )
+            .values(
+                doc_id=None,
+                status="cancelled",
+                stage="document_deleted",
+                finished_at=_now(),
+            )
+        )
+        await repository.delete_by_doc(
+            db, tenant_id=doc.tenant_id, kb_id=doc.kb_id, doc_id=doc.id
+        )
         await db.execute(
             delete(KnowledgeChunk).where(
                 KnowledgeChunk.doc_id == doc.id,
@@ -352,6 +600,8 @@ class KnowledgeService:
             )
         )
         await db.execute(delete(DocumentMeta).where(DocumentMeta.id == doc.id))
+        if doc.file_path:
+            await asyncio.to_thread(remove_upload, doc.file_path)
         if commit:
             await db.commit()
 
@@ -473,6 +723,7 @@ class KnowledgeService:
         strategy: str = "auto",
         rerank: bool = True,
         expand_query: bool = False,
+        mode: str | None = None,
     ) -> list[Hit]:
         """检索 v2（AGENTIC_RAG_UPGRADE_SPEC §3.7）：供 knowledge_search 工具使用。
 
@@ -484,6 +735,33 @@ class KnowledgeService:
         )
         if not resolved:
             return []
+        if mode is not None and settings.KB_UNIFIED_RETRIEVAL_ENABLED:
+            from .retrieval_service import retrieve_knowledge
+
+            result = await retrieve_knowledge(
+                db,
+                tenant_id=tenant_id,
+                query=query,
+                kb_ids=resolved,
+                mode=mode,
+                top_k=top_k,
+                rerank=rerank,
+                expand_query=expand_query,
+            )
+            return [
+                Hit(
+                    text=item["text"],
+                    source_file=item["source_file"],
+                    chunk_index=item["chunk_index"],
+                    score=float(item["score"]),
+                    kb_id=uuid.UUID(item["kb_id"]),
+                    chunk_id=int(item["chunk_id"]),
+                    strategy=item["strategy"],
+                    rerank_score=item.get("rerank_score"),
+                    doc_id=item.get("doc_id"),
+                )
+                for item in result["hits"]
+            ]
         return await retrieve_hybrid(
             db,
             tenant_id=tenant_id,
@@ -493,6 +771,37 @@ class KnowledgeService:
             strategy=strategy,
             rerank=rerank,
             expand_query=expand_query,
+        )
+
+    async def retrieve_unified(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        query: str,
+        kb_ids: list[uuid.UUID] | None = None,
+        kb_name: str | None = None,
+        mode: str = "auto",
+        top_k: int = 5,
+        rerank: bool = True,
+        expand_query: bool = False,
+        graph_hop: int = 2,
+    ) -> dict[str, Any]:
+        from .retrieval_service import retrieve_knowledge
+
+        resolved = await self._resolve_kb_ids(
+            db, tenant_id=tenant_id, kb_ids=kb_ids, kb_name=kb_name
+        )
+        return await retrieve_knowledge(
+            db,
+            tenant_id=tenant_id,
+            query=query,
+            kb_ids=resolved or [],
+            mode=mode,
+            top_k=top_k,
+            rerank=rerank,
+            expand_query=expand_query,
+            graph_hop=graph_hop,
         )
 
     # ---------- 分块治理（KB_MANAGEMENT_SPEC §3.5） ----------
@@ -528,6 +837,9 @@ class KnowledgeService:
             "char_count": len(chunk.chunk_text),
             "enabled": bool(chunk.enabled),
             "chunk_index": chunk.chunk_index,
+            "has_embedding": chunk.embedding is not None,
+            "metadata": chunk.meta or {},
+            "created_at": chunk.created_at.isoformat() if chunk.created_at else None,
             "updated_at": chunk.updated_at.isoformat() if chunk.updated_at else None,
         }
 
@@ -569,7 +881,11 @@ class KnowledgeService:
                 await db.execute(
                     select(KnowledgeChunk)
                     .where(*filters)
-                    .order_by(KnowledgeChunk.id.desc())
+                    .order_by(
+                        KnowledgeChunk.doc_id.asc().nulls_last(),
+                        KnowledgeChunk.chunk_index.asc(),
+                        KnowledgeChunk.id.asc(),
+                    )
                     .offset((page - 1) * page_size)
                     .limit(page_size)
                 )

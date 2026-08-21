@@ -83,6 +83,7 @@ async def _upload_doc(
     resp = await client.post(
         f"/api/v1/knowledge-bases/{kb_id}/documents/upload",
         files={"file": (filename, DOC_MD.encode("utf-8"), "text/markdown")},
+        data={"parse_method": "text"},
         headers=tenant,
     )
     assert resp.status_code == 200

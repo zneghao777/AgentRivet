@@ -10,6 +10,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -108,6 +109,78 @@ class Skill(Base):
     )
 
 
+class McpServer(Base):
+    """租户级 MCP Server 配置；敏感认证信息只保存加密密文。"""
+
+    __tablename__ = "mcp_servers"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_mcp_server_tenant_name"),
+        Index("ix_mcp_server_tenant_health", "tenant_id", "health_status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    transport: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="streamable_http"
+    )
+    endpoint_url: Mapped[str] = mapped_column(Text, nullable=False)
+    auth_type: Mapped[str] = mapped_column(String(24), nullable=False, default="none")
+    secret_ciphertext: Mapped[str | None] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    health_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unknown"
+    )
+    protocol_version: Mapped[str | None] = mapped_column(String(32))
+    server_info: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    capability_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    last_error_message: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class McpCapability(Base):
+    """MCP Server 最近一次成功发现的能力快照。"""
+
+    __tablename__ = "mcp_capabilities"
+    __table_args__ = (
+        UniqueConstraint(
+            "server_id", "kind", "remote_name", name="uq_mcp_capability_remote"
+        ),
+        Index("ix_mcp_capability_server_enabled", "server_id", "enabled"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("mcp_servers.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="tool")
+    remote_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    effective_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str | None] = mapped_column(String(255))
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    input_schema: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    output_schema: Mapped[dict | None] = mapped_column(JSON)
+    annotations: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    risk_level: Mapped[str] = mapped_column(String(16), nullable=False, default="medium")
+    approval_policy: Mapped[str] = mapped_column(String(16), nullable=False, default="write")
+    schema_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    review_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     __table_args__ = (
@@ -138,6 +211,18 @@ class KnowledgeBase(Base):
     __tablename__ = "knowledge_bases"
     __table_args__ = (
         Index("ix_kb_tenant_name", "tenant_id", "name", unique=True),
+        CheckConstraint(
+            "index_mode IN ('standard', 'graph_enhanced')",
+            name="ck_kb_index_mode",
+        ),
+        CheckConstraint(
+            "graph_build_policy IN ('auto', 'manual')",
+            name="ck_kb_graph_build_policy",
+        ),
+        CheckConstraint(
+            "index_mode = 'graph_enhanced' OR graph_build_policy = 'manual'",
+            name="ck_kb_standard_manual_policy",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -148,6 +233,21 @@ class KnowledgeBase(Base):
     description: Mapped[str | None] = mapped_column(Text)
     doc_count: Mapped[int] = mapped_column(default=0)
     chunk_count: Mapped[int] = mapped_column(default=0)
+    index_mode: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="standard"
+    )
+    graph_build_policy: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="manual"
+    )
+    index_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="empty"
+    )
+    graph_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="disabled"
+    )
+    graph_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    graph_meta: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    settings: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     # active / deleted
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(
@@ -164,6 +264,14 @@ class DocumentMeta(Base):
     __tablename__ = "document_meta"
     __table_args__ = (
         Index("ix_doc_kb_tenant", "kb_id", "tenant_id"),
+        CheckConstraint(
+            "graph_override IN ('inherit', 'include', 'exclude')",
+            name="ck_doc_graph_override",
+        ),
+        CheckConstraint(
+            "parse_method IN ('text', 'ocr')",
+            name="ck_doc_parse_method",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -179,14 +287,70 @@ class DocumentMeta(Base):
     parse_status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="pending"
     )
+    # 用户在上传时显式选择：text=本地文本提取，ocr=远程 OCR/版面解析
+    parse_method: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="text"
+    )
     parse_source: Mapped[str | None] = mapped_column(String(16))  # glm / local
     raw_text: Mapped[str | None] = mapped_column(Text)  # 解析出的原始文本
     parser_tool: Mapped[str | None] = mapped_column(String(16))  # lite/expert/prime
     glm_task_id: Mapped[str | None] = mapped_column(String(128))
     error: Mapped[str | None] = mapped_column(Text)
+    graph_override: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="inherit"
+    )
+    vector_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending"
+    )
+    graph_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="excluded"
+    )
+    vector_error: Mapped[str | None] = mapped_column(Text)
+    graph_error: Mapped[str | None] = mapped_column(Text)
+    vector_indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    graph_indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    graph_version: Mapped[int | None] = mapped_column(Integer)
+    content_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class KnowledgeIndexJob(Base):
+    """可恢复的知识库解析、文本索引和图谱任务。"""
+
+    __tablename__ = "knowledge_index_jobs"
+    __table_args__ = (
+        Index("ix_kb_jobs_tenant_kb", "tenant_id", "kb_id", "created_at"),
+        Index("ix_kb_jobs_doc_type", "doc_id", "job_type", "status"),
+        CheckConstraint("progress >= 0 AND progress <= 100", name="ck_kb_job_progress"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    kb_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("knowledge_bases.id"), nullable=False, index=True
+    )
+    doc_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("document_meta.id"), nullable=True, index=True
+    )
+    job_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    stage: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    meta: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )

@@ -9,6 +9,7 @@ from langchain_core.tools import StructuredTool
 from ..config import settings
 from .builtin import builtin_calculator, builtin_echo, builtin_get_time
 from .builtin.read_skill_file import builtin_read_skill_file
+from .knowledge_graph_search import knowledge_graph_search
 from .knowledge_search import knowledge_search
 
 
@@ -65,6 +66,9 @@ class ToolRegistry:
             builtin_read_skill_file,
             knowledge_search,
         ]
+        # Graph RAG 图谱检索工具受 GRAPH_ENABLED 开关控制（GRAPH_RAG_SPEC §7）
+        if settings.GRAPH_ENABLED:
+            tools.append(knowledge_graph_search)
         # memory_search 受 MEMORY_SEARCH_TOOL 开关控制
         if settings.MEMORY_SEARCH_TOOL:
             from .memory_search import memory_search

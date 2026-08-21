@@ -90,6 +90,7 @@ async def _prepare_kb(*, tenant_id: str, name: str | None = None) -> str:
             kb_id=kb.id,
             filename="device.md",
             content=DOC_MD.encode("utf-8"),
+            parse_method="text",
         )
         await _run_parse(doc.id)
         return str(kb.id)

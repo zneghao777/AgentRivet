@@ -15,6 +15,8 @@ from .api import (
     router_admin,
     router_chat,
     router_knowledge,
+    router_knowledge_graph,
+    router_mcp,
     router_memory,
     router_observability,
     router_sessions,
@@ -48,12 +50,67 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 建表
     await create_tables()
 
+    # KBX：恢复进程中断前已持久化的排队/超时任务。
+    if settings.KB_INDEX_JOBS_ENABLED:
+        from sqlalchemy import select
+
+        from .knowledge.graph.builder import schedule_build
+        from .knowledge.jobs import index_job_service
+        from .knowledge.service import _schedule_parse
+        from .storage.models import KnowledgeIndexJob
+
+        async with AsyncSessionLocal() as db:
+            await index_job_service.recover_stale(
+                db, stale_after_seconds=settings.KB_INDEX_JOB_STALE_SECONDS
+            )
+            queued_jobs = list(
+                (
+                    await db.execute(
+                        select(KnowledgeIndexJob).where(KnowledgeIndexJob.status == "queued")
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        for job in queued_jobs:
+            if job.job_type == "parse" and job.doc_id is not None:
+                _schedule_parse(job.doc_id)
+            elif job.job_type == "graph_build":
+                schedule_build(
+                    None,
+                    job.kb_id,
+                    job.tenant_id,
+                    full=bool((job.meta or {}).get("full")),
+                    doc_id=job.doc_id,
+                    job_id=job.id,
+                )
+
     # 工具注册
     tool_registry.register_builtin()
 
     # Skill 发现
     async with AsyncSessionLocal() as db:
         await skill_manager.discover(db)
+
+    # 逐个恢复已启用 MCP；单个远程服务失败不得阻断应用启动。
+    if settings.MCP_ENABLED:
+        from sqlalchemy import select
+
+        from .mcp.adapter import McpAdapterError
+        from .mcp.manager import mcp_manager
+        from .storage.models import McpServer
+
+        async with AsyncSessionLocal() as db:
+            enabled_mcp_servers = list(
+                (await db.execute(select(McpServer).where(McpServer.enabled.is_(True))))
+                .scalars()
+                .all()
+            )
+            for mcp_server in enabled_mcp_servers:
+                try:
+                    await mcp_manager.discover(db, mcp_server)
+                except McpAdapterError as exc:
+                    logger.warning("MCP Server %s 恢复失败: %s", mcp_server.name, exc)
 
     # 子 Agent 注册
     agent_registry.register(build_demo_subagent())
@@ -108,9 +165,7 @@ def _validate_config() -> None:
     if settings.LLM_API_KEY == "":
         logger.warning("LLM_API_KEY 未配置，接口调用将返回错误事件（允许启动）")
     if not settings.api_keys_list:
-        logger.warning(
-            "API_KEYS 未配置；prod 环境将拒绝所有请求，dev 环境使用默认 key"
-        )
+        logger.warning("API_KEYS 未配置；prod 环境将拒绝所有请求，dev 环境使用默认 key")
     if settings.APP_ENV == "prod":
         missing = []
         if not settings.LLM_API_KEY:
@@ -145,6 +200,10 @@ app.include_router(router_chat.router, prefix=API)
 app.include_router(router_skills.router, prefix=API)
 app.include_router(router_tools.router, prefix=API)
 app.include_router(router_knowledge.router, prefix=API)
+app.include_router(router_knowledge_graph.router, prefix=f"{API}/kbs")
+app.include_router(router_knowledge_graph.router, prefix=f"{API}/knowledge-bases")
+app.include_router(router_mcp.router, prefix=API)
+app.include_router(router_mcp.capability_router, prefix=API)
 app.include_router(router_memory.router, prefix=API)
 app.include_router(router_admin.router, prefix=API)
 app.include_router(router_observability.router, prefix=API)
