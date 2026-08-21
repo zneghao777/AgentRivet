@@ -6,10 +6,11 @@ LLM 创建工厂放在此，供主 Agent 与子 Agent 复用。
 from __future__ import annotations
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 
 from ..config import settings
+from ..harness.context import get_tool_context
 from ..skills.manager import skill_manager
 
 SYSTEM_PROMPT_TEMPLATE = """你是企业级 Agent Harness 底座中的通用助手，代号「Harness Agent」。
@@ -32,10 +33,10 @@ SYSTEM_PROMPT_TEMPLATE = """你是企业级 Agent Harness 底座中的通用助�
 """
 
 
-def create_llm() -> BaseChatModel:
+def create_llm(model_id: str | None = None) -> BaseChatModel:
     """创建 OpenAI 兼容 LLM。"""
     return ChatOpenAI(
-        model=settings.LLM_MODEL,
+        model=model_id or settings.LLM_MODEL,
         base_url=settings.LLM_BASE_URL,
         api_key=settings.LLM_API_KEY,
         temperature=settings.LLM_TEMPERATURE,
@@ -77,7 +78,8 @@ def build_system_prompt(
 
 def agent_node(state: dict) -> dict:
     """主 Agent 节点：调用 LLM（bind_tools）生成回复或工具调用。"""
-    llm = state.get("_llm") or create_llm()
+    request_context = get_tool_context()
+    llm = state.get("_llm") or create_llm(request_context.model_id)
     messages = state.get("messages", [])
     skill_names = state.get("skill_loaded", [])
     memory_context = state.get("memory_context")
@@ -88,6 +90,57 @@ def agent_node(state: dict) -> dict:
 
     from langchain_core.messages import SystemMessage
 
-    prompt = [SystemMessage(content=system_prompt), *messages]
+    prompt = [
+        SystemMessage(content=system_prompt),
+        *_with_attachments(messages, request_context.attachments or []),
+    ]
     response: AIMessage = llm_with_tools.invoke(prompt)
     return {"messages": [response]}
+
+
+def _with_attachments(messages: list, attachments: list[dict]) -> list:
+    """把请求态附件注入最后一条用户消息，不污染会话 checkpoint。"""
+    if not attachments:
+        return messages
+    last_user_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if isinstance(messages[index], HumanMessage)
+        ),
+        None,
+    )
+    if last_user_index is None:
+        return messages
+
+    original = messages[last_user_index]
+    text = original.content if isinstance(original.content, str) else str(original.content)
+    document_blocks = [
+        f"\n\n--- 附件：{item['name']} ---\n{item['text']}\n--- 附件结束 ---"
+        for item in attachments
+        if item.get("kind") == "document"
+    ]
+    text_content = text + "".join(document_blocks)
+    images = [item for item in attachments if item.get("kind") == "image"]
+    content: str | list[dict]
+    if images:
+        content = [{"type": "text", "text": text_content}]
+        content.extend(
+            {
+                "type": "image_url",
+                "image_url": {"url": item["data_url"]},
+            }
+            for item in images
+        )
+    else:
+        content = text_content
+
+    enriched = HumanMessage(
+        content=content,
+        additional_kwargs=original.additional_kwargs,
+        name=original.name,
+        id=original.id,
+    )
+    result = list(messages)
+    result[last_user_index] = enriched
+    return result

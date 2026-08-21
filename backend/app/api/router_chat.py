@@ -8,10 +8,16 @@ import logging
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..chat.attachments import (
+    ChatAttachmentError,
+    delete_attachment,
+    prepare_attachments,
+    save_attachment,
+)
 from ..config import settings
 from ..harness.app_runtime import harness_app
 from ..harness.context import (
@@ -19,8 +25,9 @@ from ..harness.context import (
     reset_tool_context,
     set_tool_context,
 )
-from ..harness.session_manager import derive_session_title, session_manager
+from ..harness.session_manager import derive_session_title
 from ..knowledge.service import knowledge_service
+from ..mcp.manager import mcp_manager
 from ..memory.service import memory_service
 from ..observability import audit
 from ..observability.metrics import metrics
@@ -37,6 +44,19 @@ from .schemas import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sessions", tags=["chat"])
+VISION_MODEL = "deepseek-v4-flash-vision-exp"
+
+
+def _requested_mcp_ids(refs) -> set[uuid.UUID] | None:
+    values: set[uuid.UUID] = set()
+    for ref in refs or []:
+        if ref.kind != "mcp_tool":
+            continue
+        try:
+            values.add(uuid.UUID(ref.id))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="MCP capability id 无效") from exc
+    return values or None
 
 
 async def _ensure_session_title(db: AsyncSession, sess, message: str) -> None:
@@ -44,6 +64,74 @@ async def _ensure_session_title(db: AsyncSession, sess, message: str) -> None:
         title = derive_session_title(message)
         await repo.set_session_title(db, sess.id, title)
         sess.title = title
+
+
+def _request_model_and_attachments(
+    *,
+    body: MessageSendRequest | MessageStreamRequest,
+    tenant_id: str,
+    session_id: uuid.UUID,
+) -> tuple[str, list[dict]]:
+    model_id = body.model or settings.LLM_MODEL
+    try:
+        attachments = prepare_attachments(tenant_id, session_id, body.attachment_ids)
+    except ChatAttachmentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if any(item.get("kind") == "image" for item in attachments) and model_id != VISION_MODEL:
+        raise HTTPException(
+            status_code=422,
+            detail=f"图片附件需要使用视觉模型 {VISION_MODEL}",
+        )
+    return model_id, attachments
+
+
+@router.post("/{session_id}/attachments", response_model=ApiResponse)
+async def upload_chat_attachment(
+    session_id: uuid.UUID,
+    file: UploadFile = File(...),
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """上传本次会话使用的图片或文档。"""
+    sess = await repo.get_session(db, session_id)
+    if sess is None or sess.status == "deleted":
+        raise HTTPException(status_code=404, detail="session not found")
+    content = await file.read(settings.CHAT_ATTACHMENT_MAX_SIZE_MB * 1024 * 1024 + 1)
+    try:
+        metadata = save_attachment(
+            auth.tenant.tenant_id,
+            session_id,
+            file.filename or "attachment",
+            content,
+        )
+    except ChatAttachmentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await audit.audit(
+        auth.tenant.tenant_id,
+        "chat.attachment.upload",
+        user_id=auth.user_id,
+        session_id=session_id,
+        detail={"name": metadata["name"], "kind": metadata["kind"], "size": metadata["size"]},
+    )
+    return ApiResponse(data=metadata)
+
+
+@router.delete("/{session_id}/attachments/{attachment_id}", response_model=ApiResponse)
+async def remove_chat_attachment(
+    session_id: uuid.UUID,
+    attachment_id: str,
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """删除尚未发送或不再需要的聊天附件。"""
+    sess = await repo.get_session(db, session_id)
+    if sess is None or sess.status == "deleted":
+        raise HTTPException(status_code=404, detail="session not found")
+    try:
+        delete_attachment(auth.tenant.tenant_id, session_id, attachment_id)
+    except ChatAttachmentError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ApiResponse(data={"deleted": True})
 
 
 # 后台记忆提炼任务集（防 GC + 异常兜底 + 有界并发，对齐 PARSE_CONCURRENCY）
@@ -145,6 +233,12 @@ async def send_message(
     if harness_app.runtime is None:
         raise HTTPException(status_code=503, detail="harness not ready")
 
+    model_id, attachments = _request_model_and_attachments(
+        body=body,
+        tenant_id=auth.tenant.tenant_id,
+        session_id=session_id,
+    )
+
     request_id = f"req-{uuid.uuid4().hex[:12]}"
     await _ensure_session_title(db, sess, body.message)
     await repo.add_message(
@@ -169,11 +263,20 @@ async def send_message(
         user_id=auth.user_id,
         query=body.message,
     )
+    requested_mcp = _requested_mcp_ids(body.capabilities)
+    dynamic_tools = await mcp_manager.resolve_tools(
+        db,
+        tenant_id=auth.tenant.tenant_id,
+        requested_capability_ids=requested_mcp,
+    )
     set_tool_context(
         ToolContext(
             tenant_id=auth.tenant.tenant_id,
             user_id=auth.user_id,
             allowed_kb_ids=allowed_kb_ids,
+            dynamic_tools=dynamic_tools,
+            model_id=model_id,
+            attachments=attachments,
         )
     )
     try:
@@ -196,9 +299,7 @@ async def send_message(
     obs = result.get("_observability") or {}
     trace_id = obs.get("trace_id")
     if trace_id:
-        await repo.link_messages_to_trace(
-            db, request_id=request_id, trace_id=trace_id
-        )
+        await repo.link_messages_to_trace(db, request_id=request_id, trace_id=trace_id)
     await repo.add_message(
         db,
         session_id=session_id,
@@ -230,7 +331,7 @@ async def send_message(
         "chat.send",
         user_id=auth.user_id,
         session_id=session_id,
-        detail={"model": settings.LLM_MODEL, "tool_calls": tool_calls_count},
+        detail={"model": model_id, "tool_calls": tool_calls_count},
     )
     metrics.record_request(
         auth.tenant.tenant_id, ok=run_ok, duration_ms=duration_ms, token_usage=token_usage
@@ -265,6 +366,12 @@ async def stream_message(
     if harness_app.runtime is None:
         raise HTTPException(status_code=503, detail="harness not ready")
 
+    model_id, attachments = _request_model_and_attachments(
+        body=body,
+        tenant_id=auth.tenant.tenant_id,
+        session_id=session_id,
+    )
+
     request_id = f"req-{uuid.uuid4().hex[:12]}"
     await _ensure_session_title(db, sess, body.message)
     await repo.add_message(
@@ -290,6 +397,12 @@ async def stream_message(
     memory_context = await _retrieve_memory_context(
         db, tenant_id=tenant_id, user_id=user_id, query=body.message
     )
+    requested_mcp = _requested_mcp_ids(body.capabilities)
+    dynamic_tools = await mcp_manager.resolve_tools(
+        db,
+        tenant_id=tenant_id,
+        requested_capability_ids=requested_mcp,
+    )
 
     metrics.session_open(str(session_id))
     trace_id: str | None = None
@@ -305,6 +418,9 @@ async def stream_message(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 allowed_kb_ids=allowed_kb_ids,
+                dynamic_tools=dynamic_tools,
+                model_id=model_id,
+                attachments=attachments,
             )
         )
         try:
@@ -320,14 +436,20 @@ async def stream_message(
             ):
                 if "event: trace_start" in frame:
                     try:
-                        data = next((line[6:] for line in frame.splitlines() if line.startswith("data: ")), "{}")
+                        data = next(
+                            (line[6:] for line in frame.splitlines() if line.startswith("data: ")),
+                            "{}",
+                        )
                         trace_id = json.loads(data).get("trace_id") or trace_id
                     except json.JSONDecodeError:
                         pass
                 # 从 run_end 事件提取实际状态（C-07：不固定按成功写）
                 if "event: run_end" in frame:
                     try:
-                        data = next((line[6:] for line in frame.splitlines() if line.startswith("data: ")), "{}")
+                        data = next(
+                            (line[6:] for line in frame.splitlines() if line.startswith("data: ")),
+                            "{}",
+                        )
                         payload = json.loads(data)
                         if payload.get("status") != "success":
                             run_status = "error"
@@ -340,16 +462,14 @@ async def stream_message(
         except Exception as exc:  # noqa: BLE001
             logger.exception("SSE 流异常")
             run_status = "error"
-            yield "event: error\ndata: {\"code\":50000,\"message\":\"stream error\"}\n\n"
+            yield 'event: error\ndata: {"code":50000,"message":"stream error"}\n\n'
         finally:
             reset_tool_context()
             metrics.session_close(str(session_id))
             duration_ms = int((time.monotonic() - stream_start) * 1000)
             reply = "".join(reply_parts).strip()
             if trace_id:
-                await repo.link_messages_to_trace(
-                    db, request_id=request_id, trace_id=trace_id
-                )
+                await repo.link_messages_to_trace(db, request_id=request_id, trace_id=trace_id)
             if reply:
                 await repo.add_message(
                     db,
@@ -375,7 +495,7 @@ async def stream_message(
                 "chat.stream",
                 user_id=user_id,
                 session_id=session_id,
-                detail={"model": settings.LLM_MODEL},
+                detail={"model": model_id},
                 ip=client_ip,
             )
             # C-06/C-07：使用真实耗时与状态
@@ -440,7 +560,7 @@ async def resume(
             ):
                 yield frame
         except Exception as exc:  # noqa: BLE001
-            yield "event: error\ndata: {\"code\":50002,\"message\":\"resume failed\"}\n\n"
+            yield 'event: error\ndata: {"code":50002,"message":"resume failed"}\n\n'
 
     await audit.audit(
         auth.tenant.tenant_id,
@@ -448,9 +568,7 @@ async def resume(
         user_id=auth.user_id,
         session_id=session_id,
     )
-    return StreamingResponse(
-        event_stream(), media_type="text/event-stream"
-    )
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 def _extract_final_answer(result: dict, fallback: str) -> str:

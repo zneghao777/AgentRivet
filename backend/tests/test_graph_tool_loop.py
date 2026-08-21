@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import asyncio
 
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import StructuredTool
+
+import app.harness.graph_builder as graph_builder_module
+from app.harness.context import ToolContext, reset_tool_context, set_tool_context
 from app.harness.graph_builder import build_main_graph
 from app.harness.graph_runtime import GraphRuntime
 from app.skills.manager import skill_manager
@@ -22,9 +27,7 @@ def test_builtin_tools_registered(clean_registry):
     assert "builtin_read_skill_file" in names
 
 
-def test_read_skill_file_tool_is_scoped_to_registered_skill(
-    clean_registry, tmp_path, monkeypatch
-):
+def test_read_skill_file_tool_is_scoped_to_registered_skill(clean_registry, tmp_path, monkeypatch):
     """Skill 资源可读，但不能越过已注册 Skill 根目录。"""
     skill_dir = tmp_path / "safe-skill"
     references = skill_dir / "references"
@@ -48,9 +51,7 @@ def test_read_skill_file_tool_is_scoped_to_registered_skill(
     tool = tool_registry.get("builtin_read_skill_file")
     assert tool is not None
 
-    content = str(
-        tool.invoke({"skill_name": "safe-skill", "path": "references/survey.json"})
-    )
+    content = str(tool.invoke({"skill_name": "safe-skill", "path": "references/survey.json"}))
     assert "A or B" in content
 
     blocked = str(tool.invoke({"skill_name": "safe-skill", "path": "../secret.txt"}))
@@ -75,6 +76,49 @@ def test_graph_compiles_with_tools(clean_registry):
     tool_registry.register_builtin()
     g = build_main_graph(tool_registry, checkpointer=None)
     assert g is not None
+
+
+def test_graph_executes_request_scoped_dynamic_tool(clean_registry, monkeypatch):
+    """MCP 类动态工具无需重编译即可进入同一次 Agent 工具循环。"""
+
+    def remote_echo(text: str) -> str:
+        return f"dynamic:{text}"
+
+    tool = StructuredTool.from_function(
+        remote_echo, name="mcp_demo__echo", description="dynamic fixture"
+    )
+
+    def fake_agent(state: dict) -> dict:
+        if any(isinstance(message, ToolMessage) for message in state["messages"]):
+            return {"messages": [AIMessage(content="dynamic tool complete")]}
+        return {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "mcp_demo__echo",
+                            "args": {"text": "hello"},
+                            "id": "call-dynamic-1",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        }
+
+    monkeypatch.setattr(graph_builder_module, "agent_node", fake_agent)
+    set_tool_context(ToolContext(tenant_id="tenant-a", dynamic_tools=[tool]))
+    try:
+        graph = build_main_graph(tool_registry, checkpointer=None)
+        result = asyncio.run(graph.ainvoke({"messages": [HumanMessage(content="go")]}))
+    finally:
+        reset_tool_context()
+
+    tool_messages = [message for message in result["messages"] if isinstance(message, ToolMessage)]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].content == "dynamic:hello"
+    assert result["messages"][-1].content == "dynamic tool complete"
 
 
 def test_echo_tool_executes(clean_registry):
@@ -103,9 +147,7 @@ def test_sse_event_stream_shapes(clean_registry):
         g = build_main_graph(tool_registry, checkpointer=None)
         rt = GraphRuntime(g, None)
         frames: list[str] = []
-        async for frame in rt.astream(
-            "thr_sse", "hi", "tenant-a", "u1", [], session_id="sess"
-        ):
+        async for frame in rt.astream("thr_sse", "hi", "tenant-a", "u1", [], session_id="sess"):
             frames.append(frame)
         return "\n".join(frames)
 

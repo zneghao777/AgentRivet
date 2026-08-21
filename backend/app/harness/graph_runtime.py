@@ -25,6 +25,7 @@ from langgraph.graph.state import CompiledStateGraph
 from ..config import settings
 from ..observability.costing import compute_cost as _compute_cost
 from . import events as ev
+from .context import get_tool_context
 
 logger = logging.getLogger(__name__)
 
@@ -364,7 +365,11 @@ class GraphRuntime:
 
                 elif etype == "on_chat_model_start":
                     # 记录每次 LLM 调用的独立 span（C-03/C-04/C-05）
-                    model = data.get("model") or settings.LLM_MODEL
+                    model = (
+                        data.get("model")
+                        or get_tool_context().model_id
+                        or settings.LLM_MODEL
+                    )
                     parent_id = _resolve_parent(parent_ids)
                     input_summary = _summarize_input(data.get("input"))
                     pending, created = _register_span(
@@ -687,7 +692,11 @@ class GraphRuntime:
                 parent_ids = event.get("parent_ids") or []
 
                 if etype == "on_chat_model_start":
-                    model = data.get("model") or settings.LLM_MODEL
+                    model = (
+                        data.get("model")
+                        or get_tool_context().model_id
+                        or settings.LLM_MODEL
+                    )
                     pending_spans[run_id] = {
                         "span_id": tracing._new_span_id(),
                         "name": "llm.chat",
@@ -988,7 +997,11 @@ class GraphRuntime:
                                 detail={"ttft_ms": pending_spans[run_id]["ttft_ms"]},
                             )
                 elif etype == "on_chat_model_start":
-                    model = data.get("model") or settings.LLM_MODEL
+                    model = (
+                        data.get("model")
+                        or get_tool_context().model_id
+                        or settings.LLM_MODEL
+                    )
                     pending_spans[run_id] = {
                         "span_id": tracing._new_span_id(),
                         "name": "llm.chat",
