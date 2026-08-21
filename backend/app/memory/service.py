@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -509,6 +510,83 @@ class MemoryService:
             "top_accessed": [self._entry_to_dict(e) for e in top],
         }
 
+    async def graph(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        user_id: str,
+        memory_type: str | None = None,
+        status: str | None = "active",
+        q: str | None = None,
+        limit: int = 80,
+        similarity_threshold: float = 0.72,
+    ) -> dict[str, Any]:
+        """构建当前用户的记忆关系图谱。
+
+        节点取最近更新的记忆；同一来源会话形成同源边，其余节点在向量余弦
+        相似度达到阈值时形成语义边。计算规模由 limit 限制，避免管理页请求
+        对数据库造成无界开销。
+        """
+        filters = [MemoryEntry.tenant_id == tenant_id, MemoryEntry.user_id == user_id]
+        if memory_type:
+            filters.append(MemoryEntry.memory_type == memory_type)
+        if status:
+            filters.append(MemoryEntry.status == status)
+        if q:
+            filters.append(MemoryEntry.content.ilike(f"%{q}%"))
+
+        limit = max(10, min(limit, 120))
+        threshold = max(0.5, min(similarity_threshold, 0.95))
+        rows = (
+            (
+                await db.execute(
+                    select(MemoryEntry)
+                    .where(*filters)
+                    .order_by(MemoryEntry.updated_at.desc())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        edges: list[dict[str, Any]] = []
+        for index, source in enumerate(rows):
+            for target in rows[index + 1 :]:
+                same_source = bool(
+                    source.source_session_id
+                    and source.source_session_id == target.source_session_id
+                )
+                similarity = _cosine_similarity(source.embedding, target.embedding)
+                if same_source:
+                    edges.append(
+                        {
+                            "source": int(source.id),
+                            "target": int(target.id),
+                            "relation": "same_source",
+                            "strength": round(max(similarity or 0.0, 0.82), 4),
+                        }
+                    )
+                elif similarity is not None and similarity >= threshold:
+                    edges.append(
+                        {
+                            "source": int(source.id),
+                            "target": int(target.id),
+                            "relation": "semantic",
+                            "strength": round(similarity, 4),
+                        }
+                    )
+
+        # 保留最强的关系，避免高密度数据下形成不可读的“毛线团”。
+        edges.sort(key=lambda edge: edge["strength"], reverse=True)
+        max_edges = max(limit, min(limit * 2, 180))
+        return {
+            "nodes": [self._entry_to_dict(entry) for entry in rows],
+            "edges": edges[:max_edges],
+            "similarity_threshold": round(threshold, 2),
+        }
+
     async def get_entry(
         self, db: AsyncSession, *, tenant_id: str, user_id: str, memory_id: int
     ) -> MemoryEntry | None:
@@ -669,6 +747,22 @@ class _RowLike:
         self.content = content
         self.similarity = similarity
         self.access_count = access_count
+
+
+def _cosine_similarity(left: Any, right: Any) -> float | None:
+    """兼容 pgvector 返回的 list/ndarray，计算两个已存向量的余弦相似度。"""
+    if left is None or right is None:
+        return None
+    left_values = [float(value) for value in left]
+    right_values = [float(value) for value in right]
+    if not left_values or len(left_values) != len(right_values):
+        return None
+    dot = sum(a * b for a, b in zip(left_values, right_values))
+    left_norm = math.sqrt(sum(value * value for value in left_values))
+    right_norm = math.sqrt(sum(value * value for value in right_values))
+    if left_norm == 0 or right_norm == 0:
+        return None
+    return dot / (left_norm * right_norm)
 
 
 def _merge_texts(old: str, new: str) -> str:

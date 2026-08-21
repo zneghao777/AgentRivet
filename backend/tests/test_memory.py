@@ -308,6 +308,47 @@ async def test_memory_api_timeline(app_client):
 
 
 @pytest.mark.asyncio
+async def test_memory_api_graph_returns_semantic_edges(app_client):
+    """GET /memory/graph 返回当前用户节点及真实向量关系。"""
+    tenant = _tenant()
+    await _insert_memory(
+        tenant_id=tenant,
+        user_id=settings.ANONYMOUS_USER_ID,
+        content="用户偏好 Python 开发",
+    )
+    await _insert_memory(
+        tenant_id=tenant,
+        user_id=settings.ANONYMOUS_USER_ID,
+        content="用户喜欢 Python 编程",
+    )
+    headers = {**AUTH, "X-Tenant-Id": tenant}
+    resp = await app_client.get(
+        "/api/v1/memory/graph?similarity_threshold=0.5", headers=headers
+    )
+    assert resp.status_code == 200
+    graph = resp.json()["data"]
+    assert len(graph["nodes"]) == 2
+    assert any(edge["relation"] == "semantic" for edge in graph["edges"])
+    assert graph["similarity_threshold"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_memory_graph_tenant_isolation(app_client):
+    """关系图谱不会泄露其他租户的节点。"""
+    tenant = _tenant()
+    await _insert_memory(
+        tenant_id=tenant,
+        user_id=settings.ANONYMOUS_USER_ID,
+        content="租户图谱私有记忆",
+    )
+    resp = await app_client.get(
+        "/api/v1/memory/graph", headers={**AUTH, "X-Tenant-Id": "other-tenant"}
+    )
+    assert resp.status_code == 200
+    assert all(node["content"] != "租户图谱私有记忆" for node in resp.json()["data"]["nodes"])
+
+
+@pytest.mark.asyncio
 async def test_memory_api_cross_tenant_404(app_client):
     """跨租户访问返回 404（不泄露存在性）。"""
     tenant = _tenant()

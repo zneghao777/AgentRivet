@@ -16,6 +16,7 @@ from ..storage.db import get_db
 from .deps import AuthContext, require_auth
 from .schemas import (
     ApiResponse,
+    MemoryGraphResponse,
     MemoryItem,
     MemoryListResponse,
     MemoryOverview,
@@ -117,6 +118,30 @@ async def memory_overview(
             top_accessed=[_to_memory_item(c) for c in data["top_accessed"]],
         )
     )
+
+
+@router.get("/graph", response_model=ApiResponse)
+async def memory_graph(
+    memory_type: str | None = None,
+    status: str | None = "active",
+    q: str | None = None,
+    limit: int = Query(80, ge=10, le=120),
+    similarity_threshold: float = Query(0.72, ge=0.5, le=0.95),
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """当前用户的记忆关系图谱：同源会话 + 向量语义相似关系。"""
+    data = await memory_service.graph(
+        db,
+        tenant_id=auth.tenant.tenant_id,
+        user_id=auth.user_id,
+        memory_type=memory_type,
+        status=status,
+        q=q,
+        limit=limit,
+        similarity_threshold=similarity_threshold,
+    )
+    return ApiResponse(data=MemoryGraphResponse(**data))
 
 
 # 注意：/settings 固定路径必须声明在 /{memory_id} 之前，否则会被路径参数吞掉。
