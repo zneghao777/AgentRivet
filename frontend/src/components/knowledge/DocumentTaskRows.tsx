@@ -1,26 +1,14 @@
 // 文档 / 解析任务列表（KB_MANAGEMENT_SPEC §4.3-A）：task-rows 动效、状态徽标、轮询
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Button, Popconfirm, Tag, Tooltip, Upload, message } from "antd";
+import { useEffect, useRef, useState } from "react";
+import { Button, Popconfirm, Tag, Tooltip, message } from "antd";
 import { deleteData, postData } from "@/api/http";
 import type {
   KnowledgeDocItem,
-  KnowledgeUploadResponse,
+  KnowledgeBaseItem,
 } from "@/types/api";
 import { formatTime } from "@/utils/format";
-
-const ACCEPT_EXTS = ".md,.txt,.pdf,.docx";
-const MAX_FILE_SIZE_MB = 50;
-
-const PARSE_STATUS_META: Record<
-  KnowledgeDocItem["parse_status"],
-  { color: string; label: string; icon: string }
-> = {
-  pending: { color: "default", label: "等待解析", icon: "schedule" },
-  parsing: { color: "processing", label: "解析中…", icon: "progress_activity" },
-  reparsing: { color: "processing", label: "重新解析…", icon: "progress_activity" },
-  parsed: { color: "success", label: "已就绪", icon: "check_circle" },
-  failed: { color: "error", label: "解析失败", icon: "error" },
-};
+import PipelineStatus from "./PipelineStatus";
+import KnowledgeUploadModal from "./KnowledgeUploadModal";
 
 function fileSizeLabel(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
@@ -30,6 +18,7 @@ function fileSizeLabel(bytes: number): string {
 
 export default function DocumentTaskRows({
   kbId,
+  kb,
   documents,
   loading,
   onChanged,
@@ -38,6 +27,7 @@ export default function DocumentTaskRows({
   onSelectDoc,
 }: {
   kbId: string;
+  kb: KnowledgeBaseItem;
   documents: KnowledgeDocItem[];
   loading: boolean;
   onChanged: () => void;
@@ -45,19 +35,21 @@ export default function DocumentTaskRows({
   selectedDocId?: number | null;
   onSelectDoc?: (doc: KnowledgeDocItem) => void;
 }) {
-  const [uploading, setUploading] = useState(false);
+  const [uploadOpen, setUploadOpen] = useState(false);
   const [busyDoc, setBusyDoc] = useState<number | null>(null);
   const timerRef = useRef<number | null>(null);
 
-  const hasRunning = documents.some(
-    (doc) => doc.parse_status === "parsing" || doc.parse_status === "reparsing"
+  const hasRunning = documents.some((doc) =>
+    ["parsing", "reparsing"].includes(doc.parse_status) ||
+    ["pending", "building"].includes(doc.vector_status) ||
+    ["building"].includes(doc.graph_status)
   );
 
   // 解析状态轮询：有解析中任务时 3s 刷新
   useEffect(() => {
     if (hasRunning && timerRef.current === null) {
       timerRef.current = window.setInterval(() => {
-        onChanged();
+        if (document.visibilityState === "visible") onChanged();
       }, 3000);
     }
     if (!hasRunning && timerRef.current !== null) {
@@ -72,40 +64,27 @@ export default function DocumentTaskRows({
     };
   }, [hasRunning, onChanged]);
 
-  const uploadFile = useCallback(
-    async (file: File) => {
-      if (file.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
-        message.error(`文件超过 ${MAX_FILE_SIZE_MB}MB 上限`);
-        return;
-      }
-      setUploading(true);
-      try {
-        const formData = new FormData();
-        formData.append("file", file);
-        formData.append("replace", "true");
-        const data = await postData<KnowledgeUploadResponse>(
-          `/knowledge-bases/${kbId}/documents/upload`,
-          formData
-        );
-        message.success(`已上传 ${data.source_file}，后台解析中`);
-        onChanged();
-      } catch (e) {
-        message.error(e instanceof Error ? e.message : "上传失败");
-      } finally {
-        setUploading(false);
-      }
-    },
-    [kbId, onChanged]
-  );
+  const retry = async (doc: KnowledgeDocItem) => {
+    setBusyDoc(doc.doc_id);
+    try {
+      await postData(`/knowledge-bases/${kbId}/documents/${doc.doc_id}/retry`);
+      message.success("已重试失败阶段");
+      onChanged();
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : "重试失败");
+    } finally {
+      setBusyDoc(null);
+    }
+  };
 
   const reparse = async (doc: KnowledgeDocItem) => {
     setBusyDoc(doc.doc_id);
     try {
       await postData(`/knowledge-bases/${kbId}/documents/${doc.doc_id}/reparse`);
-      message.success("已开始重新解析");
+      message.success("旧证据已清理，正在重新解析");
       onChanged();
-    } catch (e) {
-      message.error(e instanceof Error ? e.message : "重新解析失败");
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "重新解析失败");
     } finally {
       setBusyDoc(null);
     }
@@ -129,23 +108,7 @@ export default function DocumentTaskRows({
           <b>文档管理</b>
           <Tag bordered={false}>{documents.length} 个文档</Tag>
         </div>
-        <Upload
-          accept={ACCEPT_EXTS}
-          showUploadList={false}
-          beforeUpload={(file) => {
-            void uploadFile(file);
-            return false;
-          }}
-        >
-          <Button
-            type="primary"
-            size="small"
-            loading={uploading}
-            icon={<span className="material-symbols-rounded" style={{ fontSize: 15 }}>upload_file</span>}
-          >
-            上传文档
-          </Button>
-        </Upload>
+        <Button type="primary" size="small" onClick={() => setUploadOpen(true)} icon={<span className="material-symbols-rounded" style={{ fontSize: 15 }}>upload_file</span>}>上传文档</Button>
       </div>
 
       {documents.length === 0 ? (
@@ -156,8 +119,8 @@ export default function DocumentTaskRows({
       ) : (
         <div className="kb-doc-list">
           {documents.map((doc) => {
-            const meta = PARSE_STATUS_META[doc.parse_status] ?? PARSE_STATUS_META.pending;
-            const running = doc.parse_status === "parsing" || doc.parse_status === "reparsing";
+            const running = ["parsing", "reparsing"].includes(doc.parse_status) || doc.vector_status === "building" || doc.graph_status === "building";
+            const failed = doc.parse_status === "failed" || doc.vector_status === "failed" || doc.graph_status === "failed";
             return (
               <div className={`kb-doc-row${running ? " running" : ""}${selectedDocId === doc.doc_id ? " selected" : ""}`} key={doc.doc_id} role={onSelectDoc ? "option" : undefined} aria-selected={onSelectDoc ? selectedDocId === doc.doc_id : undefined} onClick={() => onSelectDoc?.(doc)} tabIndex={onSelectDoc ? (selectedDocId === doc.doc_id ? 0 : -1) : undefined} onKeyDown={(event) => { if (onSelectDoc && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); onSelectDoc(doc); } }}>
                 <div className="kb-doc-icon">
@@ -169,13 +132,7 @@ export default function DocumentTaskRows({
                     <small>{fileSizeLabel(doc.file_size)}</small>
                   </div>
                   <div className="kb-doc-sub">
-                    <Tag
-                      color={meta.color}
-                      icon={running ? <span className="material-symbols-rounded spin" style={{ fontSize: 12 }}>progress_activity</span> : undefined}
-                      className="kb-parse-tag"
-                    >
-                      {meta.label}
-                    </Tag>
+                    <PipelineStatus doc={doc} showGraph={kb.index_mode === "graph_enhanced"} />
                     {doc.parse_source === "glm" ? <Tag color="purple" bordered={false}>GLM 解析</Tag> : null}
                     {doc.parse_source === "local" ? <Tag bordered={false}>本地解析</Tag> : null}
                     {doc.parse_status === "parsed" ? <span className="kb-doc-chunks">{doc.chunk_count} 分块</span> : null}
@@ -183,9 +140,9 @@ export default function DocumentTaskRows({
                   </div>
                 </div>
                 <div className="kb-doc-actions" onClick={(event) => event.stopPropagation()}>
-                  {doc.parse_status === "failed" && doc.error ? (
-                    <Tooltip title={doc.error}>
-                      <Button size="small" type="text" danger onClick={() => void reparse(doc)} loading={busyDoc === doc.doc_id}>
+                  {failed ? (
+                    <Tooltip title={doc.graph_error || doc.vector_error || doc.error || "索引失败"}>
+                      <Button size="small" type="text" danger onClick={() => void retry(doc)} loading={busyDoc === doc.doc_id}>
                         <span className="material-symbols-rounded" style={{ fontSize: 15 }}>refresh</span>
                         重试
                       </Button>
@@ -196,7 +153,7 @@ export default function DocumentTaskRows({
                       type="text"
                       loading={busyDoc === doc.doc_id}
                       onClick={() => void reparse(doc)}
-                      title="重新解析"
+                      title="重新解析并更新全部证据"
                     >
                       <span className="material-symbols-rounded" style={{ fontSize: 15 }}>refresh</span>
                     </Button>
@@ -208,7 +165,7 @@ export default function DocumentTaskRows({
                   ) : null}
                   <Popconfirm
                     title="删除该文档？"
-                    description={`将删除 ${doc.source_file} 及其全部分块与向量。`}
+                    description={`将删除 ${doc.source_file}、分块、向量、实体、关系、事件、社区归属和历史引用目标。`}
                     okText="删除"
                     cancelText="取消"
                     okButtonProps={{ danger: true }}
@@ -225,6 +182,7 @@ export default function DocumentTaskRows({
         </div>
       )}
       {loading ? <div className="kb-loading-hint">加载中…</div> : null}
+      <KnowledgeUploadModal kb={kb} open={uploadOpen} onClose={() => setUploadOpen(false)} onUploaded={onChanged} />
     </div>
   );
 }

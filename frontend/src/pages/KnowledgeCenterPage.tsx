@@ -1,176 +1,161 @@
-// 知识库体系总览（KB_MANAGEMENT_SPEC §4.2）：context-cards 质感卡片网格
-import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  Button,
-  Empty,
-  Form,
-  Input,
-  Modal,
-  Popconfirm,
-  Select,
-  Skeleton,
-  Switch,
-  Upload,
-  message,
-} from "antd";
-import { useNavigate } from "react-router-dom";
-import { deleteData, getData, patchData, postData } from "@/api/http";
-import type { KnowledgeBaseItem, KnowledgeUploadResponse } from "@/types/api";
+import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
+import { Button, Empty, Popconfirm, Select, Skeleton, Switch, message } from "antd";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { deleteData, getData, patchData } from "@/api/http";
+import type { IndexMode, IndexStatus, KnowledgeBaseItem } from "@/types/api";
 import { formatTime } from "@/utils/format";
-import { InspectorField, MetricStrip, ResponsiveInspector, StatusDot, WorkspaceHeader } from "@/components/common/Workspace";
+import { WorkspaceHeader } from "@/components/common/Workspace";
+import KnowledgeCreateModal from "@/components/knowledge/KnowledgeCreateModal";
+import KnowledgeUploadModal from "@/components/knowledge/KnowledgeUploadModal";
+import KnowledgeModeBadge from "@/components/knowledge/KnowledgeModeBadge";
+import IndexHealthBadge from "@/components/knowledge/IndexHealthBadge";
 
-const MAX_FILE_SIZE_MB = 50;
-const ACCEPT_EXTS = ".md,.txt,.pdf,.docx";
+type ModeFilter = "all" | IndexMode;
+type HealthFilter = "all" | "issues" | IndexStatus;
+
+const ISSUE_STATUSES: IndexStatus[] = ["partial", "failed", "stale"];
+const MODE_FILTERS: { value: ModeFilter; label: string; icon: string }[] = [
+  { value: "all", label: "全部", icon: "apps" },
+  { value: "standard", label: "标准检索", icon: "manage_search" },
+  { value: "graph_enhanced", label: "图谱增强", icon: "account_tree" },
+];
+
+function overallHealth(kb: KnowledgeBaseItem): IndexStatus {
+  if (kb.index_status !== "ready") return kb.index_status;
+  if (kb.index_mode !== "graph_enhanced") return kb.index_status;
+  if (kb.graph_status === "building" || kb.graph_status === "pending") return "indexing";
+  if (kb.graph_status === "partial" || kb.graph_status === "failed" || kb.graph_status === "stale") return kb.graph_status;
+  return kb.index_status;
+}
+
+function KnowledgeCard({ kb, busy, onOpen, onUpload, onToggle, onDelete }: { kb: KnowledgeBaseItem; busy: boolean; onOpen: () => void; onUpload: () => void; onToggle: (enabled: boolean) => void; onDelete: () => void }) {
+  const health = overallHealth(kb);
+  const issue = ISSUE_STATUSES.includes(health);
+  return (
+    <article className={`knowledge-library-card mode-${kb.index_mode}${issue ? " has-issue" : ""}`}>
+      <div className="knowledge-card-accent" />
+      <header className="knowledge-card-header">
+        <span className="knowledge-card-icon material-symbols-rounded">{kb.index_mode === "graph_enhanced" ? "account_tree" : "database"}</span>
+        <button type="button" className="knowledge-card-title" onClick={onOpen}><strong>{kb.name}</strong><span>{kb.description || "尚未添加知识库描述"}</span></button>
+        <Switch size="small" checked={kb.status === "active"} loading={busy} onChange={onToggle} aria-label={`${kb.status === "active" ? "停用" : "启用"}${kb.name}`} />
+      </header>
+      <div className="knowledge-card-badges">
+        <KnowledgeModeBadge mode={kb.index_mode} />
+        <IndexHealthBadge status={health} />
+        {kb.active_job_count > 0 ? <span className="knowledge-job-pill"><i />{kb.active_job_count} 个任务进行中</span> : null}
+      </div>
+      {issue ? <button type="button" className="knowledge-card-alert" onClick={onOpen}><span className="material-symbols-rounded">error</span><span><b>索引需要处理</b><small>查看状态、失败原因与恢复操作</small></span><span className="material-symbols-rounded">arrow_forward</span></button> : null}
+      <div className="knowledge-card-metrics" aria-label={`${kb.name} 索引统计`}>
+        <div><span className="material-symbols-rounded">description</span><b>{kb.doc_count}</b><small>文档</small></div>
+        <div><span className="material-symbols-rounded">view_agenda</span><b>{kb.chunk_count}</b><small>可检索分块</small></div>
+        <div><span className="material-symbols-rounded">hub</span><b>{kb.index_mode === "graph_enhanced" ? kb.entity_count : "—"}</b><small>{kb.index_mode === "graph_enhanced" ? "图谱实体" : "未启用图谱"}</small></div>
+      </div>
+      <footer className="knowledge-card-footer">
+        <span><span className="material-symbols-rounded">schedule</span>{formatTime(kb.updated_at ?? kb.created_at)} 更新</span>
+        <div>
+          <Button type="text" icon={<span className="material-symbols-rounded">upload</span>} onClick={onUpload}>上传</Button>
+          <Popconfirm title="删除知识库" description="将删除原文件、分块、向量与图谱数据。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={onDelete}><Button type="text" danger aria-label={`删除${kb.name}`} icon={<span className="material-symbols-rounded">delete</span>} /></Popconfirm>
+          <Button type="primary" onClick={onOpen}>进入工作台</Button>
+        </div>
+      </footer>
+    </article>
+  );
+}
 
 export default function KnowledgeCenterPage() {
   const navigate = useNavigate();
+  const [params, setParams] = useSearchParams();
   const [kbs, setKbs] = useState<KnowledgeBaseItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
-  const [creating, setCreating] = useState(false);
-  const [uploadingKb, setUploadingKb] = useState<string | null>(null);
+  const [uploadTarget, setUploadTarget] = useState<KnowledgeBaseItem | null>(null);
   const [togglingKb, setTogglingKb] = useState<string | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [keyword, setKeyword] = useState("");
-  const [statusFilter, setStatusFilter] = useState<"all" | "active" | "disabled">("all");
-  const [form] = Form.useForm();
+  const [keyword, setKeyword] = useState(params.get("q") ?? "");
+  const [modeFilter, setModeFilter] = useState<ModeFilter>((params.get("mode") as ModeFilter) ?? "all");
+  const [healthFilter, setHealthFilter] = useState<HealthFilter>((params.get("health") as HealthFilter) ?? "all");
+  const [statusFilter, setStatusFilter] = useState(params.get("status") ?? "all");
+  const [sort, setSort] = useState(params.get("sort") ?? "updated");
+  const deferredKeyword = useDeferredValue(keyword.trim().toLowerCase());
 
   const load = useCallback(async () => {
     setLoading(true);
-    try {
-      const data = await getData<KnowledgeBaseItem[]>("/knowledge-bases");
-      setKbs(data);
-      setSelectedId((current) => current && data.some((item) => item.kb_id === current) ? current : data[0]?.kb_id ?? null);
-    } catch (e) {
-      message.error(e instanceof Error ? e.message : "加载知识库失败");
-    } finally {
-      setLoading(false);
-    }
+    setLoadError(null);
+    try { setKbs(await getData<KnowledgeBaseItem[]>("/knowledge-bases")); }
+    catch (error) { setLoadError(error instanceof Error ? error.message : "加载知识库失败"); }
+    finally { setLoading(false); }
   }, []);
 
+  useEffect(() => { void load(); }, [load]);
   useEffect(() => {
-    void load();
-  }, [load]);
+    const next = new URLSearchParams();
+    if (keyword) next.set("q", keyword);
+    if (modeFilter !== "all") next.set("mode", modeFilter);
+    if (healthFilter !== "all") next.set("health", healthFilter);
+    if (statusFilter !== "all") next.set("status", statusFilter);
+    if (sort !== "updated") next.set("sort", sort);
+    setParams(next, { replace: true });
+  }, [healthFilter, keyword, modeFilter, setParams, sort, statusFilter]);
 
   const toggleKb = async (kb: KnowledgeBaseItem, enabled: boolean) => {
     setTogglingKb(kb.kb_id);
     try {
-      const updated = await patchData<KnowledgeBaseItem>(
-        `/knowledge-bases/${kb.kb_id}/status`,
-        { enabled }
-      );
-      setKbs((current) => current.map((entry) => (entry.kb_id === updated.kb_id ? updated : entry)));
+      const updated = await patchData<KnowledgeBaseItem>(`/knowledge-bases/${kb.kb_id}/status`, { enabled });
+      setKbs((current) => current.map((entry) => entry.kb_id === updated.kb_id ? updated : entry));
       message.success(enabled ? "知识库已启用" : "知识库已停用");
-    } catch (e) {
-      message.error(e instanceof Error ? e.message : "更新状态失败");
-    } finally {
-      setTogglingKb(null);
-    }
-  };
-
-  const createKb = async () => {
-    const values = await form.validateFields();
-    setCreating(true);
-    try {
-      await postData("/knowledge-bases", values);
-      message.success("知识库已创建");
-      setCreateOpen(false);
-      form.resetFields();
-      await load();
-    } catch (e) {
-      message.error(e instanceof Error ? e.message : "创建失败");
-    } finally {
-      setCreating(false);
-    }
+    } catch (error) { message.error(error instanceof Error ? error.message : "更新状态失败"); }
+    finally { setTogglingKb(null); }
   };
 
   const removeKb = async (kb: KnowledgeBaseItem) => {
-    try {
-      await deleteData(`/knowledge-bases/${kb.kb_id}`);
-      message.success("已删除");
-      await load();
-    } catch (e) {
-      message.error(e instanceof Error ? e.message : "删除失败");
-    }
-  };
-
-  const uploadFile = async (kb: KnowledgeBaseItem, file: File) => {
-    if (file.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
-      message.error(`文件超过 ${MAX_FILE_SIZE_MB}MB 上限`);
-      return;
-    }
-    setUploadingKb(kb.kb_id);
-    try {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("replace", "true");
-      const data = await postData<KnowledgeUploadResponse>(
-        `/knowledge-bases/${kb.kb_id}/documents/upload`,
-        formData
-      );
-      message.success(`已上传 ${data.source_file}，后台解析中`);
-      await load();
-    } catch (e) {
-      message.error(e instanceof Error ? e.message : "上传失败");
-    } finally {
-      setUploadingKb(null);
-    }
+    try { await deleteData(`/knowledge-bases/${kb.kb_id}`); message.success("知识库已删除"); await load(); }
+    catch (error) { message.error(error instanceof Error ? error.message : "删除失败"); }
   };
 
   const visibleKbs = useMemo(() => {
-    const query = keyword.trim().toLowerCase();
-    return kbs.filter((kb) => {
-      const matchesStatus = statusFilter === "all" || kb.status === statusFilter;
-      const matchesQuery = !query || `${kb.name} ${kb.description ?? ""}`.toLowerCase().includes(query);
-      return matchesStatus && matchesQuery;
+    const items = kbs.filter((kb) => {
+      const matchesQuery = !deferredKeyword || `${kb.name} ${kb.description ?? ""} ${kb.kb_id}`.toLowerCase().includes(deferredKeyword);
+      const health = overallHealth(kb);
+      const matchesHealth = healthFilter === "all" || (healthFilter === "issues" ? ISSUE_STATUSES.includes(health) : health === healthFilter);
+      return matchesQuery && (modeFilter === "all" || kb.index_mode === modeFilter) && matchesHealth && (statusFilter === "all" || kb.status === statusFilter);
     });
-  }, [kbs, keyword, statusFilter]);
-  const selected = kbs.find((kb) => kb.kb_id === selectedId) ?? null;
+    return [...items].sort((a, b) => {
+      if (sort === "name") return a.name.localeCompare(b.name, "zh-CN");
+      if (sort === "documents") return b.doc_count - a.doc_count;
+      if (sort === "issues") return Number(ISSUE_STATUSES.includes(overallHealth(b))) - Number(ISSUE_STATUSES.includes(overallHealth(a)));
+      return String(b.updated_at ?? b.created_at).localeCompare(String(a.updated_at ?? a.created_at));
+    });
+  }, [deferredKeyword, healthFilter, kbs, modeFilter, sort, statusFilter]);
+
+  const graphKbs = kbs.filter((kb) => kb.index_mode === "graph_enhanced");
+  const issueCount = kbs.filter((kb) => ISSUE_STATUSES.includes(overallHealth(kb))).length;
   const totalDocs = kbs.reduce((sum, kb) => sum + kb.doc_count, 0);
   const totalChunks = kbs.reduce((sum, kb) => sum + kb.chunk_count, 0);
+  const clearFilters = () => { setKeyword(""); setModeFilter("all"); setHealthFilter("all"); setStatusFilter("all"); };
 
   return (
-    <div className="page-scroll workspace-page knowledge-page">
-      <WorkspaceHeader icon="database" title="知识库" description="上传文档构建企业知识，让 Agent 基于知识回答并引用来源" actions={<><Button type="primary" icon={<span className="material-symbols-rounded">add</span>} onClick={() => setCreateOpen(true)}>新建知识库</Button><Button icon={<span className="material-symbols-rounded">refresh</span>} onClick={() => void load()}>刷新</Button></>} />
-      <MetricStrip items={[{ label: "知识库", value: kbs.length, meta: `已启用 ${kbs.filter((kb) => kb.status === "active").length}` }, { label: "文档", value: totalDocs, meta: "全部知识来源", tone: "teal" }, { label: "分块", value: totalChunks, meta: "可检索内容片段", tone: "warning" }]} />
-      <div className="workspace-toolbar"><Input allowClear prefix={<span className="material-symbols-rounded">search</span>} placeholder="搜索知识库名称或描述" value={keyword} onChange={(event) => setKeyword(event.target.value)} /><Select value={statusFilter} onChange={setStatusFilter} options={[{ value: "all", label: "全部状态" }, { value: "active", label: "已启用" }, { value: "disabled", label: "已停用" }]} /></div>
-      <div className="workspace-master-detail">
-        <section className="data-surface knowledge-master">
-          <div className="data-list-header knowledge-grid-row"><span>知识库名称 / 描述</span><span>状态</span><span className="numeric">文档</span><span className="numeric">分块</span><span>最后更新</span></div>
-          {loading && kbs.length === 0 ? <Skeleton active paragraph={{ rows: 6 }} /> : null}
-          {!loading && visibleKbs.length === 0 ? <Empty description="暂无匹配的知识库" /> : null}
-          {visibleKbs.map((kb) => { const active = kb.kb_id === selectedId; return (
-            <button type="button" key={kb.kb_id} className={`data-list-row knowledge-grid-row${active ? " selected" : ""}`} onClick={() => { setSelectedId(kb.kb_id); setInspectorOpen(true); }} onDoubleClick={() => navigate(`/knowledge/${kb.kb_id}`)} aria-selected={active}>
-              <span className="knowledge-primary-cell"><span className="row-leading-icon material-symbols-rounded">database</span><span><b>{kb.name}</b><small>{kb.description || "暂无描述"}</small></span></span>
-              <StatusDot label={kb.status === "active" ? "已启用" : "已停用"} tone={kb.status === "active" ? "success" : "neutral"} />
-              <span className="numeric">{kb.doc_count}</span><span className="numeric">{kb.chunk_count}</span><span className="subtle-label">{formatTime(kb.updated_at ?? kb.created_at)}</span>
-            </button>
-          ); })}
-          <footer className="data-list-footer">共 {visibleKbs.length} 个知识库</footer>
-        </section>
-        <ResponsiveInspector open={inspectorOpen && Boolean(selected)} onClose={() => setInspectorOpen(false)} title={selected?.name ?? "知识库详情"} subtitle={selected ? <StatusDot label={selected.status === "active" ? "已启用" : "已停用"} tone={selected.status === "active" ? "success" : "neutral"} /> : undefined} actions={selected ? <Switch checked={selected.status === "active"} loading={togglingKb === selected.kb_id} onChange={(checked) => void toggleKb(selected, checked)} /> : undefined}>
-          {!selected ? <Empty description="选择一个知识库查看详情" /> : <><section className="inspector-section"><h3>基本信息</h3><p className="inspector-copy">{selected.description || "暂无描述"}</p><InspectorField label="知识库 ID" mono>{selected.kb_id}</InspectorField><InspectorField label="创建时间">{formatTime(selected.created_at)}</InspectorField><InspectorField label="最后更新">{formatTime(selected.updated_at ?? selected.created_at)}</InspectorField></section><section className="inspector-section"><h3>统计信息</h3><InspectorField label="文档数">{selected.doc_count}</InspectorField><InspectorField label="分块数">{selected.chunk_count}</InspectorField></section><section className="inspector-section inspector-button-stack"><Upload accept={ACCEPT_EXTS} showUploadList={false} beforeUpload={(file) => { void uploadFile(selected, file); return false; }}><Button block loading={uploadingKb === selected.kb_id} icon={<span className="material-symbols-rounded">upload</span>}>上传文档</Button></Upload><Button block type="primary" onClick={() => navigate(`/knowledge/${selected.kb_id}`)}>进入详情</Button><Popconfirm title="删除知识库" description="将删除全部文档与分块，确定？" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => void removeKb(selected)}><Button block danger>删除知识库</Button></Popconfirm></section></>}
-        </ResponsiveInspector>
-      </div>
-
-      <Modal
-        title="新建知识库"
-        open={createOpen}
-        onOk={() => void createKb()}
-        confirmLoading={creating}
-        onCancel={() => setCreateOpen(false)}
-        destroyOnHidden
-      >
-        <Form form={form} layout="vertical" initialValues={{ name: "", description: "" }}>
-          <Form.Item name="name" label="名称" rules={[{ required: true, message: "请输入知识库名称" }]}>
-            <Input placeholder="如：员工手册" maxLength={128} />
-          </Form.Item>
-          <Form.Item name="description" label="描述">
-            <Input.TextArea placeholder="这个知识库包含什么内容？（可选）" rows={3} />
-          </Form.Item>
-        </Form>
-      </Modal>
+    <div className="page-scroll workspace-page knowledge-page knowledge-card-page">
+      <WorkspaceHeader icon="database" title="知识库" description="管理标准检索与知识图谱，让 Agent 基于可追溯的企业知识回答。" actions={<><Button type="primary" icon={<span className="material-symbols-rounded">add</span>} onClick={() => setCreateOpen(true)}>新建知识库</Button><Button icon={<span className="material-symbols-rounded">refresh</span>} onClick={() => void load()} loading={loading}>刷新</Button></>} />
+      <section className="knowledge-summary-band" aria-label="知识库关键指标">
+        <div className="tone-blue"><span className="material-symbols-rounded">database</span><p>知识库<strong>{kbs.length}</strong><small>{kbs.filter((kb) => kb.status === "active").length} 个已启用</small></p></div>
+        <div className="tone-violet"><span className="material-symbols-rounded">account_tree</span><p>图谱增强<strong>{graphKbs.length}</strong><small>{graphKbs.filter((kb) => kb.graph_status === "ready").length} 个图谱就绪</small></p></div>
+        <div className="tone-teal"><span className="material-symbols-rounded">description</span><p>知识内容<strong>{totalDocs}</strong><small>{totalChunks} 个可检索分块</small></p></div>
+        <button type="button" className="tone-amber" onClick={() => setHealthFilter("issues")}><span className="material-symbols-rounded">error</span><p>需要处理<strong>{issueCount}</strong><small>失败、部分可用或过期</small></p></button>
+      </section>
+      <section className="knowledge-discovery-bar">
+        <label className="kb-search-field"><span className="sr-only">搜索知识库</span><input value={keyword} onChange={(event) => setKeyword(event.target.value)} placeholder="搜索知识库名称、描述或 ID" /><span className="material-symbols-rounded">search</span></label>
+        <div className="knowledge-mode-filters" role="group" aria-label="知识库类型">{MODE_FILTERS.map((filter) => <button key={filter.value} type="button" aria-pressed={modeFilter === filter.value} onClick={() => setModeFilter(filter.value)}><span className="material-symbols-rounded">{filter.icon}</span>{filter.label}</button>)}</div>
+        <Select aria-label="索引健康度" value={healthFilter} onChange={setHealthFilter} options={[{ value: "all", label: "全部健康度" }, { value: "issues", label: "需要处理" }, { value: "ready", label: "已就绪" }, { value: "indexing", label: "处理中" }, { value: "partial", label: "部分可用" }, { value: "failed", label: "失败" }, { value: "stale", label: "已过期" }]} />
+        <Select aria-label="启用状态" value={statusFilter} onChange={setStatusFilter} options={[{ value: "all", label: "全部状态" }, { value: "active", label: "已启用" }, { value: "inactive", label: "已停用" }]} />
+        <Select aria-label="排序方式" value={sort} onChange={setSort} options={[{ value: "updated", label: "最近更新" }, { value: "name", label: "名称排序" }, { value: "documents", label: "文档最多" }, { value: "issues", label: "问题优先" }]} />
+      </section>
+      {loading && kbs.length === 0 ? <div className="knowledge-card-grid">{Array.from({ length: 4 }, (_, index) => <div className="knowledge-library-card" key={index}><Skeleton active paragraph={{ rows: 4 }} /></div>)}</div> : null}
+      {loadError ? <div className="kb-inline-error" role="alert"><span>{loadError}</span><Button onClick={() => void load()}>重新加载</Button></div> : null}
+      {!loading && !loadError && visibleKbs.length === 0 ? <div className="knowledge-empty-surface"><Empty description={kbs.length ? "没有符合筛选条件的知识库" : "还没有知识库"}>{kbs.length ? <Button onClick={clearFilters}>清除筛选</Button> : <Button type="primary" onClick={() => setCreateOpen(true)}>新建知识库</Button>}</Empty></div> : null}
+      {visibleKbs.length > 0 ? <section className="knowledge-card-grid" aria-label="知识库列表">{visibleKbs.map((kb) => <KnowledgeCard key={kb.kb_id} kb={kb} busy={togglingKb === kb.kb_id} onOpen={() => navigate(`/knowledge/${kb.kb_id}?tab=overview`)} onUpload={() => setUploadTarget(kb)} onToggle={(enabled) => void toggleKb(kb, enabled)} onDelete={() => void removeKb(kb)} />)}</section> : null}
+      {visibleKbs.length > 0 ? <footer className="knowledge-grid-footer">显示 {visibleKbs.length} / {kbs.length} 个知识库</footer> : null}
+      <KnowledgeCreateModal open={createOpen} onClose={() => setCreateOpen(false)} onCreated={() => void load()} />
+      <KnowledgeUploadModal kb={uploadTarget} open={uploadTarget !== null} onClose={() => setUploadTarget(null)} onUploaded={() => void load()} />
     </div>
   );
 }

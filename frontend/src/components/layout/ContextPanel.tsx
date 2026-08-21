@@ -1,11 +1,14 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { getData } from "@/api/http";
-import type { KnowledgeBaseItem, SkillItem, ToolItem } from "@/types/api";
+import type { KnowledgeBaseItem, McpServerItem, SkillItem, ToolItem } from "@/types/api";
+import { DEFAULT_CHAT_MODEL } from "@/constants";
 import { useSettingsStore } from "@/stores/settingsStore";
 
 const toolIcon = (name: string) => {
   const value = name.toLowerCase();
+  if (value === "knowledge_graph_search") return "account_tree";
+  if (value === "knowledge_search") return "find_in_page";
   if (value.includes("calc")) return "calculate";
   if (value.includes("time")) return "schedule";
   if (value.includes("echo")) return "terminal";
@@ -15,6 +18,8 @@ const toolIcon = (name: string) => {
 
 const toolLabel = (name: string) => {
   const value = name.toLowerCase();
+  if (value === "knowledge_graph_search") return "知识图谱专用检索";
+  if (value === "knowledge_search") return "统一知识检索";
   if (value.includes("calc")) return "计算器";
   if (value.includes("time")) return "时间";
   if (value.includes("echo")) return "回显";
@@ -26,16 +31,19 @@ export default function ContextPanel() {
   const navigate = useNavigate();
   const { model, apiKey } = useSettingsStore();
   const [skills, setSkills] = useState<SkillItem[]>([]);
+  const [mcpServers, setMcpServers] = useState<McpServerItem[]>([]);
   const [tools, setTools] = useState<ToolItem[]>([]);
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseItem[]>([]);
 
   useEffect(() => {
     Promise.all([
       getData<SkillItem[]>("/skills").catch(() => []),
+      getData<McpServerItem[]>("/mcp/servers").catch(() => []),
       getData<ToolItem[]>("/tools").catch(() => []),
       getData<KnowledgeBaseItem[]>("/knowledge-bases").catch(() => []),
-    ]).then(([skillItems, toolItems, kbItems]) => {
+    ]).then(([skillItems, serverItems, toolItems, kbItems]) => {
       setSkills(skillItems);
+      setMcpServers(serverItems);
       setTools(toolItems);
       setKnowledgeBases(kbItems);
     });
@@ -44,6 +52,7 @@ export default function ContextPanel() {
   const activeKnowledgeBases = knowledgeBases.filter((kb) => kb.status === "active");
 
   const enabledSkills = skills.filter((skill) => skill.enabled);
+  const connectedMcpServers = mcpServers.filter((server) => server.health_status === "ready");
   return (
     <aside className="context-panel">
       <header className="context-header">
@@ -54,7 +63,7 @@ export default function ContextPanel() {
           <div className="eyebrow">当前模型</div>
           <div className="model-row">
             <div className="model-icon"><span className="material-symbols-rounded">memory</span></div>
-            <strong>{model || "deepseek-chat"}</strong>
+            <strong title={model || DEFAULT_CHAT_MODEL}>{model || DEFAULT_CHAT_MODEL}</strong>
           </div>
           <div className={`api-pill${apiKey ? " ready" : ""}`}>
             <i />{apiKey ? "API Key 已配置" : "API Key 未配置"}
@@ -62,7 +71,7 @@ export default function ContextPanel() {
         </section>
 
         <section className="context-card skills-card">
-          <div className="card-heading"><span className="eyebrow">已加载技能</span><b>{enabledSkills.length}</b></div>
+          <div className="card-heading"><span className="eyebrow">已加载插件</span><b>{enabledSkills.length + connectedMcpServers.length}</b></div>
           <div className="skill-stack">
             {enabledSkills.map((skill) => (
               <div className="skill-row" key={skill.name}>
@@ -70,9 +79,15 @@ export default function ContextPanel() {
                 <div><strong>{skill.name}</strong><p>{skill.description}</p></div>
               </div>
             ))}
+            {connectedMcpServers.map((server) => (
+              <div className="skill-row mcp-plugin-row" key={server.id}>
+                <div className="skill-icon"><span className="material-symbols-rounded">hub</span></div>
+                <div><strong>{server.name}</strong><p>{server.description || "已连接的 MCP Server"}</p></div>
+              </div>
+            ))}
           </div>
           <button className="manage-skills" onClick={() => navigate("/skills")}>
-            <span className="material-symbols-rounded">manage_search</span>管理技能
+            <span className="material-symbols-rounded">manage_search</span>管理插件
           </button>
         </section>
 
@@ -98,7 +113,7 @@ export default function ContextPanel() {
           <div className="eyebrow">内置工具</div>
           <div className="tool-grid">
             {tools.map((tool) => (
-              <div className="tool-chip" key={tool.name} title={tool.description}>
+              <div className={`tool-chip${tool.name === "knowledge_search" ? " text-search-tool" : tool.name === "knowledge_graph_search" ? " graph-search-tool" : ""}`} key={tool.name} title={tool.description}>
                 <span className="material-symbols-rounded">{toolIcon(tool.name)}</span>
                 {toolLabel(tool.name)}
               </div>

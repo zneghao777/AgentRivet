@@ -80,6 +80,53 @@ export interface ToolItem {
   source: string;
 }
 
+export type McpHealthStatus = "unknown" | "checking" | "ready" | "degraded" | "error" | "disabled";
+
+export interface McpServerItem {
+  id: string;
+  name: string;
+  description: string | null;
+  transport: "streamable_http";
+  endpoint_url: string;
+  auth_type: "none" | "bearer" | "headers";
+  credential_configured: boolean;
+  enabled: boolean;
+  health_status: McpHealthStatus;
+  protocol_version: string | null;
+  capability_revision: number;
+  tool_count: number;
+  enabled_tool_count: number;
+  pending_tool_count: number;
+  last_checked_at: string | null;
+  last_error_code: string | null;
+  last_error_message: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface McpCapabilityItem {
+  id: string;
+  server_id: string;
+  kind: "tool" | "resource" | "prompt";
+  remote_name: string;
+  effective_name: string;
+  title: string | null;
+  description: string;
+  input_schema: Record<string, unknown>;
+  annotations: Record<string, unknown>;
+  enabled: boolean;
+  risk_level: "low" | "medium" | "high";
+  approval_policy: "never" | "write" | "always";
+  review_status: "pending" | "approved" | "changed";
+  removed_at: string | null;
+}
+
+export interface CapabilitySummary {
+  skills: { total: number; enabled: number; with_scripts: number };
+  mcp_servers: { total: number; ready: number; degraded: number };
+  needs_attention: number;
+}
+
 export interface AuditItem {
   id: number;
   tenant_id: string;
@@ -91,12 +138,28 @@ export interface AuditItem {
   created_at: string | null;
 }
 
+export type IndexMode = "standard" | "graph_enhanced";
+export type GraphBuildPolicy = "auto" | "manual";
+export type IndexStatus = "empty" | "indexing" | "ready" | "partial" | "failed" | "stale";
+export type GraphStatusValue = "disabled" | "none" | "pending" | "building" | "ready" | "partial" | "failed" | "stale";
+export type VectorStatus = "pending" | "building" | "ready" | "failed" | "stale";
+export type DocumentGraphStatus = "excluded" | "pending" | "building" | "ready" | "failed" | "stale";
+
 export interface KnowledgeBaseItem {
   kb_id: string;
   name: string;
   description: string | null;
   doc_count: number;
   chunk_count: number;
+  index_mode: IndexMode;
+  graph_build_policy: GraphBuildPolicy;
+  index_status: IndexStatus;
+  graph_status: GraphStatusValue;
+  graph_version: number;
+  graph_meta: Record<string, number | string | null | undefined>;
+  settings: Record<string, unknown>;
+  entity_count: number;
+  active_job_count: number;
   status: string;
   created_at: string | null;
   updated_at: string | null;
@@ -109,7 +172,17 @@ export interface KnowledgeDocItem {
   file_size: number;
   mime_type: string | null;
   parse_status: "pending" | "parsing" | "parsed" | "failed" | "reparsing";
+  parse_method: "text" | "ocr";
   parse_source: "glm" | "local" | null;
+  graph_override: "inherit" | "include" | "exclude";
+  vector_status: VectorStatus;
+  graph_status: DocumentGraphStatus;
+  vector_error: string | null;
+  graph_error: string | null;
+  vector_indexed_at: string | null;
+  graph_indexed_at: string | null;
+  graph_version: number | null;
+  content_hash: string | null;
   chunk_count: number;
   error: string | null;
   created_at: string | null;
@@ -126,7 +199,30 @@ export interface KnowledgeUploadResponse {
   doc_id: number;
   source_file: string;
   parse_status: string;
+  parse_method: "text" | "ocr";
+  vector_status: VectorStatus;
+  graph_status: DocumentGraphStatus;
   chunk_count: number;
+  job_ids: string[];
+}
+
+export interface KnowledgeIndexJob {
+  job_id: string;
+  kb_id: string;
+  doc_id: number | null;
+  job_type: "parse" | "vectorize" | "graph_build" | "graph_cleanup";
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  stage: string;
+  progress: number;
+  attempt: number;
+  max_attempts: number;
+  error_code: string | null;
+  error_message: string | null;
+  meta: Record<string, unknown>;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
 }
 
 export interface KnowledgeSearchRequest {
@@ -155,6 +251,9 @@ export interface KnowledgeChunkItem {
   char_count: number;
   enabled: boolean;
   chunk_index: number;
+  has_embedding: boolean;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
   updated_at: string | null;
 }
 
@@ -183,6 +282,97 @@ export interface RetrieveHit {
   rerank_score: number | null;
 }
 
+// ---------- Graph RAG 知识图谱（GRAPH_RAG_SPEC §6） ----------
+
+export interface GraphStatus {
+  kb_id: string;
+  graph_status: GraphStatusValue;
+  platform_enabled?: boolean;
+  graph_meta?: {
+    entities?: number;
+    relations?: number;
+    events?: number;
+    communities?: number;
+    chunks_processed?: number;
+    error?: string;
+  } | null;
+}
+
+export interface GraphEntityItem {
+  id: string;
+  kb_id: string;
+  doc_id: number | null;
+  entity_type: string;
+  name: string;
+  canonical_name: string;
+  description: string | null;
+  meta?: Record<string, unknown>;
+  chunk_ids?: number[];
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface GraphEntityListData {
+  items: GraphEntityItem[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface GraphRelation {
+  relation_id?: string;
+  source_entity_id: string;
+  source_name: string;
+  target_entity_id: string;
+  target_name: string;
+  relation_type: string;
+  description?: string | null;
+  weight: number;
+  source_chunk_id?: number | null;
+  created_at?: string | null;
+}
+
+export interface GraphEventItem {
+  event_id: string;
+  subject_entity_id?: string;
+  subject_name?: string;
+  order_no: number | null;
+  predicate: string | null;
+  object: string | null;
+  summary: string | null;
+  event_type: string | null;
+  source_chunk_id?: number | null;
+  created_at?: string | null;
+}
+
+export interface GraphRelationListData {
+  items: GraphRelation[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface GraphEventListData {
+  items: GraphEventItem[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface GraphSearchResult {
+  entities?: GraphEntityItem[];
+  relations: GraphRelation[];
+  communities?: { summary: string; keywords?: string[]; level?: number }[];
+  events?: GraphEventItem[];
+  evidence_chunk_ids: number[];
+  strategy: string;
+}
+
+export interface GraphSubgraph {
+  nodes: Array<{ id: string; name: string; entity_type: string; description?: string | null }>;
+  edges: Array<{ id: string; source: string; target: string; relation_type: string; source_chunk_id?: number | null }>;
+}
+
 // ---------- 混合检索 / 评测（AGENTIC_RAG_UPGRADE_SPEC §4） ----------
 
 export type RetrievalStrategy = "auto" | "vector" | "keyword" | "hybrid";
@@ -193,6 +383,24 @@ export interface TestSearchRequest {
   strategy: string;
   rerank: boolean;
   expand_query?: boolean;
+}
+
+export interface UnifiedRetrieveResult {
+  query: string;
+  requested_mode: "auto" | "text" | "graph" | "fused";
+  resolved_mode: "text" | "graph" | "fused";
+  hits: Array<RetrieveHit & { doc_id?: number | null; channels: Array<"text" | "graph"> }>;
+  text_hits: RetrieveHit[];
+  graph_context: {
+    entities: unknown[];
+    relations: GraphRelation[];
+    communities: Array<{ summary: string; keywords?: string[]; level?: number }>;
+    events: GraphEventItem[];
+  };
+  evidence_chunks: Array<{ chunk_id: number; kb_id: string; doc_id: number | null; source_file: string; text: string }>;
+  citations: Array<Record<string, unknown>>;
+  degradations: string[];
+  timings: { text_ms: number; graph_ms: number; total_ms: number };
 }
 
 export interface EvaluationCaseResult {

@@ -34,7 +34,13 @@ export interface StreamHandlers {
 
 export async function streamChat(
   sessionId: string,
-  body: { message: string; skills?: string[]; knowledge_bases?: string[] },
+  body: {
+    message: string;
+    skills?: string[];
+    knowledge_bases?: string[];
+    model?: string;
+    attachment_ids?: string[];
+  },
   handlers: StreamHandlers,
   signal?: AbortSignal
 ): Promise<void> {
@@ -52,12 +58,19 @@ export async function streamChat(
   });
 
   if (!resp.ok || !resp.body) {
+    let detail = "";
+    try {
+      const payload = await resp.json() as { detail?: string | { message?: string } };
+      detail = typeof payload.detail === "string" ? payload.detail : payload.detail?.message ?? "";
+    } catch {
+      detail = "";
+    }
     const msg =
       resp.status === 401
         ? "鉴权失败(401)：请确认 API Key 已配置且与后端一致"
         : resp.status === 503
-          ? "服务未就绪(503)：请检查后端是否启动"
-          : `请求失败: HTTP ${resp.status}`;
+          ? detail || "服务未就绪(503)：请检查后端是否启动"
+          : detail || `请求失败: HTTP ${resp.status}`;
     handlers.onError?.({ code: resp.status, message: msg });
     handlers.onClose?.();
     return;

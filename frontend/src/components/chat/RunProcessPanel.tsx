@@ -15,7 +15,8 @@ const NAME_COPY: Record<string, string> = {
   "node.agent": "分析请求并组织回答",
   "node.tools": "调度工具",
   "node.approval": "等待人工确认",
-  knowledge_search: "检索知识库",
+  knowledge_search: "统一知识检索（文本 / 图谱自动路由）",
+  knowledge_graph_search: "知识图谱专用检索",
   builtin_read_skill_file: "读取 Skill 资源",
   builtin_memory_search: "检索长期记忆",
   builtin_calculate: "执行计算",
@@ -49,7 +50,8 @@ function stepLabel(step: ChatRunStep): string {
 
 function stepIcon(step: ChatRunStep): string {
   if (step.kind === "tool") {
-    if (step.name.includes("knowledge")) return "database";
+    if (step.name.includes("knowledge_graph")) return "account_tree";
+    if (step.name.includes("knowledge")) return "find_in_page";
     if (step.name.includes("skill")) return "handyman";
     if (step.name.includes("memory")) return "memory";
     return "build";
@@ -66,12 +68,12 @@ function extractQuery(summary: string | undefined): string | undefined {
   if (!summary) return undefined;
   const jsonQuery = summary.match(/["']query["']\s*:\s*["']([^"']+)["']/)?.[1];
   if (jsonQuery) return jsonQuery;
-  return summary.match(/knowledge_search\([^\n]*query[^\n]*\)/)?.[0];
+  return summary.match(/knowledge_(?:graph_)?search\([^\n]*query[^\n]*\)/)?.[0];
 }
 
 function StepDetail({ step }: { step: ChatRunStep }) {
   if (step.error) return <div className="run-step-detail error">{compactText(step.error)}</div>;
-  if (step.name.includes("knowledge_search")) {
+  if (step.name.includes("knowledge_search") || step.name.includes("knowledge_graph_search")) {
     const query = extractQuery(step.summary);
     const references = step.references ?? [];
     const sources = Array.from(new Set(references.map((reference) => reference.sourceFile)));

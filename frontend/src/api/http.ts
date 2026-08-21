@@ -34,13 +34,18 @@ http.interceptors.response.use(
   },
   (error) => {
     const status = error?.response?.status;
+    const detail = error?.response?.data?.detail;
+    const detailMessage = typeof detail === "string" ? detail : detail?.message;
     if (status === 401) {
       return Promise.reject(
         new Error("鉴权失败(401)：请确认 API Key 已配置且与后端一致（设置页可修改）")
       );
     }
     if (status === 503) {
-      return Promise.reject(new Error("服务未就绪(503)：请检查后端是否启动"));
+      return Promise.reject(new Error(detailMessage || "服务未就绪(503)：请检查后端是否启动"));
+    }
+    if (detailMessage) {
+      return Promise.reject(new Error(detailMessage));
     }
     if (!error?.response) {
       return Promise.reject(

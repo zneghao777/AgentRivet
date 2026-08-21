@@ -1,139 +1,94 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
-import { Button, Empty, Input, Popconfirm, Select, Spin, Switch, message } from "antd";
-import { deleteData, getData, postData } from "@/api/http";
-import { InspectorField, ResponsiveInspector, StatusDot, WorkspaceHeader } from "@/components/common/Workspace";
+import { useCallback, useDeferredValue, useEffect, useMemo, useState, type KeyboardEvent } from "react";
+import { Button, Empty, Input, Popconfirm, Select, Skeleton, Switch, message } from "antd";
+import { useSearchParams } from "react-router-dom";
+import { deleteData, getData, patchData, postData } from "@/api/http";
+import McpServerCard from "@/components/capabilities/McpServerCard";
+import McpServerCreateModal from "@/components/capabilities/McpServerCreateModal";
+import { InspectorField, MetricStrip, ResponsiveInspector, StatusDot, WorkspaceHeader } from "@/components/common/Workspace";
 import SkillImportModal from "@/components/skills/SkillImportModal";
-import type { SkillCategory, SkillItem } from "@/types/api";
+import type { CapabilitySummary, McpCapabilityItem, McpServerItem, SkillCategory, SkillItem } from "@/types/api";
 
+type TabKey = "skills" | "mcp";
 const CATEGORY_LABEL: Record<SkillCategory, string> = { builtin: "内置", external: "外部" };
+const TABS: Array<{ key: TabKey; label: string; icon: string }> = [{ key: "skills", label: "Skills", icon: "bolt" }, { key: "mcp", label: "MCP Servers", icon: "hub" }];
 
-function compactPath(path: string | null | undefined) {
-  if (!path) return "@builtin/skills";
-  const parts = path.split("/").filter(Boolean);
-  return parts.length > 4 ? `…/${parts.slice(-4).join("/")}` : path;
+function SkillCard({ skill, busy, onInspect, onToggle, onDelete }: { skill: SkillItem; busy: boolean; onInspect: () => void; onToggle: () => void; onDelete: () => void }) {
+  return <article className={`capability-card skill-card${skill.has_scripts ? " has-risk" : ""}`}>
+    <header className="capability-card-head"><span className="capability-card-icon material-symbols-rounded">{skill.source === "builtin" ? "bolt" : "deployed_code"}</span><button type="button" className="capability-card-title" onClick={onInspect}><b>{skill.name}</b><small>{CATEGORY_LABEL[skill.source]} · v{skill.version}</small></button>{skill.has_scripts ? <span className="capability-risk-mark material-symbols-rounded" title="包含可执行脚本">security</span> : null}</header>
+    <p className="capability-card-description">{skill.description || "暂无描述"}</p>
+    <div className="capability-card-status"><StatusDot label={skill.enabled ? "已启用" : "已停用"} tone={skill.enabled ? "success" : "neutral"} />{skill.tags.slice(0, 2).map((tag) => <span className="capability-tag" key={tag}>{tag}</span>)}{skill.tags.length > 2 ? <span className="capability-tag">+{skill.tags.length - 2}</span> : null}</div>
+    <div className="capability-card-metrics"><span><b>{skill.file_count}</b>文件</span><span><b>{skill.has_scripts ? "有" : "无"}</b>脚本</span><span><b>{skill.author || "—"}</b>作者</span></div>
+    <footer className="capability-card-footer"><small>{skill.source === "builtin" ? "系统内置能力" : "租户托管能力"}</small>{skill.source === "external" ? <Popconfirm title={`删除 ${skill.name}？`} description="将删除托管目录中的全部文件。" okButtonProps={{ danger: true }} onConfirm={onDelete}><Button type="text" size="small" danger>删除</Button></Popconfirm> : null}<Switch checked={skill.enabled} loading={busy} onChange={onToggle} /></footer>
+  </article>;
 }
 
 export default function SkillsPage() {
+  const [params, setParams] = useSearchParams();
+  const tab: TabKey = params.get("tab") === "mcp" ? "mcp" : "skills";
   const [skills, setSkills] = useState<SkillItem[]>([]);
+  const [servers, setServers] = useState<McpServerItem[]>([]);
+  const [summary, setSummary] = useState<CapabilitySummary | null>(null);
   const [loading, setLoading] = useState(true);
-  const [selectedName, setSelectedName] = useState<string | null>(null);
+  const [keyword, setKeyword] = useState(params.get("q") || "");
+  const [status, setStatus] = useState("all");
   const [busy, setBusy] = useState<string | null>(null);
-  const [keyword, setKeyword] = useState("");
-  const [category, setCategory] = useState<SkillCategory | "all">("all");
-  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
-  const [reloading, setReloading] = useState(false);
-  const deferredKeyword = useDeferredValue(keyword);
+  const [mcpOpen, setMcpOpen] = useState(false);
+  const [selectedSkill, setSelectedSkill] = useState<SkillItem | null>(null);
+  const [selectedServer, setSelectedServer] = useState<McpServerItem | null>(null);
+  const [serverTools, setServerTools] = useState<McpCapabilityItem[]>([]);
+  const query = useDeferredValue(keyword.trim().toLowerCase());
 
   const load = useCallback(async () => {
+    setLoading(true);
     try {
-      const data = await getData<SkillItem[]>("/skills");
-      setSkills(data);
-      setSelectedName((current) => current && data.some((item) => item.name === current) ? current : data[0]?.name ?? null);
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : "加载技能失败");
-    } finally {
-      setLoading(false);
-    }
+      const [skillRows, serverRows, summaryData] = await Promise.all([
+        getData<SkillItem[]>("/skills"), getData<McpServerItem[]>("/mcp/servers"), getData<CapabilitySummary>("/capabilities/summary"),
+      ]);
+      setSkills(skillRows); setServers(serverRows); setSummary(summaryData);
+      setSelectedSkill((current) => current ? skillRows.find((item) => item.name === current.name) ?? null : null);
+      setSelectedServer((current) => current ? serverRows.find((item) => item.id === current.id) ?? null : null);
+    } catch (error) { message.error(error instanceof Error ? error.message : "加载插件失败"); }
+    finally { setLoading(false); }
   }, []);
-
   useEffect(() => { void load(); }, [load]);
+  useEffect(() => { const next = new URLSearchParams(params); keyword ? next.set("q", keyword) : next.delete("q"); setParams(next, { replace: true }); }, [keyword]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const toggle = async (skill: SkillItem) => {
-    setBusy(skill.name);
+  const switchTab = (nextTab: TabKey) => { const next = new URLSearchParams(params); next.set("tab", nextTab); next.delete("q"); setParams(next, { replace: true }); setKeyword(""); setStatus("all"); setSelectedSkill(null); setSelectedServer(null); };
+  const onTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, current: TabKey) => { const index = TABS.findIndex((item) => item.key === current); if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return; event.preventDefault(); const nextIndex = event.key === "Home" ? 0 : event.key === "End" ? TABS.length - 1 : event.key === "ArrowRight" ? (index + 1) % TABS.length : (index - 1 + TABS.length) % TABS.length; switchTab(TABS[nextIndex].key); window.requestAnimationFrame(() => document.getElementById(`cap-tab-${TABS[nextIndex].key}`)?.focus()); };
+  const inspectServer = async (server: McpServerItem) => { setSelectedServer(server); try { setServerTools(await getData<McpCapabilityItem[]>(`/mcp/servers/${server.id}/capabilities`)); } catch { setServerTools([]); } };
+  const toggleSkill = async (skill: SkillItem) => { setBusy(skill.name); try { await postData(`/skills/${encodeURIComponent(skill.name)}/${skill.enabled ? "disable" : "enable"}`, {}); await load(); } catch (error) { message.error(error instanceof Error ? error.message : "更新 Skill 失败"); } finally { setBusy(null); } };
+  const removeSkill = async (skill: SkillItem) => { setBusy(skill.name); try { await deleteData(`/skills/${encodeURIComponent(skill.name)}`); setSelectedSkill(null); await load(); } finally { setBusy(null); } };
+  const testServer = async (server: McpServerItem) => { setBusy(server.id); try { await postData(`/mcp/servers/${server.id}/test`, {}); message.success("连接测试和能力发现完成"); await load(); } catch (error) { message.error(error instanceof Error ? error.message : "连接测试失败"); await load(); } finally { setBusy(null); } };
+  const toggleServer = async (server: McpServerItem) => { setBusy(server.id); try { await postData(`/mcp/servers/${server.id}/${server.enabled ? "disable" : "enable"}`, {}); await load(); } catch (error) { message.error(error instanceof Error ? error.message : "更新 MCP Server 失败"); } finally { setBusy(null); } };
+  const removeServer = async (server: McpServerItem) => { setBusy(server.id); try { await deleteData(`/mcp/servers/${server.id}`); setSelectedServer(null); await load(); } finally { setBusy(null); } };
+  const reviewTool = async (tool: McpCapabilityItem, enabled: boolean) => {
+    if (!selectedServer) return;
+    setBusy(tool.id);
     try {
-      await postData(`/skills/${skill.name}/${skill.enabled ? "disable" : "enable"}`, {});
+      const updated = await patchData<McpCapabilityItem>(
+        `/mcp/servers/${selectedServer.id}/capabilities/${tool.id}`,
+        { enabled },
+      );
+      setServerTools((current) => current.map((item) => item.id === updated.id ? updated : item));
       await load();
-      message.success(skill.enabled ? "已禁用" : "已启用");
     } catch (error) {
-      message.error(error instanceof Error ? error.message : "操作失败");
-    } finally {
-      setBusy(null);
-    }
+      message.error(error instanceof Error ? error.message : "更新工具失败");
+    } finally { setBusy(null); }
   };
 
-  const reload = async () => {
-    setReloading(true);
-    try {
-      await postData<SkillItem[]>("/skills/reload", {});
-      await load();
-      message.success("已重新扫描 Skill 目录");
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : "重新扫描失败");
-    } finally {
-      setReloading(false);
-    }
-  };
+  const visibleSkills = useMemo(() => skills.filter((item) => (!query || `${item.name} ${item.description} ${item.tags.join(" ")}`.toLowerCase().includes(query)) && (status === "all" || (status === "enabled") === item.enabled)), [query, skills, status]);
+  const visibleServers = useMemo(() => servers.filter((item) => (!query || `${item.name} ${item.description || ""} ${item.endpoint_url}`.toLowerCase().includes(query)) && (status === "all" || status === item.health_status || (status === "enabled" && item.enabled) || (status === "disabled" && !item.enabled))), [query, servers, status]);
+  const inspectorOpen = Boolean(selectedSkill || selectedServer);
 
-  const remove = async (skill: SkillItem) => {
-    setBusy(skill.name);
-    try {
-      await deleteData(`/skills/${encodeURIComponent(skill.name)}`);
-      setInspectorOpen(false);
-      await load();
-      message.success(`已删除 ${skill.name}`);
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : "删除失败");
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const visibleSkills = useMemo(() => {
-    const query = deferredKeyword.trim().toLowerCase();
-    return skills.filter((skill) => {
-      const source = skill.source;
-      return (category === "all" || source === category) && (!query || `${skill.name} ${skill.description} ${skill.tags.join(" ")}`.toLowerCase().includes(query));
-    });
-  }, [category, deferredKeyword, skills]);
-
-  const selected = skills.find((skill) => skill.name === selectedName) ?? null;
-  const enabledCount = skills.filter((skill) => skill.enabled).length;
-  const externalCount = skills.filter((skill) => skill.source === "external").length;
-
-  return (
-    <div className="page-scroll workspace-page skills-page">
-      <WorkspaceHeader
-        icon="bolt"
-        title="技能库"
-        description="集中导入、校验与管理 Agent 可复用的能力包"
-        actions={<><StatusDot label={`已启用 ${enabledCount} / ${skills.length} 项`} tone="success" /><Button loading={reloading} onClick={() => void reload()} icon={<span className="material-symbols-rounded">sync</span>}>重新扫描</Button><Button type="primary" onClick={() => setImportOpen(true)} icon={<span className="material-symbols-rounded">system_update_alt</span>}>导入 Skill</Button></>}
-      />
-      <div className="workspace-toolbar">
-        <Input allowClear prefix={<span className="material-symbols-rounded">search</span>} placeholder="搜索技能名称、描述或标签" value={keyword} onChange={(event) => setKeyword(event.target.value)} />
-        <Select value={category} onChange={setCategory} options={[{ value: "all", label: `全部 ${skills.length}` }, { value: "builtin", label: `内置 ${skills.length - externalCount}` }, { value: "external", label: `外部 ${externalCount}` }]} />
-        <span className="skill-toolbar-note"><span className="material-symbols-rounded">verified_user</span>外部 Skill 导入后默认停用</span>
-      </div>
-      <div className="workspace-master-detail">
-        <section className="data-surface skills-master" aria-label="技能列表" role="listbox">
-          <div className="data-list-header skill-grid-row"><span>技能名称</span><span>类型</span><span>状态</span><span>版本</span></div>
-          {loading ? <div className="skill-loading"><Spin size="small" />正在加载 Skill…</div> : null}
-          {!loading && visibleSkills.length === 0 ? <Empty description={skills.length ? "没有匹配的 Skill" : "还没有 Skill，点击右上角开始导入"} /> : null}
-          {visibleSkills.map((skill) => {
-            const source = skill.source;
-            const active = skill.name === selectedName;
-            return (
-              <div role="option" tabIndex={active ? 0 : -1} key={skill.name} className={`data-list-row skill-grid-row${active ? " selected" : ""}`} onClick={() => { setSelectedName(skill.name); setInspectorOpen(true); }} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setSelectedName(skill.name); setInspectorOpen(true); } }} aria-selected={active}>
-                <span className="skill-primary-cell"><span className="row-leading-icon material-symbols-rounded">{source === "builtin" ? "bolt" : "cloud_download"}</span><span><b>{skill.name}</b><small>{skill.description || "暂无描述"}</small></span></span>
-                <span className="subtle-label">{CATEGORY_LABEL[source]}</span>
-                <span onClick={(event) => event.stopPropagation()}><Switch checked={skill.enabled} loading={busy === skill.name} onChange={() => void toggle(skill)} /></span>
-                <span className="mono subtle-label">v{skill.version}</span>
-              </div>
-            );
-          })}
-          <footer className="data-list-footer">共 {visibleSkills.length} 项</footer>
-        </section>
-        <ResponsiveInspector open={inspectorOpen && Boolean(selected)} onClose={() => setInspectorOpen(false)} title={selected?.name ?? "技能详情"} subtitle={selected ? <StatusDot label={selected.enabled ? "已启用" : "已停用"} tone={selected.enabled ? "success" : "neutral"} /> : undefined} actions={selected ? <Switch checked={selected.enabled} loading={busy === selected.name} onChange={() => void toggle(selected)} /> : undefined}>
-          {!selected ? <Empty description="选择一个技能查看详情" /> : <>
-            <section className="inspector-section"><h3>概览</h3><InspectorField label="类型">{CATEGORY_LABEL[selected.source]}</InspectorField><InspectorField label="版本">v{selected.version}</InspectorField><InspectorField label="作者">{selected.author || "—"}</InspectorField><InspectorField label="文件">{selected.file_count} 个{selected.has_scripts ? " · 含脚本" : ""}</InspectorField><InspectorField label="来源路径" mono><span title={selected.path || "@builtin/skills"}>{compactPath(selected.path)}</span></InspectorField></section>
-            <section className="inspector-section"><h3>描述</h3><p className="inspector-copy">{selected.description || "暂无描述"}</p></section>
-            <section className="inspector-section"><h3>标签</h3><div className="quiet-tags">{selected.tags.length ? selected.tags.map((tag) => <span key={tag}>{tag}</span>) : <span>无标签</span>}</div></section>
-            {selected.has_scripts ? <section className="inspector-section skill-security-note"><span className="material-symbols-rounded">security</span><p><b>此 Skill 包含可执行脚本</b>启用前请确认文件来源与脚本内容可信。</p></section> : null}
-            {selected.source === "external" ? <section className="inspector-section"><Popconfirm title={`删除 ${selected.name}？`} description="将移除托管目录中的全部文件，此操作无法撤销。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => void remove(selected)}><Button danger block loading={busy === selected.name} icon={<span className="material-symbols-rounded">delete</span>}>删除外部 Skill</Button></Popconfirm></section> : null}
-          </>}
-        </ResponsiveInspector>
-      </div>
-      <SkillImportModal open={importOpen} onClose={() => setImportOpen(false)} onImported={(names) => { void load().then(() => { setSelectedName(names[0] ?? null); setInspectorOpen(Boolean(names[0])); }); }} />
-    </div>
-  );
+  return <div className="page-scroll workspace-page capability-hub-page">
+    <WorkspaceHeader icon="extension" title="插件" description="统一管理 Skill 与 MCP Server，为 Agent 配置可信、可观察的能力。" actions={<Button type="primary" icon={<span className="material-symbols-rounded">add</span>} onClick={() => tab === "skills" ? setImportOpen(true) : setMcpOpen(true)}>{tab === "skills" ? "导入 Skill" : "添加 MCP Server"}</Button>} />
+    <MetricStrip items={[{ label: "Skills", value: summary?.skills.total ?? skills.length, meta: `${summary?.skills.enabled ?? skills.filter((item) => item.enabled).length} 个已启用`, onClick: () => switchTab("skills") }, { label: "MCP Servers", value: summary?.mcp_servers.total ?? servers.length, meta: `${summary?.mcp_servers.ready ?? 0} 个连接正常`, tone: "teal", onClick: () => switchTab("mcp") }, { label: "可用工具", value: servers.reduce((sum, item) => sum + item.enabled_tool_count, 0), meta: "已批准 MCP Tools", tone: "success" }, { label: "需要处理", value: summary?.needs_attention ?? 0, meta: "异常或部分可用", tone: "warning", onClick: () => { switchTab("mcp"); setStatus("error"); } }]} />
+    <nav className="capability-tabs" role="tablist" aria-label="能力类型">{TABS.map((item) => <button type="button" role="tab" id={`cap-tab-${item.key}`} aria-selected={tab === item.key} tabIndex={tab === item.key ? 0 : -1} className={tab === item.key ? "active" : ""} key={item.key} onClick={() => switchTab(item.key)} onKeyDown={(event) => onTabKeyDown(event, item.key)}><span className="material-symbols-rounded">{item.icon}</span>{item.label}<small>{item.key === "skills" ? skills.length : servers.length}</small></button>)}</nav>
+    <section className="capability-toolbar"><Input allowClear prefix={<span className="material-symbols-rounded">search</span>} placeholder={tab === "skills" ? "搜索名称、描述或标签" : "搜索 Server、Endpoint"} value={keyword} onChange={(event) => setKeyword(event.target.value)} /><Select value={status} onChange={setStatus} options={tab === "skills" ? [{ value: "all", label: "全部状态" }, { value: "enabled", label: "已启用" }, { value: "disabled", label: "已停用" }] : [{ value: "all", label: "全部状态" }, { value: "ready", label: "连接正常" }, { value: "degraded", label: "部分可用" }, { value: "error", label: "连接异常" }, { value: "disabled", label: "已停用" }]} /><Button icon={<span className="material-symbols-rounded">refresh</span>} onClick={() => void load()} loading={loading}>刷新</Button></section>
+    <div className={`capability-body${inspectorOpen ? " has-inspector" : ""}`}><main>{loading && !(skills.length || servers.length) ? <section className="capability-card-grid">{Array.from({ length: 6 }, (_, index) => <article className="capability-card" key={index}><Skeleton active paragraph={{ rows: 4 }} /></article>)}</section> : null}{!loading && tab === "skills" && !visibleSkills.length ? <Empty description={skills.length ? "没有匹配的 Skill" : "还没有 Skill"}><Button type="primary" onClick={() => setImportOpen(true)}>导入 Skill</Button></Empty> : null}{!loading && tab === "mcp" && !visibleServers.length ? <Empty description={servers.length ? "没有匹配的 MCP Server" : "还没有 MCP Server"}><Button type="primary" onClick={() => setMcpOpen(true)}>添加 MCP Server</Button></Empty> : null}<section className="capability-card-grid" role="tabpanel" aria-labelledby={`cap-tab-${tab}`}>{tab === "skills" ? visibleSkills.map((skill) => <SkillCard key={skill.name} skill={skill} busy={busy === skill.name} onInspect={() => { setSelectedServer(null); setSelectedSkill(skill); }} onToggle={() => void toggleSkill(skill)} onDelete={() => void removeSkill(skill)} />) : visibleServers.map((server) => <McpServerCard key={server.id} server={server} busy={busy === server.id} onInspect={() => { setSelectedSkill(null); void inspectServer(server); }} onTest={() => void testServer(server)} onToggle={() => void toggleServer(server)} onDelete={() => void removeServer(server)} />)}</section></main>
+      {inspectorOpen ? <ResponsiveInspector open onClose={() => { setSelectedSkill(null); setSelectedServer(null); }} title={selectedSkill?.name || selectedServer?.name || "能力详情"} subtitle={selectedSkill ? <StatusDot label={selectedSkill.enabled ? "已启用" : "已停用"} tone={selectedSkill.enabled ? "success" : "neutral"} /> : selectedServer ? <StatusDot label={selectedServer.health_status} tone={selectedServer.health_status === "ready" ? "success" : selectedServer.health_status === "error" ? "danger" : "warning"} /> : undefined}>{selectedSkill ? <><section className="inspector-section"><h3>概览</h3><InspectorField label="来源">{CATEGORY_LABEL[selectedSkill.source]}</InspectorField><InspectorField label="版本">v{selectedSkill.version}</InspectorField><InspectorField label="作者">{selectedSkill.author || "—"}</InspectorField><InspectorField label="文件">{selectedSkill.file_count} 个{selectedSkill.has_scripts ? " · 含脚本" : ""}</InspectorField></section><section className="inspector-section"><h3>描述</h3><p>{selectedSkill.description}</p></section></> : selectedServer ? <><section className="inspector-section"><h3>连接</h3><InspectorField label="Endpoint" mono>{selectedServer.endpoint_url}</InspectorField><InspectorField label="认证">{selectedServer.credential_configured ? `${selectedServer.auth_type} · 已配置` : "无需认证"}</InspectorField><InspectorField label="协议">{selectedServer.protocol_version || "—"}</InspectorField></section><section className="inspector-section"><h3>Tools · {serverTools.length}</h3><div className="mcp-tool-chips">{serverTools.map((tool) => <div className="mcp-tool-chip-row" key={tool.id}><span className="material-symbols-rounded">build</span><b title={tool.description}>{tool.remote_name}</b><small>{tool.enabled ? "已启用" : tool.review_status === "changed" ? "已变化" : "待审查"}</small><button type="button" role="switch" aria-checked={tool.enabled} aria-busy={busy === tool.id} disabled={busy === tool.id} className={`tool-toggle${tool.enabled ? " is-on" : ""}${busy === tool.id ? " is-busy" : ""}`} onClick={() => void reviewTool(tool, !tool.enabled)}><span className="tool-toggle-thumb" /></button></div>)}</div></section>{selectedServer.last_error_message ? <section className="inspector-section capability-error-panel"><h3>最近问题</h3><p>{selectedServer.last_error_message}</p></section> : null}</> : null}</ResponsiveInspector> : null}</div>
+    <SkillImportModal open={importOpen} onClose={() => setImportOpen(false)} onImported={() => void load()} />
+    <McpServerCreateModal open={mcpOpen} onClose={() => setMcpOpen(false)} onCreated={() => void load()} />
+  </div>;
 }

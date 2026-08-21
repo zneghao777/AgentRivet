@@ -66,4 +66,14 @@ export interface ChatMessage {
   content: string;
   createdAt?: string;
   run?: ChatRun;
+  attachments?: ChatAttachment[];
+}
+
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  mime_type: string;
+  size: number;
+  kind: "image" | "document";
+  previewUrl?: string;
 }

@@ -1,86 +1,59 @@
-// 测试检索面板（KB_MANAGEMENT_SPEC §4.3-C + AGENTIC_RAG_UPGRADE_SPEC §4.1）：
-// prompt-bar + context-cards 命中卡片 + 策略选择 + Rerank 开关 + 命中策略徽标
 import { useState } from "react";
-import { Button, Select, Switch, Tooltip, message } from "antd";
-import { postData } from "@/api/http";
-import type { RetrieveHit } from "@/types/api";
-import { buildTraceUrl } from "@/utils/trace";
+import { Button, Segmented, Select, Switch, Tag, Tooltip, message } from "antd";
 import { useNavigate } from "react-router-dom";
+import { postData } from "@/api/http";
+import type { IndexMode, UnifiedRetrieveResult } from "@/types/api";
+import { buildTraceUrl } from "@/utils/trace";
 
-const STRATEGY_OPTIONS = [
-  { value: "auto", label: "自动" },
-  { value: "vector", label: "向量" },
-  { value: "keyword", label: "关键词" },
-  { value: "hybrid", label: "混合" },
-];
-
-const STRATEGY_LABELS: Record<string, string> = {
-  vector: "向量",
-  keyword: "关键词",
-  hybrid: "混合",
-  rerank: "精排",
+const MODE_LABELS: Record<string, string> = {
+  auto: "自动",
+  text: "文本",
+  graph: "图谱",
+  fused: "融合",
 };
 
-const STRATEGY_TOOLTIPS: Record<string, string> = {
-  vector: "pgvector 余弦相似度检索（语义匹配）",
-  keyword: "pg_trgm 关键词检索（专有名词 / 型号 / 数值）",
-  hybrid: "向量 + 关键词双路召回，RRF 融合排序",
-  rerank: "cross-encoder 精排（bge-reranker-v2-m3）",
+const DEGRADATION_LABELS: Record<string, string> = {
+  graph_not_ready: "图谱尚未就绪，本次使用文本检索",
+  graph_channel_failed: "图谱通道失败，已返回文本结果",
+  no_knowledge_base: "没有可检索的知识库",
 };
 
-function highlight(text: string, keyword: string): React.ReactNode {
-  if (!keyword.trim()) return text;
-  const escaped = keyword.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const parts = text.split(new RegExp(`(${escaped})`, "gi"));
-  return parts.map((part, index) =>
-    part.toLowerCase() === keyword.trim().toLowerCase() ? (
-      <mark key={index} className="hit-keyword">{part}</mark>
-    ) : (
-      <span key={index}>{part}</span>
-    )
-  );
-}
-
-function StrategyBadge({ strategy }: { strategy: string }) {
-  const label = STRATEGY_LABELS[strategy] ?? strategy;
-  const tooltip =
-    STRATEGY_TOOLTIPS[strategy] ?? "未知检索策略";
-  return (
-    <Tooltip title={tooltip}>
-      <span className={`hit-strategy-badge hit-strategy-badge--${strategy}`}>
-        {strategy === "rerank" ? "sort" : strategy === "keyword" ? "match_word" : "layers"}
-        {label}
-      </span>
-    </Tooltip>
-  );
-}
-
-export default function TestRetrievePanel({ kbId }: { kbId: string }) {
+export default function TestRetrievePanel({
+  kbId,
+  indexMode,
+}: {
+  kbId: string;
+  indexMode: IndexMode;
+}) {
   const navigate = useNavigate();
   const [query, setQuery] = useState("");
   const [topK, setTopK] = useState(5);
-  const [strategy, setStrategy] = useState("auto");
+  const [mode, setMode] = useState<"auto" | "text" | "graph" | "fused">("auto");
   const [rerank, setRerank] = useState(true);
-  const [hits, setHits] = useState<RetrieveHit[]>([]);
+  const [hop, setHop] = useState(2);
+  const [view, setView] = useState("综合结果");
+  const [result, setResult] = useState<UnifiedRetrieveResult | null>(null);
   const [searching, setSearching] = useState(false);
-  const [searched, setSearched] = useState(false);
 
   const search = async () => {
     if (!query.trim()) return;
     setSearching(true);
     try {
-      const result = await postData<RetrieveHit[]>(
+      const data = await postData<UnifiedRetrieveResult>(
         `/knowledge-bases/${kbId}/test-search`,
-        { query: query.trim(), top_k: topK, strategy, rerank }
+        { query: query.trim(), top_k: topK, mode, rerank, graph_hop: hop }
       );
-      setHits(result);
-      setSearched(true);
-    } catch (e) {
-      message.error(e instanceof Error ? e.message : "检索失败");
+      setResult(data);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : "检索失败");
     } finally {
       setSearching(false);
     }
   };
+
+  const hits: UnifiedRetrieveResult["hits"] = view === "文本命中"
+    ? (result?.text_hits ?? []).map((hit) => ({ ...hit, channels: ["text"] }))
+    : result?.hits ?? [];
 
   return (
     <div className="kb-test-panel">
@@ -90,89 +63,138 @@ export default function TestRetrievePanel({ kbId }: { kbId: string }) {
           <b>测试检索</b>
         </div>
         <div className="kb-test-controls">
-          <span className="kb-test-control-label">策略</span>
+          <span className="kb-test-control-label">模式</span>
           <Select
-            size="large"
-            value={strategy}
-            onChange={setStrategy}
+            value={mode}
+            onChange={setMode}
             disabled={searching}
-            style={{ width: 104 }}
-            options={STRATEGY_OPTIONS}
+            options={[
+              { value: "auto", label: "自动" },
+              { value: "text", label: "文本" },
+              { value: "graph", label: "图谱", disabled: indexMode === "standard" },
+              { value: "fused", label: "融合", disabled: indexMode === "standard" },
+            ]}
           />
           <span className="kb-test-control-label">
             Rerank
-            <Tooltip title="cross-encoder 精排：服务不可用时自动跳过">
+            <Tooltip title="服务不可用时自动跳过">
               <span className="material-symbols-rounded kb-test-control-help">help</span>
             </Tooltip>
           </span>
           <Switch checked={rerank} onChange={setRerank} disabled={searching} />
         </div>
       </div>
-      <div className="kb-test-bar">
+      <form
+        className="kb-test-bar"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void search();
+        }}
+      >
+        <label className="sr-only" htmlFor="kb-test-query">检索问题</label>
         <input
+          id="kb-test-query"
           className="kb-test-input"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") void search();
-          }}
-          placeholder="输入检索问题，验证分块召回效果…（Enter 检索）"
+          placeholder="输入问题，比较文本与图谱通道…"
         />
         <Select
-          size="large"
+          aria-label="返回数量"
           value={topK}
           onChange={setTopK}
-          style={{ width: 92 }}
-          options={[2, 3, 5, 8, 10].map((n) => ({ value: n, label: `Top ${n}` }))}
+          options={[2, 3, 5, 8, 10].map((value) => ({ value, label: `Top ${value}` }))}
         />
+        {mode === "graph" || mode === "fused" ? (
+          <Select
+            aria-label="图谱跳数"
+            value={hop}
+            onChange={setHop}
+            options={[1, 2, 3].map((value) => ({ value, label: `${value} 跳` }))}
+          />
+        ) : null}
         <Button
+          htmlType="submit"
           type="primary"
-          size="large"
           loading={searching}
-          onClick={() => void search()}
           disabled={!query.trim()}
-          icon={<span className="material-symbols-rounded" style={{ fontSize: 16 }}>search</span>}
+          icon={<span className="material-symbols-rounded">search</span>}
         >
           检索
         </Button>
-      </div>
+      </form>
 
-      {searched && hits.length === 0 ? (
+      {result ? (
+        <>
+          <div className="kb-retrieve-summary" aria-live="polite">
+            <span>实际模式 <b>{MODE_LABELS[result.resolved_mode]}</b></span>
+            <span>文本召回 <b>{result.text_hits.length}</b></span>
+            <span>图谱召回 <b>{result.graph_context.relations.length} 条关系 / {result.evidence_chunks.length} 个证据</b></span>
+            <span>总耗时 <b>{result.timings.total_ms}ms</b></span>
+            {result.degradations.length ? (
+              <span className="warning">
+                {result.degradations.map((item) => DEGRADATION_LABELS[item] ?? item).join("；")}
+              </span>
+            ) : <span>降级 <b>无</b></span>}
+          </div>
+          <Segmented
+            value={view}
+            onChange={(value) => setView(String(value))}
+            options={["综合结果", "文本命中", "图谱上下文"]}
+          />
+          {view === "图谱上下文" ? (
+            <div className="kb-graph-context">
+              <h4>关系路径</h4>
+              {result.graph_context.relations.length ? result.graph_context.relations.map((relation, index) => (
+                <div key={`${relation.source_entity_id}-${relation.target_entity_id}-${index}`}>
+                  <b>{relation.source_name}</b>
+                  <span>—[{relation.relation_type}]→</span>
+                  <b>{relation.target_name}</b>
+                  {relation.source_chunk_id != null ? (
+                    <button onClick={() => navigate(buildTraceUrl(kbId, relation.source_chunk_id!))}>
+                      定位证据
+                    </button>
+                  ) : <Tag>暂无原文证据</Tag>}
+                </div>
+              )) : <p>当前查询没有返回图谱关系。</p>}
+            </div>
+          ) : (
+            <div className="kb-hit-list">
+              {hits.map((hit) => (
+                <article className="kb-hit-card" key={`${hit.chunk_id}-${hit.strategy}`}>
+                  <div className="kb-hit-head">
+                    <span className="kb-hit-source">
+                      <span className="material-symbols-rounded">description</span>
+                      {hit.source_file}
+                    </span>
+                    {hit.channels.map((channel) => (
+                      <Tag key={channel} color={channel === "graph" ? "blue" : undefined}>
+                        {channel === "graph" ? "图谱" : "文本"}
+                      </Tag>
+                    ))}
+                    <span className="kb-hit-score">{hit.score.toFixed(2)}</span>
+                    <button
+                      type="button"
+                      className="kb-hit-locate"
+                      onClick={() => navigate(buildTraceUrl(hit.kb_id, hit.chunk_id))}
+                    >
+                      <span className="material-symbols-rounded">open_in_new</span>
+                      定位证据
+                    </button>
+                  </div>
+                  <div className="kb-hit-text">{hit.text}</div>
+                </article>
+              ))}
+            </div>
+          )}
+        </>
+      ) : null}
+      {result && result.hits.length === 0 ? (
         <div className="kb-doc-empty">
           <span className="material-symbols-rounded">search_off</span>
-          <p>未检索到相关内容，可尝试调整查询词或上传更多文档。</p>
+          <p>未检索到相关内容，可调整问题、模式或索引状态。</p>
         </div>
       ) : null}
-
-      <div className="kb-hit-list">
-        {hits.map((hit) => (
-          <div className="kb-hit-card" key={hit.chunk_id}>
-            <div className="kb-hit-head">
-              <span className="kb-hit-source">
-                <span className="material-symbols-rounded">description</span>
-                {hit.source_file}
-              </span>
-              {hit.strategy ? <StrategyBadge strategy={hit.strategy} /> : null}
-              <span className="kb-hit-score">
-                {typeof hit.rerank_score === "number"
-                  ? `精排 ${hit.rerank_score.toFixed(2)}`
-                  : hit.score.toFixed(2)}
-              </span>
-              <span className="kb-hit-index">#{hit.chunk_index + 1}</span>
-              <button
-                type="button"
-                className="kb-hit-locate"
-                onClick={() => navigate(buildTraceUrl(hit.kb_id, hit.chunk_id))}
-                title="在分块管理页定位"
-              >
-                <span className="material-symbols-rounded">open_in_new</span>
-                在分块中定位
-              </button>
-            </div>
-            <div className="kb-hit-text">{highlight(hit.text, query)}</div>
-          </div>
-        ))}
-      </div>
     </div>
   );
 }

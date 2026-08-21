@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@cosmograph/react": "2.4.1",
     "antd": "^5.20.0",
     "apexcharts": "^6.10.0",
     "axios": "^1.7.0",

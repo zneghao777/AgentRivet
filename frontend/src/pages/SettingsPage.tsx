@@ -1,10 +1,19 @@
 import { useState } from "react";
-import { Alert, Button, Form, Input, Select, message } from "antd";
+import { Alert, App as AntdApp, AutoComplete, Button, Form, Input } from "antd";
 import { postData } from "@/api/http";
 import { StatusDot, WorkspaceHeader } from "@/components/common/Workspace";
+import { CHAT_MODELS } from "@/constants";
 import { useSettingsStore } from "@/stores/settingsStore";
 
 type SettingsSection = "model" | "auth" | "about";
+type ConnectionState = "idle" | "success" | "error";
+
+interface ConnectionTestResult {
+  connected: boolean;
+  model: string;
+  resolved_model: string;
+  latency_ms: number;
+}
 
 const SECTIONS: Array<{ key: SettingsSection; icon: string; label: string; description: string }> = [
   { key: "model", icon: "cloud", label: "模型连接", description: "模型与 API 基础地址" },
@@ -13,10 +22,13 @@ const SECTIONS: Array<{ key: SettingsSection; icon: string; label: string; descr
 ];
 
 export default function SettingsPage() {
+  const { message } = AntdApp.useApp();
   const { apiKey, setApiKey, model, setModel, baseUrl, setBaseUrl } = useSettingsStore();
   const [section, setSection] = useState<SettingsSection>("model");
   const [testing, setTesting] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
+  const [connectionDetail, setConnectionDetail] = useState("");
 
   const save = () => {
     setDirty(false);
@@ -30,10 +42,18 @@ export default function SettingsPage() {
     }
     setTesting(true);
     try {
-      await postData("/admin/test-connection", { api_key: apiKey, model });
-      message.success("连接测试成功");
+      const result = await postData<ConnectionTestResult>("/admin/test-connection", {
+        model,
+        base_url: baseUrl,
+      });
+      setConnectionState("success");
+      setConnectionDetail(`${result.resolved_model} · ${result.latency_ms}ms`);
+      message.success("模型连接测试成功");
     } catch (error) {
-      message.error(error instanceof Error ? error.message : "连接失败");
+      const detail = error instanceof Error ? error.message : "连接失败";
+      setConnectionState("error");
+      setConnectionDetail(detail);
+      message.error(detail);
     } finally {
       setTesting(false);
     }
@@ -42,6 +62,8 @@ export default function SettingsPage() {
   const markDirty = (update: () => void) => {
     update();
     setDirty(true);
+    setConnectionState("idle");
+    setConnectionDetail("");
   };
 
   return (
@@ -61,13 +83,27 @@ export default function SettingsPage() {
             <div className="settings-section-heading"><div><h2>模型连接</h2><p>选择要使用的语言模型并配置接入参数</p></div></div>
             <Alert type="info" showIcon message="请确保 API Key 与模型匹配；本地代理当前仅代理 DeepSeek 系列。" />
             <Form layout="vertical" className="settings-form">
-              <Form.Item label="模型" extra="选择提供响应的默认模型">
-                <Select value={model} onChange={(value) => markDirty(() => setModel(value))} options={[{ value: "deepseek-chat", label: "deepseek-chat" }, { value: "deepseek-reasoner", label: "deepseek-reasoner" }]} />
+              <Form.Item label="模型" extra="选择建议模型，或直接输入服务商提供的模型 ID">
+                <AutoComplete
+                  value={model}
+                  onChange={(value) => markDirty(() => setModel(value.trim()))}
+                  options={CHAT_MODELS.map((item) => ({ value: item.value, label: item.label }))}
+                  placeholder="输入模型 ID"
+                  filterOption={false}
+                />
               </Form.Item>
               <Form.Item label="Base URL" extra="兼容 OpenAI API 的服务地址">
                 <Input value={baseUrl} onChange={(event) => markDirty(() => setBaseUrl(event.target.value))} />
               </Form.Item>
-              <div className="connection-status-row"><span>连接状态</span><StatusDot label={apiKey ? "等待测试" : "尚未配置"} tone={apiKey ? "warning" : "neutral"} /><Button onClick={() => void testConnection()} loading={testing}>测试连接</Button></div>
+              <div className="connection-status-row">
+                <span>连接状态</span>
+                <StatusDot
+                  label={connectionState === "success" ? `已连接 · ${connectionDetail}` : connectionState === "error" ? "连接失败" : apiKey ? "等待测试" : "尚未配置"}
+                  tone={connectionState === "success" ? "success" : connectionState === "error" ? "danger" : apiKey ? "warning" : "neutral"}
+                />
+                <Button onClick={() => void testConnection()} loading={testing} disabled={!model.trim() || !baseUrl.trim()}>测试连接</Button>
+              </div>
+              {connectionState === "error" ? <Alert type="error" showIcon message={connectionDetail} /> : null}
             </Form>
           </> : null}
           {section === "auth" ? <>

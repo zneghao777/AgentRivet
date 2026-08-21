@@ -1,9 +1,10 @@
 // sessionStore：会话列表、当前会话、消息、流式状态
 import { create } from "zustand";
-import type { SessionItem } from "@/types/api";
+import type { SessionItem, SessionListData } from "@/types/api";
 import type { ChatMessage, ChatRun, ChatRunStatus, ChatRunStepStatus } from "@/types/chat";
 import type { MessageEnd, RunEnd, RunStepEnd, RunStepStart, RunStepUpdate, TraceStart } from "@/types/sse";
 import { runStepReferencesToKnowledgeReferences } from "@/utils/chatRun";
+import { getData } from "@/api/http";
 
 export type { ChatMessage } from "@/types/chat";
 
@@ -45,6 +46,7 @@ interface SessionState {
   streaming: boolean;
   lastError: string | null;
   setSessions: (s: SessionItem[]) => void;
+  fetchSessions: () => Promise<void>;
   setSessionTitle: (id: string, title: string) => void;
   setCurrentSession: (id: string | null) => void;
   setMessages: (m: ChatMessage[]) => void;
@@ -71,6 +73,14 @@ export const useSessionStore = create<SessionState>((set) => ({
   streaming: false,
   lastError: null,
   setSessions: (sessions) => set({ sessions }),
+  fetchSessions: async () => {
+    try {
+      const data = await getData<SessionListData>("/sessions?page=1&page_size=20");
+      set({ sessions: data.items });
+    } catch {
+      // 刷新失败时静默保留现有列表，不打断当前对话
+    }
+  },
   setSessionTitle: (id, title) =>
     set((state) => ({
       sessions: state.sessions.map((session) =>

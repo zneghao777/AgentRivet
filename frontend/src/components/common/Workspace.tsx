@@ -38,12 +38,13 @@ export function MetricStrip({
     value: ReactNode;
     meta?: ReactNode;
     tone?: "default" | "success" | "warning" | "danger" | "teal";
+    onClick?: () => void;
   }>;
 }) {
   return (
     <section className="metric-strip" aria-label="关键指标">
       {items.map((item) => (
-        <GlassSurface as="article" tone="panel" className={`metric-cell tone-${item.tone ?? "default"}`} key={item.label}>
+        <GlassSurface as={item.onClick ? "button" : "article"} type={item.onClick ? "button" : undefined} onClick={item.onClick} tone="panel" className={`metric-cell tone-${item.tone ?? "default"}${item.onClick ? " is-action" : ""}`} key={item.label}>
           <span className="metric-label"><i aria-hidden="true" />{item.label}</span>
           <strong>{item.value}</strong>
           {item.meta ? <span className="metric-meta">{item.meta}</span> : null}

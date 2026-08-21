@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
 import { Popconfirm, message } from "antd";
 import { useLocation, useNavigate } from "react-router-dom";
-import { deleteData, getData, postData } from "@/api/http";
-import type { SessionItem, SessionListData } from "@/types/api";
+import { deleteData, postData } from "@/api/http";
+import type { SessionItem } from "@/types/api";
 import { useSessionStore } from "@/stores/sessionStore";
 import { formatTime, summarize } from "@/utils/format";
 
 const FEATURES = [
   { label: "观测台", icon: "monitoring", path: "/observability" },
-  { label: "技能库", icon: "bolt", path: "/skills" },
+  { label: "插件", icon: "extension", path: "/skills" },
   { label: "知识库", icon: "database", path: "/knowledge" },
   { label: "记忆", icon: "memory", path: "/memory" },
   { label: "设置", icon: "settings", path: "/settings" },
@@ -17,15 +17,13 @@ const FEATURES = [
 export default function Sidebar() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { currentSessionId, setSessions, setCurrentSession, sessions, streaming } = useSessionStore();
+  const { currentSessionId, setSessions, setCurrentSession, sessions, streaming, fetchSessions } = useSessionStore();
   const [creating, setCreating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
-    getData<SessionListData>("/sessions?page=1&page_size=10")
-      .then((data) => setSessions(data.items))
-      .catch(() => undefined);
-  }, [setSessions]);
+    void fetchSessions();
+  }, [fetchSessions]);
 
   const createNew = async () => {
     if (streaming) return;
