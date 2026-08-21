@@ -81,6 +81,18 @@ pytest -v
 
 本地开发需确保 Postgres 启用 pgvector 扩展（`CREATE EXTENSION IF NOT EXISTS vector`），Docker 使用 `pgvector/pgvector:pg16` 镜像自动启用。
 
+## Graph RAG 知识图谱能力
+
+在向量 RAG 之外，新增一条**并行的图谱检索路径**（`docs/GRAPH_RAG_SPEC.md`），与向量检索形成双通道融合，专门强化**全局性问题、多跳推理、实体关系、事件时间线**类问题：
+
+- **自动建图**：文档解析完成后异步触发，LLM（默认低成本 `glm-4-flash`）抽取实体 / 关系 / 事件，写入 `graph_entities` / `graph_relations` / `graph_communities` / `graph_events` 四张表（Postgres 关系表承载，递归 CTE 做多跳遍历）。
+- **实体归一化**：别名表 + 向量相似度合并，`canonical_name` 归并（如"韩跑跑"→"韩立"）。
+- **社区摘要**：连通分量 + 粗粒度金字塔社区，LLM 生成摘要支持全局问答。
+- **Agent 集成**：`knowledge_graph_search` 工具注册进工具中心，`strategy` 支持 auto / entity / hop / global / timeline。
+- **管理 API**：`POST /api/v1/kbs/{kb_id}/graph/build|rebuild`、`GET .../graph/status|entities`、`POST .../graph/search`、`GET .../graph/timeline/{entity}` 等。
+- **前端入口**：知识库详情页新增"知识图谱"Tab（构建 / 状态 / 语义检索 / 实体清单）。
+- **配置**：`GRAPH_ENABLED` 总开关；抽取模型 / 批量大小 / 并发等见 `.env.example`（§7）。
+
 ## 里程碑状态
 
 | 里程碑 | 内容 | 状态 |
