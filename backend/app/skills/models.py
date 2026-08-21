@@ -18,5 +18,8 @@ class SkillModel:
     author: str = ""
     tags: list[str] = field(default_factory=list)
     enabled: bool = True
+    source: str = "external"
+    file_count: int = 1
+    has_scripts: bool = False
     loaded_at: datetime | None = None
     updated_at: datetime | None = None

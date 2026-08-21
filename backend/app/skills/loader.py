@@ -6,98 +6,96 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
+
+import yaml
 
 from .models import SkillModel
 
 logger = logging.getLogger(__name__)
 
 
-def _parse_frontmatter(raw: str) -> tuple[dict, str]:
-    """解析 YAML frontmatter（简易实现，不引入 pyyaml 依赖负担）。"""
-    import json
+SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
+
+class SkillValidationError(ValueError):
+    """Skill manifest 不符合约定。"""
+
+
+def _parse_frontmatter(raw: str) -> tuple[dict, str]:
+    """使用完整 YAML 解析 frontmatter，兼容多行描述和嵌套 metadata。"""
     meta: dict = {}
     body = raw
     if raw.startswith("---"):
         parts = raw.split("---", 2)
         if len(parts) >= 3:
-            fm = parts[1]
             body = parts[2].strip()
-            for line in fm.splitlines():
-                if not line.strip() or ":" not in line:
-                    continue
-                key, _, value = line.partition(":")
-                key = key.strip()
-                value = value.strip()
-                meta[key] = _parse_scalar(value)
+            try:
+                loaded = yaml.safe_load(parts[1]) or {}
+            except yaml.YAMLError as exc:
+                raise SkillValidationError(f"frontmatter YAML 无法解析：{exc}") from exc
+            if not isinstance(loaded, dict):
+                raise SkillValidationError("frontmatter 必须是 YAML 对象")
+            meta = loaded
     return meta, body
 
 
-def _parse_scalar(value: str):
-    """解析 frontmatter 标量值：支持列表 / 布尔 / 数字 / 字符串。"""
-    import json
-
-    if value.startswith("[") and value.endswith("]"):
-        # YAML 列表（元素可能无引号），转成 JSON 再解析
-        inner = value[1:-1].strip()
-        if not inner:
-            return []
-        items = [item.strip().strip("'\"") for item in inner.split(",") if item.strip()]
-        return items
-    if value.startswith("{") and value.endswith("}"):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return {}
-    if value == "true":
-        return True
-    if value == "false":
-        return False
-    try:
-        return int(value)
-    except ValueError:
-        pass
-    return value
-
-
-def load_skill_from_dir(path: Path) -> SkillModel | None:
-    """加载单个 Skill 目录。返回 None 表示无效 frontmatter。"""
+def load_skill_from_dir(path: Path, *, strict: bool = False) -> SkillModel | None:
+    """加载单个 Skill 目录；导入场景可用 strict 获取明确校验错误。"""
     skill_md = path / "SKILL.md"
     if not skill_md.exists():
+        error = SkillValidationError("目录中缺少 SKILL.md")
+        if strict:
+            raise error
         logger.warning("Skill 目录 %s 缺少 SKILL.md，跳过", path)
         return None
 
-    raw = skill_md.read_text(encoding="utf-8")
-    meta, body = _parse_frontmatter(raw)
-
-    name = meta.get("name", path.name)
-    description = meta.get("description", "")
-    if not description:
-        logger.warning("Skill %s 缺少 description，跳过", name)
+    try:
+        raw = skill_md.read_text(encoding="utf-8")
+        meta, body = _parse_frontmatter(raw)
+        name = str(meta.get("name") or path.name).strip()
+        description = str(meta.get("description") or "").strip()
+        if not SKILL_NAME_RE.fullmatch(name):
+            raise SkillValidationError(
+                "name 仅支持字母、数字、点、下划线和连字符，且长度不超过 128"
+            )
+        if not description:
+            raise SkillValidationError("frontmatter 缺少 description")
+        tags_raw = meta.get("tags", [])
+        if isinstance(tags_raw, str):
+            tags = [item.strip() for item in tags_raw.split(",") if item.strip()]
+        elif isinstance(tags_raw, list):
+            tags = [str(item).strip() for item in tags_raw if str(item).strip()]
+        else:
+            raise SkillValidationError("tags 必须是字符串数组")
+    except (UnicodeDecodeError, SkillValidationError) as exc:
+        if strict:
+            raise SkillValidationError(str(exc)) from exc
+        logger.warning("Skill 目录 %s 校验失败：%s", path, exc)
         return None
+
+    files = [item for item in path.rglob("*") if item.is_file()]
 
     return SkillModel(
         name=name,
         path=str(path),
         description=description,
         body_md=body,
-        version=meta.get("version", "0.0.0"),
-        author=meta.get("author", ""),
-        tags=meta.get("tags", []),
+        version=str(meta.get("version", "0.0.0")),
+        author=str(meta.get("author", "")),
+        tags=tags,
         enabled=str(meta.get("enabled", "true")).lower() == "true",
+        file_count=len(files),
+        has_scripts=any(item.parent.name == "scripts" and item.suffix == ".py" for item in files),
     )
 
 
 def discover_skill_dirs(*roots: Path) -> list[Path]:
-    """发现全部含 SKILL.md 的 Skill 目录（一层递归扫描）。"""
+    """递归发现全部含 SKILL.md 的 Skill 目录。"""
     found: list[Path] = []
     for root in roots:
         if not root.exists():
             continue
-        if (root / "SKILL.md").exists():
-            found.append(root)
-        for child in root.iterdir():
-            if child.is_dir() and (child / "SKILL.md").exists():
-                found.append(child)
-    return found
+        found.extend(skill_md.parent for skill_md in root.rglob("SKILL.md"))
+    return sorted(set(found))

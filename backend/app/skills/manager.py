@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -40,10 +41,16 @@ class SkillManager:
         """全量扫描（内置 + 外部），解析 frontmatter，更新内存与 DB。"""
         roots = [BUILTIN_SKILLS_DIR, EXTERNAL_SKILLS_DIR]
         dirs = discover_skill_dirs(*roots)
+        for skill in self._skills.values():
+            self._unregister_script_tools(skill)
         found: dict[str, SkillModel] = {}
         for d in dirs:
             skill = load_skill_from_dir(d)
             if skill is None:
+                continue
+            skill.source = "builtin" if d.is_relative_to(BUILTIN_SKILLS_DIR) else "external"
+            if skill.name in found and found[skill.name].source == "builtin":
+                logger.warning("外部 Skill %s 与内置 Skill 同名，已跳过", skill.name)
                 continue
             found[skill.name] = skill
 
@@ -51,6 +58,8 @@ class SkillManager:
         # 同步 DB
         for skill in found.values():
             await self._upsert_db(db, skill)
+            if skill.enabled:
+                self._register_script_tools(skill)
         return self.all()
 
     async def _upsert_db(self, db: AsyncSession, skill: SkillModel) -> None:
@@ -92,19 +101,24 @@ class SkillManager:
 
     async def reload(self, db: AsyncSession) -> list[SkillModel]:
         """重新扫描并加载（开发热更新）。"""
-        current = self._skills
-        await self.discover(db)
-        for name in list(current.keys()):
-            if name in self._skills:
-                self._skills[name].enabled = current[name].enabled
-        return self.all()
+        return await self.discover(db)
 
-    async def remove(self, db: AsyncSession, name: str) -> None:
-        """卸载：删除 DB 记录与注册信息（不删磁盘文件）。"""
-        skill = self._skills.pop(name, None)
-        if skill:
-            self._unregister_script_tools(skill)
+    async def remove(self, db: AsyncSession, name: str, *, delete_files: bool = False) -> bool:
+        """卸载外部 Skill，可选择同时移除托管目录。"""
+        skill = self._skills.get(name)
+        if skill is None or skill.source == "builtin":
+            return False
+        self._skills.pop(name, None)
+        self._unregister_script_tools(skill)
+        if delete_files:
+            path = Path(skill.path).resolve()
+            root = EXTERNAL_SKILLS_DIR.resolve()
+            if path.parent != root:
+                raise ValueError("仅允许删除外部 Skill 根目录下的托管内容")
+            if path.exists():
+                shutil.rmtree(path)
         await repo.remove_skill(db, name)
+        return True
 
     # --- 脚本工具注册 ---
 
