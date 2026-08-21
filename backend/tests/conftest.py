@@ -16,6 +16,8 @@ os.environ.setdefault("LANGSMITH_TRACING", "false")
 os.environ.setdefault("OBSERVABILITY_ENABLED", "false")
 # 测试禁用真实 GLM 解析（否则走真实网络/计费），统一回退本地解析
 os.environ.setdefault("GLM_FILES_API_KEY", "")
+# 测试禁用真实 Rerank 服务探测（AGENTIC_RAG_UPGRADE_SPEC §3.4 降级路径单测另行 mock）
+os.environ.setdefault("RERANK_ENABLED", "false")
 
 
 @pytest_asyncio.fixture(scope="session", autouse=True)

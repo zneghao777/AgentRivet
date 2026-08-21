@@ -9,6 +9,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..knowledge.embedder import EmbeddingError
@@ -16,6 +17,7 @@ from ..knowledge.ingest import IngestError
 from ..knowledge.service import knowledge_service
 from ..observability import audit
 from ..storage.db import get_db
+from ..storage.models import EvaluationRun
 from .deps import AuthContext, require_auth
 from .schemas import (
     ApiResponse,
@@ -24,6 +26,7 @@ from .schemas import (
     ChunkPreviewItem,
     ChunkPreviewRequest,
     ChunkUpdateRequest,
+    EvaluateRequest,
     KnowledgeBaseCreateRequest,
     KnowledgeBaseResponse,
     KnowledgeBaseStatusRequest,
@@ -483,15 +486,22 @@ async def test_search_knowledge_base(
     auth: AuthContext = Depends(require_auth),
     db: AsyncSession = Depends(get_db),
 ):
-    """测试检索（跨库检索调试）：返回命中 + 来源 + 溯源主键。"""
-    await _require_kb(auth, db, kb_id)
+    """测试检索（跨库检索调试）：返回命中 + 来源 + 溯源主键 + 策略标注。
+
+    AGENTIC_RAG_UPGRADE_SPEC §3.8：body 增加 strategy / rerank / expand_query
+    （默认值 auto/True/False 兼容旧前端）。
+    """
+    kb = await _require_kb(auth, db, kb_id)
     try:
-        hits = await knowledge_service.search(
+        hits = await knowledge_service.retrieve_v2(
             db,
             tenant_id=auth.tenant.tenant_id,
-            kb_id=kb_id,
             query=body.query,
+            kb_ids=[kb_id],
             top_k=body.top_k,
+            strategy=body.strategy,
+            rerank=body.rerank,
+            expand_query=body.expand_query,
         )
     except EmbeddingError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -499,9 +509,92 @@ async def test_search_knowledge_base(
         auth.tenant.tenant_id,
         "knowledge.test_search",
         user_id=auth.user_id,
-        detail={"kb": str(kb_id), "hits": len(hits)},
+        detail={
+            "kb": kb.name,
+            "hits": len(hits),
+            "strategy": body.strategy,
+            "rerank": body.rerank,
+        },
     )
     return ApiResponse(data=[_hit_resp(h) for h in hits])
+
+
+# ---------- 检索评测（AGENTIC_RAG_UPGRADE_SPEC §3.8） ----------
+
+
+def _eval_run_resp(run: EvaluationRun) -> dict:
+    return {
+        "evaluation_id": run.id,
+        "name": run.name,
+        "status": run.status,
+        "variants": run.variants,
+        "results": run.results,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+    }
+
+
+@router.post("/{kb_id}/evaluate", response_model=ApiResponse)
+async def evaluate_knowledge_base(
+    kb_id: uuid.UUID,
+    body: EvaluateRequest,
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """触发检索评测：对 dataset 逐用例跑 variants 检索，计算 hit_rate / mrr。
+
+    judge=True 时追加 LLM-as-judge 端到端评分（faithfulness / relevancy），写 TraceScore。
+    """
+    kb = await _require_kb(auth, db, kb_id)
+    try:
+        run = await knowledge_service.evaluate(
+            db,
+            tenant_id=auth.tenant.tenant_id,
+            kb_id=kb_id,
+            name=body.name,
+            dataset=body.dataset,
+            variants=body.variants,
+            judge=body.judge,
+        )
+    except EmbeddingError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if run is None:
+        raise HTTPException(status_code=404, detail="knowledge base not found")
+    await audit.audit(
+        auth.tenant.tenant_id,
+        "knowledge.evaluate",
+        user_id=auth.user_id,
+        detail={
+            "kb": kb.name,
+            "run_id": run.id,
+            "cases": len(body.dataset),
+            "variants": body.variants,
+            "judge": body.judge,
+        },
+    )
+    return ApiResponse(data=_eval_run_resp(run))
+
+
+@router.get("/{kb_id}/evaluations", response_model=ApiResponse)
+async def list_evaluations(
+    kb_id: uuid.UUID,
+    limit: int = 20,
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """列出该知识库的评测记录（复用 EvaluationRun，按 dataset.kb_id 过滤）。"""
+    await _require_kb(auth, db, kb_id)
+    result = await db.execute(
+        select(EvaluationRun)
+        .where(EvaluationRun.tenant_id == auth.tenant.tenant_id)
+        .order_by(EvaluationRun.created_at.desc())
+        .limit(max(1, min(limit, 50)))
+    )
+    runs = [
+        row
+        for row in result.scalars().all()
+        if (row.dataset or {}).get("kb_id") == str(kb_id)
+    ]
+    return ApiResponse(data=[_eval_run_resp(run) for run in runs])
 
 
 def _hit_resp(hit) -> KnowledgeHit:
@@ -512,4 +605,6 @@ def _hit_resp(hit) -> KnowledgeHit:
         score=hit.score,
         kb_id=str(hit.kb_id),
         chunk_id=hit.chunk_id,
+        strategy=hit.strategy,
+        rerank_score=hit.rerank_score,
     )

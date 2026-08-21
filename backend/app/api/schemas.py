@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import uuid
-from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
-
 
 # ---------- 通用响应包装 ----------
 
@@ -75,6 +72,10 @@ class HistoryMessage(BaseModel):
     role: str
     content: str
     tool_name: str | None = None
+    token_usage: dict[str, int] | None = None
+    trace_id: str | None = None
+    request_id: str | None = None
+    step_index: int | None = None
     created_at: str | None = None
 
 
@@ -94,6 +95,9 @@ class SkillResponse(BaseModel):
     tags: list[str]
     enabled: bool
     path: str
+    source: str = "external"
+    file_count: int = 1
+    has_scripts: bool = False
 
 
 # ---------- Tool ----------
@@ -168,6 +172,9 @@ class KnowledgeHit(BaseModel):
     score: float
     kb_id: str | None = None
     chunk_id: int | None = None
+    # 混合检索 / Rerank 扩展（AGENTIC_RAG_UPGRADE_SPEC §3.8）
+    strategy: str = "vector"  # vector | keyword | hybrid | rerank
+    rerank_score: float | None = None
 
 
 class KnowledgeUploadResponse(BaseModel):
@@ -225,6 +232,21 @@ class ChunkEnabledRequest(BaseModel):
 class TestSearchRequest(BaseModel):
     query: str = Field(min_length=1)
     top_k: int = Field(default=5, ge=1, le=10)
+    # 混合检索 / Rerank / Query 改写（AGENTIC_RAG_UPGRADE_SPEC §3.8；默认值兼容旧前端）
+    strategy: str = Field(default="auto")  # auto | vector | keyword | hybrid
+    rerank: bool = True
+    expand_query: bool = False
+
+
+# ---------- 检索评测（AGENTIC_RAG_UPGRADE_SPEC §3.8） ----------
+
+
+class EvaluateRequest(BaseModel):
+    name: str = Field(min_length=1)
+    # dataset: [{query, expected_chunk_ids?, expected_doc_ids?, reference_answer?}]
+    dataset: list[dict] = Field(min_length=1)
+    variants: list[str] | None = None  # 缺省 ["baseline", "hybrid", "hybrid+rerank"]
+    judge: bool = False  # 是否追加 LLM-as-judge 端到端评分
 
 
 # ---------- 长期记忆（MEMORY_SPEC §7.3） ----------
@@ -259,6 +281,19 @@ class MemoryTimelineGroup(BaseModel):
 
 class MemoryTimelineResponse(BaseModel):
     groups: list[MemoryTimelineGroup]
+
+
+class MemoryGraphEdge(BaseModel):
+    source: int
+    target: int
+    relation: Literal["semantic", "same_source"]
+    strength: float
+
+
+class MemoryGraphResponse(BaseModel):
+    nodes: list[MemoryItem]
+    edges: list[MemoryGraphEdge]
+    similarity_threshold: float
 
 
 class MemoryOverview(BaseModel):
@@ -342,7 +377,7 @@ class SpanNode(BaseModel):
     started_at: str | None = None
     ended_at: str | None = None
     error: str | None = None
-    children: list["SpanNode"] = Field(default_factory=list)
+    children: list[SpanNode] = Field(default_factory=list)
 
 
 class TraceDetail(BaseModel):

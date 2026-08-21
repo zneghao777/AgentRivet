@@ -79,6 +79,13 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     tool_name: Mapped[str | None] = mapped_column(String(128))
     token_usage: Mapped[dict | None] = mapped_column(JSON)
+    # 可观测性关联：允许 Trace 详情按一次请求精确回放输入与最终输出。
+    # 历史消息保持 nullable，由事件接口使用 session_id + 时间窗兼容。
+    trace_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    span_id: Mapped[str | None] = mapped_column(String(64))
+    request_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    turn_index: Mapped[int | None] = mapped_column(Integer)
+    step_index: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )

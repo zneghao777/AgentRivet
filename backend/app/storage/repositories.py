@@ -125,6 +125,11 @@ async def add_message(
     content: str,
     tool_name: str | None = None,
     token_usage: dict | None = None,
+    trace_id: str | None = None,
+    span_id: str | None = None,
+    request_id: str | None = None,
+    turn_index: int | None = None,
+    step_index: int | None = None,
 ) -> Message:
     msg = Message(
         session_id=session_id,
@@ -132,11 +137,31 @@ async def add_message(
         content=content,
         tool_name=tool_name,
         token_usage=token_usage,
+        trace_id=trace_id,
+        span_id=span_id,
+        request_id=request_id,
+        turn_index=turn_index,
+        step_index=step_index,
     )
     db.add(msg)
     await db.commit()
     await db.refresh(msg)
     return msg
+
+
+async def link_messages_to_trace(
+    db: AsyncSession,
+    *,
+    request_id: str,
+    trace_id: str,
+) -> None:
+    """把运行开始前写入的消息补链到最终 Trace。"""
+    await db.execute(
+        update(Message)
+        .where(Message.request_id == request_id, Message.trace_id.is_(None))
+        .values(trace_id=trace_id)
+    )
+    await db.commit()
 
 
 async def list_messages(
@@ -163,7 +188,6 @@ async def upsert_skill(db: AsyncSession, skill: Skill) -> Skill:
         existing.version = skill.version
         existing.author = skill.author
         existing.tags = skill.tags
-        existing.enabled = skill.enabled
         existing.updated_at = datetime.now()
         await db.commit()
         await db.refresh(existing)

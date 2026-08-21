@@ -17,7 +17,14 @@ from typing import Any
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..storage.models import DocumentMeta, KnowledgeBase, KnowledgeChunk
+from ..config import settings
+from ..storage.models import (
+    DocumentMeta,
+    EvaluationRun,
+    KnowledgeBase,
+    KnowledgeChunk,
+    TraceScore,
+)
 from .chunker import preview_chunks
 from .embedder import EmbeddingError, embed_texts
 from .files import remove_upload, save_upload
@@ -27,7 +34,7 @@ from .ingest import (
     parse_and_ingest,
     validate_file,
 )
-from .retriever import Hit, retrieve
+from .retriever import Hit, retrieve, retrieve_hybrid
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +401,37 @@ class KnowledgeService:
             top_k=top_k,
         )
 
+    async def _resolve_kb_ids(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        kb_ids: list[uuid.UUID] | None = None,
+        kb_name: str | None = None,
+    ) -> list[uuid.UUID] | None:
+        """解析有效知识库 id 列表；None 表示无可检索知识库。
+
+        - kb_name 给定：仅该知识库；不存在/不属于当前租户/非 active → None（防越权）。
+        - kb_ids 给定（会话白名单）：仅白名单内且 active 的。
+        - 均未给定：当前租户全部 active 知识库。
+        """
+        if kb_name:
+            kb = await self.get_by_name(db, tenant_id=tenant_id, name=kb_name)
+            if kb is None or kb.status != "active":
+                return None
+            return [kb.id]
+        stmt = select(KnowledgeBase.id).where(
+            KnowledgeBase.tenant_id == tenant_id,
+            KnowledgeBase.status == "active",
+        )
+        if kb_ids is not None:
+            if not kb_ids:
+                return None
+            stmt = stmt.where(KnowledgeBase.id.in_(kb_ids))
+        result = await db.execute(stmt)
+        ids = list(result.scalars().all())
+        return ids or None
+
     async def retrieve(
         self,
         db: AsyncSession,
@@ -404,36 +442,57 @@ class KnowledgeService:
         kb_name: str | None = None,
         top_k: int = 5,
     ) -> list[Hit]:
-        """供知识检索工具使用：kb_name 指定时必须校验其归属当前租户（防越权）。
+        """供知识检索工具使用（兼容旧入口）：kb_name 指定时必须校验其归属当前租户（防越权）。
 
         - kb_name 给定：仅检索该知识库；若不存在/不属于当前租户 → 返回空。
         - kb_ids 给定（会话白名单）：仅检索白名单内知识库。
         - 均未给定：检索当前租户全部知识库。
         """
-        if kb_name:
-            kb = await self.get_by_name(db, tenant_id=tenant_id, name=kb_name)
-            if kb is None or kb.status != "active":
-                return []
-            kb_ids = [kb.id]
-        else:
-            stmt = select(KnowledgeBase.id).where(
-                KnowledgeBase.tenant_id == tenant_id,
-                KnowledgeBase.status == "active",
-            )
-            if kb_ids is not None:
-                if not kb_ids:
-                    return []
-                stmt = stmt.where(KnowledgeBase.id.in_(kb_ids))
-            result = await db.execute(stmt)
-            kb_ids = list(result.scalars().all())
-            if not kb_ids:
-                return []
+        resolved = await self._resolve_kb_ids(
+            db, tenant_id=tenant_id, kb_ids=kb_ids, kb_name=kb_name
+        )
+        if not resolved:
+            return []
         return await retrieve(
             db,
             tenant_id=tenant_id,
             query=query,
-            kb_ids=kb_ids,
+            kb_ids=resolved,
             top_k=top_k,
+        )
+
+    async def retrieve_v2(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        query: str,
+        kb_ids: list[uuid.UUID] | None = None,
+        kb_name: str | None = None,
+        top_k: int = 5,
+        strategy: str = "auto",
+        rerank: bool = True,
+        expand_query: bool = False,
+    ) -> list[Hit]:
+        """检索 v2（AGENTIC_RAG_UPGRADE_SPEC §3.7）：供 knowledge_search 工具使用。
+
+        校验租户/知识库 → 改写(可选) → 混合检索 → Rerank(可选，不可用自动降级)。
+        kb_name 指定时校验归属当前租户（防越权，沿用现逻辑）。
+        """
+        resolved = await self._resolve_kb_ids(
+            db, tenant_id=tenant_id, kb_ids=kb_ids, kb_name=kb_name
+        )
+        if not resolved:
+            return []
+        return await retrieve_hybrid(
+            db,
+            tenant_id=tenant_id,
+            query=query,
+            kb_ids=resolved,
+            top_k=top_k,
+            strategy=strategy,
+            rerank=rerank,
+            expand_query=expand_query,
         )
 
     # ---------- 分块治理（KB_MANAGEMENT_SPEC §3.5） ----------
@@ -605,6 +664,164 @@ class KnowledgeService:
         await db.commit()
         await db.refresh(chunk)
         return chunk
+
+    # ---------- 检索评测（AGENTIC_RAG_UPGRADE_SPEC §3.7 / §3.9） ----------
+
+    async def evaluate(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        kb_id: uuid.UUID,
+        name: str,
+        dataset: list[dict],
+        variants: list[str] | None = None,
+        judge: bool = False,
+    ) -> EvaluationRun | None:
+        """检索评测 runner：
+
+        1. 对每个用例跑 variants（如 baseline / hybrid / hybrid+rerank）检索，
+           用 expected_chunk_ids/expected_doc_ids 计算 hit_rate@k / mrr@k。
+        2. judge=True 时追加 LLM-as-judge 端到端评分（faithfulness/relevancy），写 TraceScore。
+        3. 落 EvaluationRun（dataset / variants / results）。
+        - kb 不存在或不属于当前租户 → None（接口层转 404）。
+        """
+        from . import evaluator
+
+        kb = await self.get(db, tenant_id=tenant_id, kb_id=kb_id)
+        if kb is None:
+            return None
+
+        cases, skipped = evaluator.parse_dataset(dataset)
+        variant_names = variants or evaluator.DEFAULT_VARIANTS
+
+        # expected_doc_ids 宽松匹配：解析该 kb 下这些文档的全部分块 id
+        all_doc_ids: set[str] = set()
+        for case in cases:
+            all_doc_ids |= case.expected_doc_ids
+        doc_chunks: dict[str, set[str]] = {}
+        if all_doc_ids:
+            valid_doc_ints = [int(d) for d in all_doc_ids if str(d).isdigit()]
+            if valid_doc_ints:
+                rows = (
+                    await db.execute(
+                        select(KnowledgeChunk.doc_id, KnowledgeChunk.id).where(
+                            KnowledgeChunk.kb_id == kb_id,
+                            KnowledgeChunk.tenant_id == tenant_id,
+                            KnowledgeChunk.doc_id.in_(valid_doc_ints),
+                        )
+                    )
+                ).fetchall()
+                for doc_id, chunk_id in rows:
+                    doc_chunks.setdefault(str(doc_id), set()).add(str(chunk_id))
+
+        variant_results: list[dict] = []
+        last_hits_by_case: dict[int, list[Hit]] = {}
+        for variant in variant_names:
+            config = evaluator.VARIANT_CONFIGS.get(variant)
+            if config is None:
+                continue
+            result_ids: list[list[str]] = []
+            expected_sets: list[set[str]] = []
+            case_rows: list[dict] = []
+            for index, case in enumerate(cases):
+                expected = set(case.expected_chunk_ids)
+                for doc_id in case.expected_doc_ids:
+                    expected |= doc_chunks.get(doc_id, set())
+                hits = await retrieve_hybrid(
+                    db,
+                    tenant_id=tenant_id,
+                    query=case.query,
+                    kb_ids=[kb_id],
+                    top_k=settings.RAG_TOP_K,
+                    strategy=config["strategy"],
+                    rerank=config["rerank"],
+                )
+                top_ids = [str(h.chunk_id) for h in hits]
+                result_ids.append(top_ids)
+                expected_sets.append(expected)
+                first_rank = next(
+                    (rank for rank, cid in enumerate(top_ids, start=1) if cid in expected),
+                    0,
+                )
+                case_rows.append(
+                    {
+                        "query": case.query,
+                        "hit": bool(expected & set(top_ids)),
+                        "rank": first_rank,
+                        "top_chunk_ids": top_ids,
+                    }
+                )
+                last_hits_by_case[index] = hits
+            variant_results.append(
+                {
+                    "variant": variant,
+                    "hit_rate": round(evaluator.hit_rate(result_ids, expected_sets), 4),
+                    "mrr": round(evaluator.mrr(result_ids, expected_sets), 4),
+                    "cases": case_rows,
+                }
+            )
+
+        # LLM-as-judge（可选）：对每个用例基于最优上下文做端到端评分，写 TraceScore
+        judge_summary: dict | None = None
+        if judge and cases:
+            judge_cases: list[dict] = []
+            faith_scores: list[float] = []
+            relev_scores: list[float] = []
+            for index, case in enumerate(cases):
+                hits = last_hits_by_case.get(index, [])
+                contexts = [h.text for h in hits]
+                answer = case.reference_answer
+                if not answer:
+                    answer = await evaluator.generate_answer(case.query, contexts)
+                verdict = await evaluator.judge_answer(case.query, contexts, answer)
+                judge_cases.append(
+                    {
+                        "query": case.query,
+                        "faithfulness": verdict["faithfulness"],
+                        "relevancy": verdict["relevancy"],
+                    }
+                )
+                faith_scores.append(verdict["faithfulness"])
+                relev_scores.append(verdict["relevancy"])
+            judge_summary = {
+                "avg_faithfulness": round(sum(faith_scores) / len(faith_scores), 4),
+                "avg_relevancy": round(sum(relev_scores) / len(relev_scores), 4),
+                "cases": judge_cases,
+            }
+
+        run = EvaluationRun(
+            tenant_id=tenant_id,
+            name=name,
+            status="done",
+            dataset={"kb_id": str(kb_id), "items": dataset},
+            variants=variant_names,
+            results={
+                "variants": variant_results,
+                "judge": judge_summary,
+                "stats": {"total": len(dataset), "valid": len(cases), "skipped": skipped},
+            },
+        )
+        db.add(run)
+        await db.flush()
+
+        if judge_summary:
+            for index, jc in enumerate(judge_summary["cases"]):
+                trace_id = f"rag-eval-{run.id}-{index}"
+                for score_name in ("faithfulness", "relevancy"):
+                    db.add(
+                        TraceScore(
+                            tenant_id=tenant_id,
+                            trace_id=trace_id,
+                            score_name=score_name,
+                            value=float(jc[score_name]),
+                            source="rag_eval",
+                            reason=f"query={jc['query'][:80]}",
+                        )
+                    )
+        await db.commit()
+        await db.refresh(run)
+        return run
 
 
 knowledge_service = KnowledgeService()

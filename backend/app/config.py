@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     SESSION_MAX_TOKEN_BUDGET: int = 500_000
     MAX_INTERRUPT_PENDING: int = 10
 
+    # --- Skill 资源读取 ---
+    SKILL_FILE_READ_MAX_BYTES: int = 256 * 1024
+
     # --- 多 Agent ---
     MULTI_AGENT_ENABLED: bool = False
 
@@ -107,6 +110,24 @@ class Settings(BaseSettings):
     KB_UPLOAD_DIR: str = "data/uploads"  # 原文件落盘目录
     KB_PUBLIC_BASE_URL: str = ""  # 预留：文件对外下载地址前缀（GLM 为 multipart 直传，无需 URL）
 
+    # --- 混合检索 / Rerank / Query 改写（AGENTIC_RAG_UPGRADE_SPEC §1/§3.1）---
+    HYBRID_RETRIEVAL_ENABLED: bool = True      # 总开关：false 时退回纯向量（兼容旧行为）
+    KEYWORD_BACKEND: str = "pg_trgm"           # pg_trgm | tsvector（本期仅 pg_trgm，tsvector 预留）
+    KEYWORD_TOP_K: int = 20                    # 关键词路召回数
+    VECTOR_TOP_K: int = 20                     # 向量路召回数（混合时粗排候选数）
+    KEYWORD_SCORE_THRESHOLD: float = 0.08      # pg_trgm similarity 阈值
+    RRF_K: int = 60                            # RRF 融合常数（标准 60）
+
+    RERANK_ENABLED: bool = True                # Rerank 总开关（服务不可达自动跳过）
+    RERANK_BASE_URL: str = "http://192.168.31.185:1234/v1"   # OpenAI 兼容 /rerank
+    RERANK_MODEL: str = "bge-reranker-v2-m3"
+    RERANK_TOP_N: int = 5                      # 精排后返回条数
+    RERANK_HTTP_TIMEOUT_SECONDS: int = 30
+    RERANK_USE_FLAG_EMBEDDING: bool = False    # 进程内 FlagEmbedding fallback（可选依赖）
+
+    QUERY_EXPAND_ENABLED: bool = False         # Query 改写开关（默认关）
+    QUERY_EXPAND_TEMPLATE: str = ""            # 可选改写提示词模板，空则用内置
+
     # --- 长期记忆（MEMORY_SPEC §6/§7） ---
     MEMORY_ENABLED: bool = True            # 全局总开关（熔断用）
     MEMORY_AUTO_INJECT: bool = True        # 对话前自动注入记忆
@@ -120,7 +141,8 @@ class Settings(BaseSettings):
     MEMORY_STRENGTHEN_THRESHOLD: int = 3   # 强化阈值：access_count 达到则不因 TTL 过期
 
     # --- 用户级记忆（MEMORY_SPEC §3.2 / §6.5） ---
-    ANONYMOUS_USER_ID: str = "__anonymous__"  # 未登录阶段的统一占位用户 ID（替换 deps.py 硬编码 "api-user"）
+    # 未登录阶段的统一占位用户 ID（替换 deps.py 硬编码 "api-user"）
+    ANONYMOUS_USER_ID: str = "__anonymous__"
 
     @property
     def embedding_base_url(self) -> str:

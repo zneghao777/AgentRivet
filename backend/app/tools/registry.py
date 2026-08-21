@@ -8,6 +8,7 @@ from langchain_core.tools import StructuredTool
 
 from ..config import settings
 from .builtin import builtin_calculator, builtin_echo, builtin_get_time
+from .builtin.read_skill_file import builtin_read_skill_file
 from .knowledge_search import knowledge_search
 
 
@@ -61,6 +62,7 @@ class ToolRegistry:
             builtin_echo,
             builtin_get_time,
             builtin_calculator,
+            builtin_read_skill_file,
             knowledge_search,
         ]
         # memory_search 受 MEMORY_SEARCH_TOOL 开关控制

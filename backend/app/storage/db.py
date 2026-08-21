@@ -76,6 +76,14 @@ async def create_tables() -> None:
                 "ON knowledge_chunks USING hnsw (embedding vector_cosine_ops)"
             )
         )
+        # 混合检索关键词路（AGENTIC_RAG_UPGRADE_SPEC §1.1/§3.2）：pg_trgm 扩展 + GIN trgm 索引
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_chunks_trgm "
+                "ON knowledge_chunks USING gin (chunk_text gin_trgm_ops)"
+            )
+        )
         # 长期记忆（MEMORY_SPEC §5.3）：表已由 create_all 创建，这里补 HNSW 索引
         await conn.execute(
             text(
@@ -117,6 +125,21 @@ async def create_tables() -> None:
             )
         await conn.execute(
             text("CREATE INDEX IF NOT EXISTS ix_spans_parent ON agent_spans (parent_span_id)")
+        )
+        # Trace 事件回放：消息与一次请求/Trace 直接关联；历史数据允许为空。
+        for col in (
+            "trace_id VARCHAR(64)",
+            "span_id VARCHAR(64)",
+            "request_id VARCHAR(128)",
+            "turn_index INTEGER",
+            "step_index INTEGER",
+        ):
+            await conn.execute(text(f"ALTER TABLE messages ADD COLUMN IF NOT EXISTS {col}"))
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_messages_trace ON messages (trace_id)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_messages_request ON messages (request_id)")
         )
         # C-12：audit_logs 关联 Trace / Request（OBSERVABILITY_SPEC §8.2）
         for col in (
