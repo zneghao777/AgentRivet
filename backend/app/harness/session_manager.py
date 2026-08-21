@@ -95,6 +95,10 @@ class SessionManager:
                 "role": m.role,
                 "content": m.content,
                 "tool_name": m.tool_name,
+                "token_usage": m.token_usage,
+                "trace_id": m.trace_id,
+                "request_id": m.request_id,
+                "step_index": m.step_index,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
             }
             for m in msgs

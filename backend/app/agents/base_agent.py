@@ -18,6 +18,8 @@ SYSTEM_PROMPT_TEMPLATE = """你是企业级 Agent Harness 底座中的通用助�
 - 你本身不绑定任何业务。业务能力由已加载的 Skill 与可用工具提供。
 - 严格遵守系统提示中列出的 Skill 指令；未加载的 Skill 一律不得臆想其功能。
 - 当需要外部信息或执行操作时，调用对应工具；不要编造工具输出。
+- 当已加载 Skill 引用 references/ 等相对资源文件时，调用 builtin_read_skill_file，
+  传入该 Skill 的名称和相对路径；不要声称自己无法读取 Skill 资源。
 
 # 已加载的 Skill（description）
 {skill_descriptions}

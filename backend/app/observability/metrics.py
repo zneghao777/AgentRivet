@@ -30,6 +30,10 @@ class MetricStore:
     tool_calls: dict[str, int] = field(default_factory=lambda: defaultdict(int))  # tool -> count
     latencies: dict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
     active_sessions: set[str] = field(default_factory=set)
+    # 检索 / Rerank 指标（AGENTIC_RAG_UPGRADE_SPEC §3.10）
+    retrieval_calls: dict[str, int] = field(default_factory=lambda: defaultdict(int))  # strategy -> count
+    rerank_calls: dict[str, int] = field(default_factory=lambda: defaultdict(int))  # status(ok/error/skipped) -> count
+    rerank_latencies: list[float] = field(default_factory=list)
     # 采集器健康（§10.1 采集器 / §5.5）
     spans_dropped_total: int = 0
     spans_dropped_by_reason: dict[str, int] = field(default_factory=lambda: defaultdict(int))
@@ -90,6 +94,18 @@ class MetricStore:
         with self.lock:
             self.tool_calls[name] += 1
 
+    def record_retrieval(self, strategy: str) -> None:
+        """检索调用计数（按 strategy：vector/keyword/hybrid）。"""
+        with self.lock:
+            self.retrieval_calls[strategy] += 1
+
+    def record_rerank(self, status: str, latency_ms: float | None = None) -> None:
+        """Rerank 调用计数（status: ok/error/skipped）与耗时。"""
+        with self.lock:
+            self.rerank_calls[status] += 1
+            if latency_ms is not None:
+                self.rerank_latencies.append(latency_ms)
+
     def session_open(self, session_id: str) -> None:
         with self.lock:
             self.active_sessions.add(session_id)
@@ -125,6 +141,12 @@ class MetricStore:
                 "latency_p50_ms": round(statistics.median(all_lat), 2) if all_lat else 0,
                 "latency_p95_ms": round(_percentile(all_lat, 95), 2) if all_lat else 0,
                 "active_sessions": len(self.active_sessions),
+                # 检索 / Rerank 指标（AGENTIC_RAG_UPGRADE_SPEC §3.10）
+                "retrieval_calls": dict(self.retrieval_calls),
+                "rerank_calls": dict(self.rerank_calls),
+                "rerank_latency_p95_ms": round(_percentile(self.rerank_latencies, 95), 2)
+                if self.rerank_latencies
+                else 0,
             }
 
     def _tenant_summary(self, tenant: str) -> dict:

@@ -191,6 +191,27 @@ def sanitize_text(text: str | None, limit: int = _MAX_PROMPT_CHARS) -> str | Non
     return collapsed[:limit]
 
 
+def redact_text(text: str | None, limit: int = _MAX_PROMPT_CHARS) -> str | None:
+    """生成可展示文本摘要：折叠、截断，并遮罩常见凭据与显式 PII。"""
+    sanitized = sanitize_text(text, limit)
+    if not sanitized:
+        return None
+    sanitized = re.sub(r"sk-[A-Za-z0-9_-]+", "sk-***", sanitized)
+    sanitized = re.sub(
+        r"(?i)(Bearer\s+)[A-Za-z0-9._-]+", r"\1***", sanitized
+    )
+    sanitized = re.sub(
+        r"(?i)(api[_-]?key[=: ]+)[A-Za-z0-9._-]+", r"\1***", sanitized
+    )
+    sanitized = re.sub(
+        r"\b([A-Za-z0-9._%+-]{1,2})[A-Za-z0-9._%+-]*(@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b",
+        r"\1****\2",
+        sanitized,
+    )
+    sanitized = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "1**********", sanitized)
+    return sanitized
+
+
 def sanitize_attrs(attrs: dict | None) -> dict | None:
     """脱敏属性：删除密钥字段，嵌套 dict 只保留 key 列表，PII 遮罩。"""
     if attrs is None:
@@ -236,11 +257,7 @@ def sanitize_error(exc: BaseException | None) -> str | None:
     if exc is None:
         return None
     name = type(exc).__name__
-    msg = str(exc)
-    # 移除常见凭据串
-    msg = re.sub(r"(sk-[A-Za-z0-9]+)", "sk-***", msg)
-    msg = re.sub(r"(Bearer\s+)[A-Za-z0-9._-]+", r"\1***", msg)
-    msg = re.sub(r"(api[_-]?key[=: ]+)[A-Za-z0-9._-]+", r"\1***", msg)
+    msg = redact_text(str(exc), _MAX_ERROR_CHARS) or ""
     text = f"{name}: {msg}" if msg else name
     return text[:_MAX_ERROR_CHARS + 12]
 
@@ -412,6 +429,7 @@ class SpanHandle:
         flush_span(self)
 
     def snapshot(self) -> dict[str, Any]:
+        ctx = get_trace_context()
         return {
             "trace_id": self.trace_id,
             "span_id": self.span_id,
@@ -435,6 +453,10 @@ class SpanHandle:
             "run_id": self.run_id,
             "parent_run_id": self.parent_run_id,
             "content_capture_mode": self._content_capture_mode,
+            "request_id": ctx.request_id if ctx else None,
+            "thread_id": ctx.thread_id if ctx else None,
+            "links": list(ctx.links) if ctx and ctx.links else None,
+            "redaction_version": getattr(settings, "REDACTION_VERSION", None),
         }
 
 
@@ -788,6 +810,8 @@ def record_child_span(
         "model_parameters": model_parameters,
         "provider_request_id": provider_request_id,
         "events": events,
+        "content_capture_mode": ctx.content_capture_mode if ctx else "metadata_only",
+        "redaction_version": getattr(settings, "REDACTION_VERSION", None),
     }
     _enqueue_nowait(snapshot)
 

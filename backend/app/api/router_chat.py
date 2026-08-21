@@ -145,9 +145,15 @@ async def send_message(
     if harness_app.runtime is None:
         raise HTTPException(status_code=503, detail="harness not ready")
 
+    request_id = f"req-{uuid.uuid4().hex[:12]}"
     await _ensure_session_title(db, sess, body.message)
     await repo.add_message(
-        db, session_id=session_id, role="user", content=body.message
+        db,
+        session_id=session_id,
+        role="user",
+        content=body.message,
+        request_id=request_id,
+        step_index=1,
     )
     skill_names = body.skills or []
     kb_names = body.knowledge_bases or []
@@ -170,7 +176,6 @@ async def send_message(
             allowed_kb_ids=allowed_kb_ids,
         )
     )
-    request_id = f"req-{uuid.uuid4().hex[:12]}"
     try:
         result = await harness_app.runtime.ainvoke(
             sess.thread_id,
@@ -189,8 +194,20 @@ async def send_message(
     reply = _extract_final_answer(result, body.message)
     duration_ms = int((time.monotonic() - start) * 1000)
     obs = result.get("_observability") or {}
+    trace_id = obs.get("trace_id")
+    if trace_id:
+        await repo.link_messages_to_trace(
+            db, request_id=request_id, trace_id=trace_id
+        )
     await repo.add_message(
-        db, session_id=session_id, role="assistant", content=reply
+        db,
+        session_id=session_id,
+        role="assistant",
+        content=reply,
+        token_usage=obs.get("token_usage"),
+        trace_id=trace_id,
+        request_id=request_id,
+        step_index=2,
     )
 
     # 对话结束后台提炼长期记忆（不阻塞响应，MEMORY_SPEC §6.1）
@@ -248,9 +265,15 @@ async def stream_message(
     if harness_app.runtime is None:
         raise HTTPException(status_code=503, detail="harness not ready")
 
+    request_id = f"req-{uuid.uuid4().hex[:12]}"
     await _ensure_session_title(db, sess, body.message)
     await repo.add_message(
-        db, session_id=session_id, role="user", content=body.message
+        db,
+        session_id=session_id,
+        role="user",
+        content=body.message,
+        request_id=request_id,
+        step_index=1,
     )
     skill_names = body.skills or []
     kb_names = body.knowledge_bases or []
@@ -269,9 +292,10 @@ async def stream_message(
     )
 
     metrics.session_open(str(session_id))
-    request_id = f"req-{uuid.uuid4().hex[:12]}"
+    trace_id: str | None = None
 
     async def event_stream():
+        nonlocal trace_id
         reply_parts: list[str] = []
         stream_start = time.monotonic()
         run_status = "ok"
@@ -294,6 +318,12 @@ async def stream_message(
                 memory_context=memory_context,
                 request_id=request_id,
             ):
+                if "event: trace_start" in frame:
+                    try:
+                        data = next((line[6:] for line in frame.splitlines() if line.startswith("data: ")), "{}")
+                        trace_id = json.loads(data).get("trace_id") or trace_id
+                    except json.JSONDecodeError:
+                        pass
                 # 从 run_end 事件提取实际状态（C-07：不固定按成功写）
                 if "event: run_end" in frame:
                     try:
@@ -316,9 +346,19 @@ async def stream_message(
             metrics.session_close(str(session_id))
             duration_ms = int((time.monotonic() - stream_start) * 1000)
             reply = "".join(reply_parts).strip()
+            if trace_id:
+                await repo.link_messages_to_trace(
+                    db, request_id=request_id, trace_id=trace_id
+                )
             if reply:
                 await repo.add_message(
-                    db, session_id=session_id, role="assistant", content=reply
+                    db,
+                    session_id=session_id,
+                    role="assistant",
+                    content=reply,
+                    trace_id=trace_id,
+                    request_id=request_id,
+                    step_index=2,
                 )
             # 对话结束后台提炼长期记忆（不阻塞响应，MEMORY_SPEC §6.1）
             if reply:

@@ -31,6 +31,7 @@ def observability_enabled(monkeypatch):
 
     monkeypatch.setattr(settings, "OBSERVABILITY_ENABLED", True)
     monkeypatch.setattr(settings, "TRACE_SAMPLE_RATE", 1.0)
+    monkeypatch.setattr(settings, "CONTENT_CAPTURE_MODE", "redacted")
     tracing.init_tracing(lambda: AsyncSessionLocal())
     return settings
 
@@ -55,7 +56,9 @@ async def _tenant_spans(tenant_id: str) -> list[AgentSpan]:
                     .where(AgentSpan.tenant_id == tenant_id)
                     .order_by(AgentSpan.started_at.asc())
                 )
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         )
 
 
@@ -82,6 +85,17 @@ def _event_payload(frames: list[str], event_name: str) -> dict | None:
         data = next((line[6:] for line in lines if line.startswith("data: ")), None)
         return json.loads(data) if data else {}
     return None
+
+
+def _event_payloads(frames: list[str], event_name: str) -> list[dict]:
+    payloads: list[dict] = []
+    for frame in frames:
+        lines = frame.splitlines()
+        if f"event: {event_name}" not in lines:
+            continue
+        data = next((line[6:] for line in lines if line.startswith("data: ")), None)
+        payloads.append(json.loads(data) if data else {})
+    return payloads
 
 
 def _root(spans: list[AgentSpan]) -> AgentSpan:
@@ -135,7 +149,35 @@ async def test_sse_emits_trace_start_with_request_id(observability_enabled):
     assert payload is not None
     assert payload["request_id"] == "request-sse-v2"
     spans = await _tenant_spans(tenant_id)
-    assert payload["trace_id"] == _root(spans).trace_id
+    root = _root(spans)
+    assert payload["trace_id"] == root.trace_id
+    assert root.request_id == "request-sse-v2"
+
+
+@pytest.mark.asyncio
+async def test_sse_emits_stable_auditable_run_steps(observability_enabled):
+    frames = await _stream(
+        GraphRuntime(build_tool_loop_graph()),
+        f"tenant-steps-{uuid.uuid4().hex}",
+    )
+    starts = _event_payloads(frames, "run_step_start")
+    ends = _event_payloads(frames, "run_step_end")
+    updates = _event_payloads(frames, "run_step_update")
+    assert {item["kind"] for item in starts} >= {"node", "llm", "tool"}
+    assert {item["id"] for item in starts} == {item["id"] for item in ends}
+    assert all(item["phase"] == "first_token" for item in updates)
+    kind_by_id = {item["id"]: item["kind"] for item in starts}
+    llm_summaries = [
+        item["summary"] for item in ends if kind_by_id[item["id"]] == "llm"
+    ]
+    assert any(summary and "observability_lookup" in summary for summary in llm_summaries)
+    assert "deterministic final answer" in llm_summaries
+    tool_start = _event_payload(frames, "tool_start")
+    tool_end = _event_payload(frames, "tool_end")
+    assert tool_start is not None and tool_end is not None
+    assert tool_start["id"] == tool_end["id"]
+    assert tool_start["arguments"] == {"query": "frozen-contract"}
+    assert "lookup-result" in tool_end["result"]
 
 
 @pytest.mark.asyncio
@@ -151,6 +193,14 @@ async def test_real_langgraph_maps_parent_ids_and_sequence(observability_enabled
     assert all(by_id[span.parent_span_id].span_name == "node.agent" for span in llms)
     assert by_id[tools[0].parent_span_id].span_name == "node.tools"
     assert llms[0].started_at <= tools[0].started_at <= llms[1].started_at
+    nodes = [span for span in spans if span.span_type == "node"]
+    assert nodes
+    assert all(span.input_summary for span in nodes)
+    assert all(span.input_summary for span in llms)
+    for span in [*llms, *tools]:
+        phases = [event["phase"] for event in (span.events or [])]
+        assert phases[0] == "start"
+        assert phases[-1] == "end"
 
 
 @pytest.mark.asyncio
@@ -196,6 +246,7 @@ async def test_non_streaming_real_graph_has_same_observability_shape(observabili
     spans = await _tenant_spans(tenant_id)
     assert {span.span_type for span in spans} >= {"root", "node", "llm", "tool"}
     assert len([span for span in spans if span.span_type == "llm"]) == 2
+    assert all(span.input_summary for span in spans if span.span_type in {"node", "llm"})
 
 
 @pytest.mark.asyncio
@@ -221,9 +272,7 @@ async def test_timeout_and_error_close_real_graph_spans(observability_enabled, m
     error_spans = await _tenant_spans(error_tenant)
     assert _root(error_spans).status == "error"
     assert any(
-        span.status == "error" and span.error
-        for span in error_spans
-        if span.span_type != "root"
+        span.status == "error" and span.error for span in error_spans if span.span_type != "root"
     )
 
 
@@ -249,8 +298,14 @@ async def test_interrupt_and_resume_create_linked_traces(observability_enabled):
         link_trace_id=initial_root.trace_id,
     ):
         frames.append(frame)
-    roots = [span for span in await _tenant_spans(tenant_id) if span.span_type == "root"]
+    all_spans = await _tenant_spans(tenant_id)
+    roots = [span for span in all_spans if span.span_type == "root"]
     resumed = next(span for span in roots if span.trace_id != initial_root.trace_id)
     assert resumed.status == "ok"
+    resumed_nodes = [
+        span for span in all_spans if span.trace_id == resumed.trace_id and span.span_type == "node"
+    ]
+    assert resumed_nodes
+    assert all(span.input_summary for span in resumed_nodes)
     assert initial_root.trace_id in str((resumed.attributes or {}).get("links"))
     assert _event_payload(frames, "trace_start")["trace_id"] == resumed.trace_id

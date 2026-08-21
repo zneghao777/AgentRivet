@@ -6,6 +6,8 @@ import asyncio
 
 from app.harness.graph_builder import build_main_graph
 from app.harness.graph_runtime import GraphRuntime
+from app.skills.manager import skill_manager
+from app.skills.models import SkillModel
 from app.tools.builtin.calculator import _safe_eval
 from app.tools.registry import tool_registry
 
@@ -17,6 +19,43 @@ def test_builtin_tools_registered(clean_registry):
     assert "builtin_echo" in names
     assert "builtin_get_time" in names
     assert "builtin_calculator" in names
+    assert "builtin_read_skill_file" in names
+
+
+def test_read_skill_file_tool_is_scoped_to_registered_skill(
+    clean_registry, tmp_path, monkeypatch
+):
+    """Skill 资源可读，但不能越过已注册 Skill 根目录。"""
+    skill_dir = tmp_path / "safe-skill"
+    references = skill_dir / "references"
+    references.mkdir(parents=True)
+    (references / "survey.json").write_text('{"question": "A or B"}', encoding="utf-8")
+    outside = tmp_path / "secret.txt"
+    outside.write_text("do-not-leak", encoding="utf-8")
+    monkeypatch.setattr(
+        skill_manager,
+        "_skills",
+        {
+            "safe-skill": SkillModel(
+                name="safe-skill",
+                path=str(skill_dir),
+                description="fixture",
+                enabled=True,
+            )
+        },
+    )
+    tool_registry.register_builtin()
+    tool = tool_registry.get("builtin_read_skill_file")
+    assert tool is not None
+
+    content = str(
+        tool.invoke({"skill_name": "safe-skill", "path": "references/survey.json"})
+    )
+    assert "A or B" in content
+
+    blocked = str(tool.invoke({"skill_name": "safe-skill", "path": "../secret.txt"}))
+    assert "do-not-leak" not in blocked
+    assert "读取失败" in blocked
 
 
 def test_calculator_safe_eval():

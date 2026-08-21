@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..observability.metrics import metrics
 from ..storage import repositories as repo
 from ..storage.db import get_db
-from ..storage.models import AgentSpan
+from ..storage.models import AgentSpan, Message
 from .deps import AuthContext, require_auth
 from .schemas import (
     AlertIncidentUpdateRequest,
@@ -124,10 +124,70 @@ async def _count_children(db: AsyncSession, trace_id: str) -> tuple[int, int]:
     return total, tools
 
 
+def _token_value(usage: dict | None, canonical: str, legacy: str) -> int:
+    data = usage or {}
+    return int(data.get(canonical, data.get(legacy, 0)) or 0)
+
+
+def _span_event_kind(span: AgentSpan) -> str:
+    if span.span_type == "llm":
+        return "assistant"
+    if span.span_type == "tool":
+        return "tool"
+    if span.span_type in {"retriever", "memory"}:
+        return "context"
+    return "node"
+
+
+def _span_lane(span: AgentSpan) -> str | None:
+    if span.span_type == "llm":
+        return "model"
+    if span.span_type == "tool":
+        return "tools"
+    return None
+
+
+def _safe_span_raw(span: AgentSpan, capture_mode: str) -> dict:
+    """按采集策略返回检视原始数据，metadata_only 不泄露内容字段。"""
+    base = {
+        "span_id": span.span_id,
+        "parent_span_id": span.parent_span_id,
+        "run_id": span.run_id,
+        "parent_run_id": span.parent_run_id,
+        "span_name": span.span_name,
+        "span_type": span.span_type,
+        "status": span.status,
+        "model": span.model,
+        "model_provider": span.model_provider,
+        "model_name_requested": span.model_name_requested,
+        "model_name_resolved": span.model_name_resolved,
+        "finish_reason": span.finish_reason,
+        "token_usage": span.token_usage,
+        "ttft_ms": span.ttft_ms,
+        "retry_count": span.retry_count,
+        "duration_ms": span.duration_ms,
+        "started_at": _dt(span.started_at),
+        "ended_at": _dt(span.ended_at),
+        "error": span.error,
+        "attribute_keys": sorted((span.attributes or {}).keys()),
+        "events": span.events or [],
+    }
+    if capture_mode != "metadata_only":
+        base.update(
+            {
+                "input_summary": span.input_summary,
+                "output_summary": span.output_summary,
+                "attributes": span.attributes,
+                "model_parameters": span.model_parameters,
+            }
+        )
+    return base
+
+
 def _hourly_buckets(start: datetime, end: datetime) -> list[dict]:
-    """生成近 N 小时的空桶序列。"""
+    """生成近 N 小时的空桶序列（整点对齐、UTC 归一，与 span 桶 key 一致）。"""
     buckets: list[dict] = []
-    cur = start
+    cur = _floor_hour(start)
     while cur < end:
         buckets.append(
             {
@@ -155,7 +215,9 @@ async def overview(
     """Dashboard 总览：今日卡片 + 近 24h 折线 + 工具 Top + 最近异常 + 采集健康。"""
     tenant_id = auth.tenant.tenant_id
     now = datetime.now(UTC)
-    today_start = datetime.combine(now.date(), datetime.min.time(), tzinfo=UTC)
+    # "今日"按服务器本地时区取零点（UTC 零点会把本地 00:00~08:00 的请求算进昨天）
+    local = now.astimezone()
+    today_start = datetime.combine(local.date(), datetime.min.time(), tzinfo=local.tzinfo)
 
     from sqlalchemy import select
 
@@ -185,8 +247,8 @@ async def overview(
     today_latency_p50 = _percentile(today_durations, 50) if today_durations else 0
     today_latency_p95 = _percentile(today_durations, 95) if today_durations else 0
 
-    # 近 24h 折线
-    trend_start = now - timedelta(hours=24)
+    # 近 24h 折线（窗口按整点对齐：24 个整点桶，末桶为当前小时）
+    trend_start = _floor_hour(now) - timedelta(hours=23)
     buckets = _hourly_buckets(trend_start, now)
     bucket_index = {b["ts"]: b for b in buckets}
     recent_spans = list(
@@ -526,6 +588,274 @@ async def get_trace_timeline(
         for s in spans
     ]
     return ApiResponse(data={"items": timeline, "start": _dt(start), "end": _dt(end)})
+
+
+@router.get("/traces/{trace_id}/events", response_model=ApiResponse)
+async def get_trace_events(
+    trace_id: str,
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """Trace Explorer 数据：消息、Span 事件、泳道和右侧检视所需元数据。"""
+    spans = await repo.query_trace_spans(db, trace_id)
+    if not spans or spans[0].tenant_id != auth.tenant.tenant_id:
+        return ApiResponse(code=404, message="trace not found", data=None)
+
+    spans = sorted(spans, key=lambda item: (item.started_at, item.span_id))
+    root = next((span for span in spans if span.span_type == "root"), spans[0])
+    trace_summary = await repo.get_trace_summary(db, trace_id)
+    capture_mode = (
+        getattr(trace_summary, "content_capture_mode", None)
+        or root.content_capture_mode
+        or "metadata_only"
+    )
+    trace_start = root.started_at
+    trace_end = root.ended_at or max(span.ended_at for span in spans)
+    total_ms = max(
+        1,
+        int((trace_end - trace_start).total_seconds() * 1000),
+        root.duration_ms,
+    )
+
+    # 新数据优先按 trace_id 精确关联；历史数据退回 session + 紧邻时间窗。
+    message_stmt = select(Message).where(Message.trace_id == trace_id)
+    messages = list((await db.execute(message_stmt.order_by(Message.created_at))).scalars())
+    if not messages and root.session_id:
+        margin = timedelta(minutes=2)
+        messages = list(
+            (
+                await db.execute(
+                    select(Message)
+                    .where(
+                        Message.session_id == root.session_id,
+                        Message.created_at >= trace_start - margin,
+                        Message.created_at <= trace_end + margin,
+                    )
+                    .order_by(Message.created_at)
+                )
+            ).scalars()
+        )
+        # 单次 Trace 只对应一轮对话，避免把同一会话相邻历史轮次一起带入。
+        first_user = next((i for i, msg in enumerate(messages) if msg.role == "user"), None)
+        if first_user is not None:
+            messages = messages[first_user:]
+            next_user = next(
+                (i for i, msg in enumerate(messages[1:], start=1) if msg.role == "user"),
+                None,
+            )
+            if next_user is not None:
+                messages = messages[:next_user]
+
+    sortable_events: list[tuple[datetime, int, dict]] = []
+    lane_blocks: list[dict] = []
+
+    root_attrs = root.attributes or {}
+    context_bits = []
+    if root_attrs.get("skill_loaded"):
+        context_bits.append(f"技能 {len(root_attrs.get('skill_loaded') or [])} 项")
+    if root_attrs.get("memory_injected"):
+        context_bits.append("已注入长期记忆")
+    if context_bits:
+        sortable_events.append(
+            (
+                trace_start,
+                0,
+                {
+                    "event_id": f"context:{root.span_id}",
+                    "kind": "context",
+                    "role": "context",
+                    "name": "运行上下文",
+                    "summary": " · ".join(context_bits),
+                    "status": root.status,
+                    "span_id": root.span_id,
+                    "parent_span_id": None,
+                    "started_at": _dt(trace_start),
+                    "ended_at": _dt(trace_start),
+                    "start_ms": 0,
+                    "duration_ms": 0,
+                    "token_usage": None,
+                    "ttft_ms": None,
+                    "generation_ms": None,
+                    "throughput": None,
+                    "model": None,
+                    "model_provider": None,
+                    "finish_reason": None,
+                    "input_summary": None,
+                    "output_summary": None,
+                    "error": None,
+                    "capture_mode": capture_mode,
+                    "raw": {"context": context_bits},
+                },
+            )
+        )
+
+    for msg in messages:
+        kind = msg.role if msg.role in {"user", "assistant", "tool", "system"} else "context"
+        start_ms = max(0, int((msg.created_at - trace_start).total_seconds() * 1000))
+        event = {
+            "event_id": f"message:{msg.id}",
+            "kind": kind,
+            "role": msg.role,
+            "name": "用户输入" if msg.role == "user" else ("最终回复" if msg.role == "assistant" else (msg.tool_name or msg.role)),
+            "summary": msg.content,
+            "status": "ok",
+            "span_id": msg.span_id,
+            "parent_span_id": None,
+            "started_at": _dt(msg.created_at),
+            "ended_at": _dt(msg.created_at),
+            "start_ms": min(start_ms, total_ms),
+            "duration_ms": 0,
+            "token_usage": msg.token_usage,
+            "ttft_ms": None,
+            "generation_ms": None,
+            "throughput": None,
+            "model": None,
+            "model_provider": None,
+            "finish_reason": None,
+            "input_summary": msg.content if msg.role == "user" else None,
+            "output_summary": msg.content if msg.role == "assistant" else None,
+            "error": None,
+            "capture_mode": "message_history",
+            "raw": {
+                "message_id": msg.id,
+                "role": msg.role,
+                "tool_name": msg.tool_name,
+                "token_usage": msg.token_usage,
+                "request_id": msg.request_id,
+                "trace_id": msg.trace_id,
+                "created_at": _dt(msg.created_at),
+            },
+        }
+        sortable_events.append((msg.created_at, 1, event))
+        if msg.role == "user":
+            lane_blocks.append(
+                {
+                    "block_id": f"input:{msg.id}",
+                    "lane": "input",
+                    "event_id": event["event_id"],
+                    "span_id": None,
+                    "status": "ok",
+                    "start_ms": min(start_ms, total_ms),
+                    "duration_ms": max(1, min(12, total_ms)),
+                }
+            )
+
+    for span in spans:
+        if span.span_type == "root":
+            continue
+        start_ms = max(0, int((span.started_at - trace_start).total_seconds() * 1000))
+        output_tokens = _token_value(span.token_usage, "output", "completion")
+        generation_ms = (
+            max(0, span.duration_ms - span.ttft_ms)
+            if span.ttft_ms is not None
+            else None
+        )
+        throughput = (
+            round(output_tokens / (generation_ms / 1000), 1)
+            if output_tokens and generation_ms and generation_ms > 0
+            else None
+        )
+        kind = _span_event_kind(span)
+        visible_input = span.input_summary if capture_mode != "metadata_only" else None
+        visible_output = span.output_summary if capture_mode != "metadata_only" else None
+        event = {
+            "event_id": f"span:{span.span_id}",
+            "kind": kind,
+            "role": "assistant" if span.span_type == "llm" else span.span_type,
+            "name": span.span_name,
+            "summary": visible_output or visible_input or (
+                "调用完成" if span.status == "ok" else (span.error or span.status)
+            ),
+            "status": span.status,
+            "span_id": span.span_id,
+            "parent_span_id": span.parent_span_id,
+            "started_at": _dt(span.started_at),
+            "ended_at": _dt(span.ended_at),
+            "start_ms": start_ms,
+            "duration_ms": span.duration_ms,
+            "token_usage": span.token_usage,
+            "ttft_ms": span.ttft_ms,
+            "generation_ms": generation_ms,
+            "throughput": throughput,
+            "model": span.model,
+            "model_provider": span.model_provider,
+            "finish_reason": span.finish_reason,
+            "input_summary": visible_input,
+            "output_summary": visible_output,
+            "error": span.error,
+            "capture_mode": capture_mode,
+            "references": (
+                (span.attributes or {}).get("references", [])
+                if capture_mode != "metadata_only"
+                else []
+            ),
+            "raw": _safe_span_raw(span, capture_mode),
+        }
+        sortable_events.append((span.started_at, 2, event))
+        lane = _span_lane(span)
+        if lane:
+            lane_blocks.append(
+                {
+                    "block_id": f"span:{span.span_id}",
+                    "lane": lane,
+                    "event_id": event["event_id"],
+                    "span_id": span.span_id,
+                    "status": span.status,
+                    "start_ms": start_ms,
+                    "duration_ms": max(1, span.duration_ms),
+                }
+            )
+
+    sortable_events.sort(key=lambda item: (item[0], item[1], item[2]["event_id"]))
+    events: list[dict] = []
+    turn_index = 0
+    for step_index, (_, _, event) in enumerate(sortable_events, start=1):
+        if event["kind"] == "user":
+            turn_index += 1
+        event["turn_index"] = max(1, turn_index)
+        event["step_index"] = step_index
+        events.append(event)
+
+    llm_spans = [span for span in spans if span.span_type == "llm"]
+    ttft_values = [span.ttft_ms for span in llm_spans if span.ttft_ms is not None]
+    trace_ttft = min(ttft_values) if ttft_values else None
+    trace_output_tokens = sum(
+        _token_value(span.token_usage, "output", "completion") for span in llm_spans
+    )
+    trace_generation_ms = max(0, total_ms - trace_ttft) if trace_ttft is not None else None
+    trace_throughput = (
+        round(trace_output_tokens / (trace_generation_ms / 1000), 1)
+        if trace_output_tokens and trace_generation_ms and trace_generation_ms > 0
+        else None
+    )
+    token_usage = (
+        getattr(trace_summary, "token_usage", None)
+        or root.token_usage
+        or None
+    )
+    return ApiResponse(
+        data={
+            "trace": {
+                "trace_id": trace_id,
+                "request_id": getattr(trace_summary, "request_id", None) or root.request_id,
+                "session_id": str(root.session_id) if root.session_id else None,
+                "thread_id": getattr(trace_summary, "thread_id", None) or root.thread_id,
+                "status": root.status,
+                "started_at": _dt(trace_start),
+                "ended_at": _dt(trace_end),
+                "duration_ms": total_ms,
+                "span_count": len(spans),
+                "tool_calls": len([span for span in spans if span.span_type == "tool"]),
+                "token_usage": token_usage,
+                "ttft_ms": trace_ttft,
+                "generation_ms": trace_generation_ms,
+                "throughput": trace_throughput,
+                "content_capture_mode": capture_mode,
+            },
+            "events": events,
+            "lanes": lane_blocks,
+        }
+    )
 
 
 @router.get("/traces/{trace_id}/logs", response_model=ApiResponse)
@@ -1300,7 +1630,8 @@ async def metric_trend(
         return ApiResponse(data={"items": points})
 
     hours = days
-    trend_start = now - timedelta(hours=hours)
+    # 窗口按整点对齐（hours 个整点桶，末桶为当前小时）
+    trend_start = _floor_hour(now) - timedelta(hours=hours - 1)
     buckets = _hourly_buckets(trend_start, now)
     bucket_index = {b["ts"]: b for b in buckets}
     spans = list(
@@ -1340,7 +1671,8 @@ async def metric_trend(
 
 
 def _floor_hour(ts: datetime) -> datetime:
-    return ts.replace(minute=0, second=0, microsecond=0)
+    """归一到 UTC 并取整点：DB 会话时区（如 +08）与 UTC 生成的桶 key 才能对齐。"""
+    return ts.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
 
 
 def _percentile(values: list[int], p: float) -> int:

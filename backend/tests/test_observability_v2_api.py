@@ -7,14 +7,14 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
 
 from app.storage import repositories as repo
 from app.storage.db import AsyncSessionLocal
-from app.storage.models import ObservabilityLog, TraceScore
+from app.storage.models import AgentSpan, ObservabilityLog, TraceScore
 
 
 async def _write_span(**kwargs):
@@ -63,6 +63,116 @@ async def _write_log(**kwargs):
 
 def _headers():
     return {"X-API-Key": "test-key-1", "X-Tenant-Id": "tenant-a"}
+
+
+@pytest.mark.asyncio
+async def test_trace_events_returns_messages_lanes_and_inspector_data(app_client):
+    trace_id = f"trace-events-{uuid.uuid4().hex[:6]}"
+    request_id = f"req-{uuid.uuid4().hex[:8]}"
+    started = datetime.now(UTC)
+    async with AsyncSessionLocal() as db:
+        session = await repo.create_session(
+            db,
+            thread_id=f"thread-{uuid.uuid4().hex}",
+            tenant_id="tenant-a",
+            user_id="user-1",
+            title="事件回放测试",
+        )
+        root = AgentSpan(
+            trace_id=trace_id,
+            span_id="event-root",
+            parent_span_id=None,
+            session_id=session.id,
+            tenant_id="tenant-a",
+            user_id="user-1",
+            span_name="agent.run",
+            span_type="root",
+            status="ok",
+            token_usage={"input": 10, "output": 5, "total": 15},
+            duration_ms=1000,
+            started_at=started,
+            ended_at=started + timedelta(seconds=1),
+            attributes={"skill_loaded": ["search"], "memory_injected": True},
+            content_capture_mode="redacted",
+            request_id=request_id,
+        )
+        llm = AgentSpan(
+            trace_id=trace_id,
+            span_id="event-llm",
+            parent_span_id="event-root",
+            session_id=session.id,
+            tenant_id="tenant-a",
+            user_id="user-1",
+            span_name="llm.chat",
+            span_type="llm",
+            status="ok",
+            model="test-model",
+            token_usage={"input": 10, "output": 5, "total": 15},
+            input_summary="测试输入",
+            output_summary="测试输出",
+            duration_ms=700,
+            started_at=started + timedelta(milliseconds=100),
+            ended_at=started + timedelta(milliseconds=800),
+            ttft_ms=120,
+            events=[{"name": "llm.chat", "phase": "start"}],
+            content_capture_mode="redacted",
+            request_id=request_id,
+        )
+        tool = AgentSpan(
+            trace_id=trace_id,
+            span_id="event-tool",
+            parent_span_id="event-root",
+            session_id=session.id,
+            tenant_id="tenant-a",
+            user_id="user-1",
+            span_name="tool.search",
+            span_type="tool",
+            status="ok",
+            input_summary="search(query)",
+            output_summary="找到 2 条",
+            duration_ms=200,
+            started_at=started + timedelta(milliseconds=400),
+            ended_at=started + timedelta(milliseconds=600),
+            content_capture_mode="redacted",
+            request_id=request_id,
+        )
+        db.add_all([root, llm, tool])
+        await db.commit()
+        await repo.add_message(
+            db,
+            session_id=session.id,
+            role="user",
+            content="请帮我搜索",
+            trace_id=trace_id,
+            request_id=request_id,
+        )
+        await repo.add_message(
+            db,
+            session_id=session.id,
+            role="assistant",
+            content="搜索完成",
+            trace_id=trace_id,
+            request_id=request_id,
+        )
+
+    resp = await app_client.get(
+        f"/api/v1/observability/traces/{trace_id}/events", headers=_headers()
+    )
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["trace"]["ttft_ms"] == 120
+    assert data["trace"]["tool_calls"] == 1
+    assert {lane["lane"] for lane in data["lanes"]} == {"input", "model", "tools"}
+    assert {event["kind"] for event in data["events"]} >= {
+        "user",
+        "assistant",
+        "tool",
+        "context",
+    }
+    llm_event = next(event for event in data["events"] if event["span_id"] == "event-llm")
+    assert llm_event["generation_ms"] == 580
+    assert llm_event["throughput"] == 8.6
+    assert llm_event["raw"]["events"][0]["phase"] == "start"
 
 
 @pytest.mark.asyncio

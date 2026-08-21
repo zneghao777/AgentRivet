@@ -45,6 +45,9 @@ async def test_stream_message(app_client):
     messages = history.json()["data"]
     assert [message["role"] for message in messages] == ["user", "assistant"]
     assert messages[-1]["content"]
+    assert messages[0]["trace_id"]
+    assert messages[-1]["trace_id"] == messages[0]["trace_id"]
+    assert messages[-1]["request_id"] == messages[0]["request_id"]
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -28,6 +30,49 @@ logger = logging.getLogger(__name__)
 
 # SSE 帧类型：字符串
 SseEvent = str
+
+
+def _span_event(
+    name: str,
+    phase: str,
+    *,
+    timestamp: datetime | None = None,
+    summary: str | None = None,
+    status: str | None = None,
+    details: dict | None = None,
+) -> dict:
+    """生成可持久化、可排序的标准 Span 事件。"""
+    return {
+        "name": name,
+        "phase": phase,
+        "timestamp": (timestamp or datetime.now(UTC)).isoformat(),
+        "summary": summary,
+        "status": status,
+        "details": details or {},
+    }
+
+
+def _append_span_event(
+    pending: dict,
+    phase: str,
+    *,
+    timestamp: datetime | None = None,
+    summary: str | None = None,
+    status: str | None = None,
+    details: dict | None = None,
+) -> None:
+    if settings.CONTENT_CAPTURE_MODE == "metadata_only":
+        summary = None
+    pending.setdefault("events", []).append(
+        _span_event(
+            pending.get("name", "span"),
+            phase,
+            timestamp=timestamp,
+            summary=summary,
+            status=status,
+            details=details,
+        )
+    )
 
 
 def _cost_for_pending(pending: dict) -> dict:
@@ -150,21 +195,31 @@ class GraphRuntime:
             name: str,
             span_type: str,
             parent_span_id: str | None,
+            input_summary: str | None = None,
             attributes: dict | None = None,
-        ) -> None:
+        ) -> tuple[dict, bool]:
             # 同一 run_id 只分配一次 span_id（避免重复 start 事件覆盖导致父子错乱）
             existing = pending_spans.get(run_id)
             if existing is not None:
                 existing.setdefault("attributes", {}).update(attributes or {})
-                return
+                if input_summary and not existing.get("input_summary"):
+                    existing["input_summary"] = input_summary
+                return existing, False
             pending_spans[run_id] = {
                 "span_id": tracing._new_span_id(),
                 "name": name,
                 "type": span_type,
                 "parent_span_id": parent_span_id,
                 "started_at": datetime.now(UTC),
+                "input_summary": input_summary,
                 "attributes": attributes,
             }
+            _append_span_event(
+                pending_spans[run_id],
+                "start",
+                summary=input_summary,
+            )
+            return pending_spans[run_id], True
 
         def _resolve_parent(parent_ids: list[str]) -> str | None:
             """按最近父 run_id 计算 parent_span_id（修复 C-02）。"""
@@ -173,14 +228,22 @@ class GraphRuntime:
                     return pending_spans[pid]["span_id"]
             return root_span.span_id
 
-        def _close_span(run_id: str, *, status: str = "ok", data: dict | None = None) -> None:
+        def _close_span(
+            run_id: str, *, status: str = "ok", data: dict | None = None
+        ) -> dict | None:
             """按 run_id 关闭一个进行中的子 span，并按真实父节点挂载。"""
             pending = pending_spans.pop(run_id, None)
             if not pending:
-                return
+                return None
             ended = datetime.now(UTC)
-            duration_ms = max(
-                0, int((ended - pending["started_at"]).total_seconds() * 1000)
+            duration_ms = max(0, int((ended - pending["started_at"]).total_seconds() * 1000))
+            _append_span_event(
+                pending,
+                "end",
+                timestamp=ended,
+                summary=pending.get("output_summary") or pending.get("error"),
+                status=status,
+                details={"duration_ms": duration_ms},
             )
             cost = _cost_for_pending(pending)
             tracing.record_child_span(
@@ -217,7 +280,24 @@ class GraphRuntime:
                 model_parameters=pending.get("model_parameters"),
                 events=pending.get("events"),
             )
+            pending["status"] = status
+            pending["duration_ms"] = duration_ms
+            return pending
 
+        def _step_end_frame(pending: dict | None) -> str | None:
+            if pending is None:
+                return None
+            return ev.run_step_end(
+                step_id=pending["span_id"],
+                status=pending.get("status", "ok"),
+                duration_ms=pending.get("duration_ms", 0),
+                summary=_public_step_summary(pending),
+                error=pending.get("error"),
+                token_usage=pending.get("token_usage"),
+                references=pending.get("references"),
+            )
+
+        final_step_frames: list[str] = []
         try:
             while True:
                 try:
@@ -228,7 +308,9 @@ class GraphRuntime:
                     # 关闭所有进行中的子 span 为 timeout（C-08）
                     for rid in list(pending_spans):
                         pending_spans[rid]["error"] = run_error
-                        _close_span(rid, status="timeout")
+                        frame = _step_end_frame(_close_span(rid, status="timeout"))
+                        if frame:
+                            yield frame
                     yield ev.error(50001, run_error)
                     break
                 if event is None:
@@ -244,7 +326,9 @@ class GraphRuntime:
                     run_error = tracing.sanitize_error(exc)
                     for rid in list(pending_spans):
                         pending_spans[rid]["error"] = run_error
-                        _close_span(rid, status="error")
+                        frame = _step_end_frame(_close_span(rid, status="error"))
+                        if frame:
+                            yield frame
                     yield ev.error(50001, f"graph error: {exc}")
                     break
 
@@ -262,34 +346,53 @@ class GraphRuntime:
                         if run_id in pending_spans and "ttft_recorded" not in pending_spans[run_id]:
                             pending_spans[run_id]["ttft_recorded"] = True
                             pending_spans[run_id]["ttft_ms"] = int(
-                                (datetime.now(UTC) - pending_spans[run_id]["stream_started"]).total_seconds() * 1000
+                                (
+                                    datetime.now(UTC) - pending_spans[run_id]["stream_started"]
+                                ).total_seconds()
+                                * 1000
+                            )
+                            _append_span_event(
+                                pending_spans[run_id],
+                                "first_token",
+                                details={"ttft_ms": pending_spans[run_id]["ttft_ms"]},
+                            )
+                            yield ev.run_step_update(
+                                step_id=pending_spans[run_id]["span_id"],
+                                phase="first_token",
+                                detail={"ttft_ms": pending_spans[run_id]["ttft_ms"]},
                             )
 
                 elif etype == "on_chat_model_start":
                     # 记录每次 LLM 调用的独立 span（C-03/C-04/C-05）
                     model = data.get("model") or settings.LLM_MODEL
                     parent_id = _resolve_parent(parent_ids)
-                    _register_span(
+                    input_summary = _summarize_input(data.get("input"))
+                    pending, created = _register_span(
                         run_id,
                         name="llm.chat",
                         span_type="llm",
                         parent_span_id=parent_id,
+                        input_summary=input_summary,
                         attributes={
                             "model_requested": model,
                             "model_resolved": model,
                             "streaming": True,
-                            "prompt_input": tracing.sanitize_text(
-                                _summarize_prompt(data.get("input")), 512
-                            ),
+                            "prompt_input": tracing.sanitize_text(input_summary, 512),
                         },
                     )
+                    if created:
+                        yield ev.run_step_start(
+                            step_id=pending["span_id"],
+                            kind="llm",
+                            name=pending["name"],
+                            parent_id=pending["parent_span_id"],
+                            summary=model,
+                            started_at=pending["started_at"].isoformat(),
+                        )
                     pending_spans[run_id]["model"] = model
                     pending_spans[run_id]["model_requested"] = model
                     pending_spans[run_id]["run_id"] = run_id
-                    pending_spans[run_id]["parent_run_id"] = (
-                        parent_ids[-1] if parent_ids else None
-                    )
-                    pending_spans[run_id]["input_summary"] = _summarize_prompt(data.get("input"))
+                    pending_spans[run_id]["parent_run_id"] = parent_ids[-1] if parent_ids else None
                     # 首个 chunk 到达时记录 first_token event / TTFT
                     pending_spans[run_id]["stream_started"] = datetime.now(UTC)
 
@@ -314,27 +417,41 @@ class GraphRuntime:
                                 pending["model"] = rm["model_name"]
                             if rm.get("finish_reason"):
                                 pending["finish_reason"] = rm["finish_reason"]
-                    _close_span(run_id)
+                    frame = _step_end_frame(_close_span(run_id))
+                    if frame:
+                        yield frame
 
                 elif etype == "on_tool_start":
                     tool_name = event.get("name", "")
                     tool_input = data.get("input", {})
                     tool_calls_count += 1
                     parent_id = _resolve_parent(parent_ids)
-                    _register_span(
+                    input_summary = _summarize_tool_input(tool_name, tool_input)
+                    pending, created = _register_span(
                         run_id,
                         name=f"tool.{tool_name}",
                         span_type="tool",
                         parent_span_id=parent_id,
+                        input_summary=input_summary,
                         attributes={
                             "tool": tool_name,
                             "tool_input": tracing.redact_object(tool_input, limit=256),
                         },
                     )
-                    pending_spans[run_id]["input_summary"] = _summarize_tool_input(tool_name, tool_input)
+                    public_arguments = _public_tool_arguments(tool_input)
+                    if created:
+                        yield ev.run_step_start(
+                            step_id=pending["span_id"],
+                            kind="tool",
+                            name=tool_name,
+                            parent_id=pending["parent_span_id"],
+                            summary=_public_tool_arguments_text(public_arguments),
+                            started_at=pending["started_at"].isoformat(),
+                        )
                     yield ev.tool_start(
+                        pending["span_id"],
                         tool_name,
-                        tool_input if isinstance(tool_input, dict) else {"input": str(tool_input)},
+                        public_arguments,
                     )
 
                 elif etype == "on_tool_end":
@@ -342,10 +459,23 @@ class GraphRuntime:
                     tool_name = event.get("name", "")
                     pending = pending_spans.get(run_id)
                     if pending is not None:
-                        pending["output_summary"] = _summarize_tool_output(tool_name, out)
-                        pending["attributes"]["tool_output_summary"] = _summarize_tool_output(tool_name, out)
-                    _close_span(run_id)
-                    yield ev.tool_end(tool_name, str(out))
+                        pending["references"] = _extract_knowledge_references(tool_name, out)
+                        pending["output_summary"] = _summarize_tool_output(
+                            tool_name, out, pending["references"]
+                        )
+                        pending["attributes"]["tool_output_summary"] = pending["output_summary"]
+                        if pending["references"]:
+                            pending["attributes"]["references"] = pending["references"]
+                    closed = _close_span(run_id)
+                    frame = _step_end_frame(closed)
+                    if frame:
+                        yield frame
+                    if closed:
+                        yield ev.tool_end(
+                            closed["span_id"],
+                            tool_name,
+                            _public_step_summary(closed) or "执行完成",
+                        )
 
                 elif etype == "on_tool_error":
                     tool_name = event.get("name", "") or "tool"
@@ -353,19 +483,32 @@ class GraphRuntime:
                     pending = pending_spans.get(run_id)
                     if pending is not None:
                         pending["error"] = tracing.sanitize_error(exc)
-                    _close_span(run_id, status="error", data={"error": exc})
+                    frame = _step_end_frame(
+                        _close_span(run_id, status="error", data={"error": exc})
+                    )
+                    if frame:
+                        yield frame
                     yield ev.error(50002, f"tool error: {exc}")
 
                 elif etype == "on_chain_start":
                     node_name = event.get("name", "") or "agent"
                     if node_name and node_name not in {"__start__", "__end__"}:
                         parent_id = _resolve_parent(parent_ids)
-                        _register_span(
+                        pending, created = _register_span(
                             run_id,
                             name=f"node.{node_name}",
                             span_type="node",
                             parent_span_id=parent_id,
+                            input_summary=_summarize_input(data.get("input")),
                         )
+                        if created:
+                            yield ev.run_step_start(
+                                step_id=pending["span_id"],
+                                kind="node",
+                                name=pending["name"],
+                                parent_id=pending["parent_span_id"],
+                                started_at=pending["started_at"].isoformat(),
+                            )
 
                 elif etype == "on_chain_error":
                     node_name = event.get("name", "") or "agent"
@@ -373,12 +516,18 @@ class GraphRuntime:
                     pending = pending_spans.get(run_id)
                     if pending is not None:
                         pending["error"] = tracing.sanitize_error(exc)
-                    _close_span(run_id, status="error", data={"error": exc})
+                    frame = _step_end_frame(
+                        _close_span(run_id, status="error", data={"error": exc})
+                    )
+                    if frame:
+                        yield frame
 
                 elif etype == "on_chain_end":
                     node_name = event.get("name", "") or "agent"
                     if node_name and node_name not in {"__start__", "__end__"}:
-                        _close_span(run_id)
+                        frame = _step_end_frame(_close_span(run_id))
+                        if frame:
+                            yield frame
         finally:
             task.cancel()
             try:
@@ -388,8 +537,11 @@ class GraphRuntime:
             # HITL 中断检测（§5.3）：流正常结束但仍有未关闭节点 → interrupted
             if run_status == "ok" and pending_spans:
                 run_status = "interrupted"
-                for rid in list(pending_spans):
-                    _close_span(rid, status="interrupted")
+            for rid in list(pending_spans):
+                close_status = "interrupted" if run_status == "interrupted" else run_status
+                frame = _step_end_frame(_close_span(rid, status=close_status))
+                if frame:
+                    final_step_frames.append(frame)
             duration_ms = int((time.monotonic() - start) * 1000)
             root_span.finalize(
                 status=run_status,
@@ -404,12 +556,14 @@ class GraphRuntime:
             )
 
         duration_ms = int((time.monotonic() - start) * 1000)
+        for frame in final_step_frames:
+            yield frame
         if not msg_id:
             yield ev.message_start()
             yield ev.message_delta("msg_stream", _dummy_reply())
         yield ev.message_end(token_usage)
         yield ev.run_end(
-            status="success" if run_status == "ok" else "error",
+            status="success" if run_status == "ok" else run_status,
             duration_ms=duration_ms,
             tool_calls=tool_calls_count,
         )
@@ -471,6 +625,14 @@ class GraphRuntime:
                 return
             ended = datetime.now(UTC)
             duration_ms = max(0, int((ended - pending["started_at"]).total_seconds() * 1000))
+            _append_span_event(
+                pending,
+                "end",
+                timestamp=ended,
+                summary=pending.get("output_summary") or error or pending.get("error"),
+                status=status,
+                details={"duration_ms": duration_ms},
+            )
             cost = _cost_for_pending(pending)
             tracing.record_child_span(
                 trace_id=root_span.trace_id,
@@ -536,9 +698,14 @@ class GraphRuntime:
                         "model_requested": model,
                         "run_id": run_id,
                         "parent_run_id": parent_ids[-1] if parent_ids else None,
-                        "input_summary": _summarize_prompt(data.get("input")),
+                        "input_summary": _summarize_input(data.get("input")),
                         "streaming": False,
                     }
+                    _append_span_event(
+                        pending_spans[run_id],
+                        "start",
+                        summary=pending_spans[run_id].get("input_summary"),
+                    )
                 elif etype == "on_chat_model_end":
                     output = data.get("output")
                     um = getattr(output, "usage_metadata", None) or {}
@@ -569,6 +736,11 @@ class GraphRuntime:
                             "tool_input": tracing.redact_object(tool_input, limit=256),
                         },
                     }
+                    _append_span_event(
+                        pending_spans[run_id],
+                        "start",
+                        summary=pending_spans[run_id].get("input_summary"),
+                    )
                 elif etype == "on_tool_end":
                     out = data.get("output", "")
                     tool_name = event.get("name", "")
@@ -591,7 +763,13 @@ class GraphRuntime:
                             "type": "node",
                             "parent_span_id": _resolve_parent(parent_ids),
                             "started_at": datetime.now(UTC),
+                            "input_summary": _summarize_input(data.get("input")),
                         }
+                        _append_span_event(
+                            pending_spans[run_id],
+                            "start",
+                            summary=pending_spans[run_id].get("input_summary"),
+                        )
                 elif etype == "on_chain_end":
                     node_name = event.get("name", "") or "agent"
                     if node_name and node_name not in {"__start__", "__end__"}:
@@ -692,6 +870,7 @@ class GraphRuntime:
         )
 
         msg_id = ""
+        tool_calls_count = 0
         token_usage: dict[str, int] = {"input": 0, "output": 0, "total": 0}
         run_status = "ok"
         _pending_reply: list[str] = []
@@ -703,12 +882,20 @@ class GraphRuntime:
                     return pending_spans[pid]["span_id"]
             return root_span.span_id
 
-        def _close_span(run_id: str, *, status: str = "ok") -> None:
+        def _close_span(run_id: str, *, status: str = "ok") -> dict | None:
             pending = pending_spans.pop(run_id, None)
             if not pending:
-                return
+                return None
             ended = datetime.now(UTC)
             duration_ms = max(0, int((ended - pending["started_at"]).total_seconds() * 1000))
+            _append_span_event(
+                pending,
+                "end",
+                timestamp=ended,
+                summary=pending.get("output_summary") or pending.get("error"),
+                status=status,
+                details={"duration_ms": duration_ms},
+            )
             cost = _cost_for_pending(pending)
             tracing.record_child_span(
                 trace_id=root_span.trace_id,
@@ -744,6 +931,22 @@ class GraphRuntime:
                 model_parameters=pending.get("model_parameters"),
                 events=pending.get("events"),
             )
+            pending["status"] = status
+            pending["duration_ms"] = duration_ms
+            return pending
+
+        def _step_end_frame(pending: dict | None) -> str | None:
+            if pending is None:
+                return None
+            return ev.run_step_end(
+                step_id=pending["span_id"],
+                status=pending.get("status", "ok"),
+                duration_ms=pending.get("duration_ms", 0),
+                summary=_public_step_summary(pending),
+                error=pending.get("error"),
+                token_usage=pending.get("token_usage"),
+                references=pending.get("references"),
+            )
 
         try:
             async for event in self.app.astream_events(
@@ -766,6 +969,24 @@ class GraphRuntime:
                                 yield ev.message_start()
                                 msg_id = "msg_resume"
                             yield ev.message_delta(msg_id, text[:64])
+                        if run_id in pending_spans and "ttft_recorded" not in pending_spans[run_id]:
+                            pending_spans[run_id]["ttft_recorded"] = True
+                            pending_spans[run_id]["ttft_ms"] = int(
+                                (
+                                    datetime.now(UTC) - pending_spans[run_id]["stream_started"]
+                                ).total_seconds()
+                                * 1000
+                            )
+                            _append_span_event(
+                                pending_spans[run_id],
+                                "first_token",
+                                details={"ttft_ms": pending_spans[run_id]["ttft_ms"]},
+                            )
+                            yield ev.run_step_update(
+                                step_id=pending_spans[run_id]["span_id"],
+                                phase="first_token",
+                                detail={"ttft_ms": pending_spans[run_id]["ttft_ms"]},
+                            )
                 elif etype == "on_chat_model_start":
                     model = data.get("model") or settings.LLM_MODEL
                     pending_spans[run_id] = {
@@ -778,8 +999,23 @@ class GraphRuntime:
                         "model_requested": model,
                         "run_id": run_id,
                         "parent_run_id": parent_ids[-1] if parent_ids else None,
-                        "input_summary": _summarize_prompt(data.get("input")),
+                        "input_summary": _summarize_input(data.get("input")),
+                        "stream_started": datetime.now(UTC),
                     }
+                    _append_span_event(
+                        pending_spans[run_id],
+                        "start",
+                        summary=pending_spans[run_id].get("input_summary"),
+                    )
+                    pending = pending_spans[run_id]
+                    yield ev.run_step_start(
+                        step_id=pending["span_id"],
+                        kind="llm",
+                        name=pending["name"],
+                        parent_id=pending["parent_span_id"],
+                        summary=model,
+                        started_at=pending["started_at"].isoformat(),
+                    )
                 elif etype == "on_chat_model_end":
                     output = data.get("output")
                     um = getattr(output, "usage_metadata", None) or {}
@@ -794,7 +1030,74 @@ class GraphRuntime:
                     if pending is not None:
                         pending["token_usage"] = usage
                         pending["output_summary"] = _summarize_output(output)
-                    _close_span(run_id)
+                    frame = _step_end_frame(_close_span(run_id))
+                    if frame:
+                        yield frame
+                elif etype == "on_tool_start":
+                    tool_name = event.get("name", "")
+                    tool_input = data.get("input", {})
+                    tool_calls_count += 1
+                    pending_spans[run_id] = {
+                        "span_id": tracing._new_span_id(),
+                        "name": f"tool.{tool_name}",
+                        "type": "tool",
+                        "parent_span_id": _resolve_parent(parent_ids),
+                        "started_at": datetime.now(UTC),
+                        "input_summary": _summarize_tool_input(tool_name, tool_input),
+                        "attributes": {
+                            "tool": tool_name,
+                            "tool_input": tracing.redact_object(tool_input, limit=256),
+                        },
+                    }
+                    _append_span_event(
+                        pending_spans[run_id],
+                        "start",
+                        summary=pending_spans[run_id].get("input_summary"),
+                    )
+                    pending = pending_spans[run_id]
+                    public_arguments = _public_tool_arguments(tool_input)
+                    yield ev.run_step_start(
+                        step_id=pending["span_id"],
+                        kind="tool",
+                        name=tool_name,
+                        parent_id=pending["parent_span_id"],
+                        summary=_public_tool_arguments_text(public_arguments),
+                        started_at=pending["started_at"].isoformat(),
+                    )
+                    yield ev.tool_start(
+                        pending["span_id"],
+                        tool_name,
+                        public_arguments,
+                    )
+                elif etype == "on_tool_end":
+                    out = data.get("output", "")
+                    tool_name = event.get("name", "")
+                    pending = pending_spans.get(run_id)
+                    if pending is not None:
+                        pending["references"] = _extract_knowledge_references(tool_name, out)
+                        pending["output_summary"] = _summarize_tool_output(
+                            tool_name, out, pending["references"]
+                        )
+                        if pending["references"]:
+                            pending.setdefault("attributes", {})["references"] = pending["references"]
+                    closed = _close_span(run_id)
+                    frame = _step_end_frame(closed)
+                    if frame:
+                        yield frame
+                    if closed:
+                        yield ev.tool_end(
+                            closed["span_id"],
+                            tool_name,
+                            _public_step_summary(closed) or "执行完成",
+                        )
+                elif etype == "on_tool_error":
+                    exc = data.get("error")
+                    pending = pending_spans.get(run_id)
+                    if pending is not None:
+                        pending["error"] = tracing.sanitize_error(exc)
+                    frame = _step_end_frame(_close_span(run_id, status="error"))
+                    if frame:
+                        yield frame
                 elif etype == "on_chain_start":
                     node_name = event.get("name", "") or "agent"
                     if node_name and node_name not in {"__start__", "__end__"}:
@@ -804,23 +1107,43 @@ class GraphRuntime:
                             "type": "node",
                             "parent_span_id": _resolve_parent(parent_ids),
                             "started_at": datetime.now(UTC),
+                            "input_summary": _summarize_input(data.get("input")),
                         }
+                        _append_span_event(
+                            pending_spans[run_id],
+                            "start",
+                            summary=pending_spans[run_id].get("input_summary"),
+                        )
+                        pending = pending_spans[run_id]
+                        yield ev.run_step_start(
+                            step_id=pending["span_id"],
+                            kind="node",
+                            name=pending["name"],
+                            parent_id=pending["parent_span_id"],
+                            started_at=pending["started_at"].isoformat(),
+                        )
                 elif etype == "on_chain_end":
                     node_name = event.get("name", "") or "agent"
                     if node_name and node_name not in {"__start__", "__end__"}:
-                        _close_span(run_id)
+                        frame = _step_end_frame(_close_span(run_id))
+                        if frame:
+                            yield frame
                 elif etype == "on_chain_error":
                     exc = data.get("error")
                     pending = pending_spans.get(run_id)
                     if pending is not None:
                         pending["error"] = tracing.sanitize_error(exc)
-                    _close_span(run_id, status="error")
+                    frame = _step_end_frame(_close_span(run_id, status="error"))
+                    if frame:
+                        yield frame
                 elif etype == "on_chat_model_error":
                     exc = data.get("error")
                     pending = pending_spans.get(run_id)
                     if pending is not None:
                         pending["error"] = tracing.sanitize_error(exc)
-                    _close_span(run_id, status="error")
+                    frame = _step_end_frame(_close_span(run_id, status="error"))
+                    if frame:
+                        yield frame
         except Exception as exc:  # noqa: BLE001
             run_status = "error"
             yield ev.error(50001, f"resume failed: {exc}")
@@ -832,7 +1155,11 @@ class GraphRuntime:
 
         duration_ms = int((time.monotonic() - start) * 1000)
         yield ev.message_end(token_usage)
-        yield ev.run_end(status="success", duration_ms=duration_ms, tool_calls=0)
+        yield ev.run_end(
+            status="success" if run_status == "ok" else run_status,
+            duration_ms=duration_ms,
+            tool_calls=tool_calls_count,
+        )
         root_span.finalize(
             status=run_status,
             token_usage=token_usage,
@@ -840,23 +1167,85 @@ class GraphRuntime:
         )
 
 
-def _summarize_prompt(input_data: Any) -> str | None:
-    """LLM prompt 摘要：取 messages 首条用户文本，截断。"""
+def _message_values(value: Any) -> list[Any]:
+    """展开 LangChain 的单层/批量消息输入，同时保留 ``(role, content)``。"""
+
+    if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        messages: list[Any] = []
+        for item in value:
+            messages.extend(_message_values(item))
+        return messages
+    return [value]
+
+
+def _summarize_message(message: Any) -> str | None:
+    """将一条 LangChain 消息转换成短文本，避免把对象 repr 直接落库。"""
     from ..observability import tracing
 
-    if not input_data:
+    role: str | None = None
+    content: Any = None
+    tool_calls: Any = None
+    if isinstance(message, tuple) and len(message) == 2:
+        role, content = str(message[0]), message[1]
+    elif isinstance(message, dict):
+        role = str(message.get("role") or message.get("type") or "message")
+        content = message.get("content")
+        tool_calls = message.get("tool_calls")
+    else:
+        role = str(getattr(message, "type", None) or message.__class__.__name__)
+        content = getattr(message, "content", None)
+        tool_calls = getattr(message, "tool_calls", None)
+
+    text: str | None = None
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = [
+            str(item.get("text", ""))
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        text = " ".join(part for part in parts if part)
+
+    if text:
+        return tracing.sanitize_text(f"{role}: {text}", 180)
+    if tool_calls:
+        calls: list[str] = []
+        for call in tool_calls[:5]:
+            if not isinstance(call, dict):
+                continue
+            name = call.get("name") or "tool"
+            args = call.get("args")
+            keys = ", ".join(str(key) for key in list(args)[:10]) if isinstance(args, dict) else ""
+            calls.append(f"{name}({keys})")
+        if calls:
+            return tracing.sanitize_text(f"{role}: tool_calls {', '.join(calls)}", 180)
+    return tracing.sanitize_text(str(role), 180)
+
+
+def _summarize_input(input_data: Any) -> str | None:
+    """记录 LangGraph 节点/LLM 的真实输入形状，并生成脱敏短摘要。"""
+    from ..observability import tracing
+
+    if input_data is None:
         return None
-    messages = input_data.get("messages") if isinstance(input_data, dict) else None
-    if messages:
-        for msg in messages:
-            content = getattr(msg, "content", None)
-            if isinstance(content, str) and content:
-                return tracing.sanitize_text(content, 512)
-            if isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        return tracing.sanitize_text(item.get("text", ""), 512)
-    return None
+    message_input = input_data.get("messages") if isinstance(input_data, dict) else input_data
+    if message_input:
+        messages = _message_values(message_input)
+        summaries = [summary for item in messages[-3:] if (summary := _summarize_message(item))]
+        if summaries:
+            return tracing.sanitize_text(" | ".join(summaries), 512)
+
+    sanitized = tracing.redact_object(input_data, limit=512)
+    return tracing.sanitize_text(str(sanitized), 512)
+
+
+def _summarize_prompt(input_data: Any) -> str | None:
+    """兼容旧调用名；LLM prompt 与节点输入使用同一真实事件摘要器。"""
+
+    return _summarize_input(input_data)
 
 
 def _summarize_output(output: Any) -> str | None:
@@ -870,24 +1259,150 @@ def _summarize_output(output: Any) -> str | None:
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
                 return tracing.sanitize_text(item.get("text", ""), 512)
+    tool_calls = getattr(output, "tool_calls", None) if output is not None else None
+    if tool_calls:
+        calls: list[str] = []
+        for call in tool_calls[:5]:
+            if not isinstance(call, dict):
+                continue
+            name = str(call.get("name") or "tool")
+            args = call.get("args")
+            keys = ", ".join(str(key) for key in list(args)[:10]) if isinstance(args, dict) else ""
+            calls.append(f"{name}({keys})")
+        if calls:
+            return tracing.sanitize_text(f"请求调用工具：{'、'.join(calls)}", 512)
     return None
 
 
 def _summarize_tool_input(tool_name: str, tool_input: Any) -> str:
-    """工具入参摘要：仅存参数 key 列表 + 短文本。"""
+    """工具入参摘要：保留脱敏后的短参数，供 Trace 与历史过程回放。"""
+    from ..observability import tracing
+
     if isinstance(tool_input, dict):
-        keys = ", ".join(list(tool_input.keys())[:20])
-        return f"{tool_name}({keys})"
-    return f"{tool_name}(input)"
+        redacted = tracing.redact_object(tool_input, limit=320)
+        payload = json.dumps(redacted, ensure_ascii=False, separators=(", ", ": "))
+        return tracing.redact_text(f"{tool_name}({payload})", 400) or f"{tool_name}()"
+    value = tracing.redact_text(str(tool_input), 240)
+    return f"{tool_name}({value or 'input'})"
 
 
-def _summarize_tool_output(tool_name: str, out: Any) -> str | None:
+def _tool_output_text(out: Any) -> str:
+    content = getattr(out, "content", out)
+    return str(content or "")
+
+
+_REFERENCE_HEADER_RE = re.compile(r"^\[片段\s+(\d+)\s+\|\s+(.+)\]$", re.MULTILINE)
+_REFERENCE_ID_RE = re.compile(r"KB-([0-9a-fA-F-]{36})/(\d+)")
+_REFERENCE_LINE_RE = re.compile(r"第\s*(\d+)\s*-\s*(\d+)\s*行")
+
+
+def _extract_knowledge_references(tool_name: str, out: Any) -> list[dict[str, Any]]:
+    """从 knowledge_search 完整输出提取结构化来源，避免 UI 依赖截断正文。"""
+    from ..observability import tracing
+
+    if tool_name != "knowledge_search":
+        return []
+    text = _tool_output_text(out)
+    matches = list(_REFERENCE_HEADER_RE.finditer(text))
+    references: list[dict[str, Any]] = []
+    for index, match in enumerate(matches[:10]):
+        fields: dict[str, str] = {}
+        for part in match.group(2).split(" | "):
+            if ": " in part:
+                key, value = part.split(": ", 1)
+                fields[key.strip()] = value.strip()
+            elif part.startswith("相关度 "):
+                fields["相关度"] = part.removeprefix("相关度 ").strip()
+        reference_match = _REFERENCE_ID_RE.search(fields.get("引用", ""))
+        if not reference_match:
+            continue
+        line_match = _REFERENCE_LINE_RE.search(fields.get("位置", ""))
+        excerpt_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        excerpt = text[match.end():excerpt_end].strip()
+        score_raw = fields.get("相关度")
+        try:
+            score = float(score_raw) if score_raw is not None else None
+        except ValueError:
+            score = None
+        chunk_raw = fields.get("分块", "").lstrip("#")
+        doc_raw = fields.get("文档ID", "")
+        references.append(
+            {
+                "rank": int(match.group(1)),
+                "kb_id": reference_match.group(1),
+                "chunk_id": int(reference_match.group(2)),
+                "doc_id": int(doc_raw) if doc_raw.isdigit() else None,
+                "source_file": fields.get("来源") or "未知文档",
+                "chunk_index": int(chunk_raw) if chunk_raw.isdigit() else None,
+                "heading": None
+                if fields.get("章节") in {None, "未标注章节"}
+                else fields.get("章节"),
+                "line_start": int(line_match.group(1)) if line_match else None,
+                "line_end": int(line_match.group(2)) if line_match else None,
+                "score": score,
+                "strategy": fields.get("策略"),
+                "excerpt": tracing.redact_text(excerpt, 220),
+            }
+        )
+    return references
+
+
+def _reference_summary(references: list[dict[str, Any]]) -> str | None:
+    if not references:
+        return None
+    sources = list(dict.fromkeys(str(item["source_file"]) for item in references))
+    source_text = "、".join(sources[:2])
+    if len(sources) > 2:
+        source_text += f" 等 {len(sources)} 个文档"
+    return f"命中 {len(references)} 个相关片段 · {source_text}"
+
+
+def _summarize_tool_output(
+    tool_name: str,
+    out: Any,
+    references: list[dict[str, Any]] | None = None,
+) -> str | None:
     """工具出参摘要：截断为短摘要。"""
+    from ..observability import tracing
 
-    s = str(out)
-    if len(s) > 200:
-        s = s[:200] + "…"
-    return s or None
+    if tool_name == "knowledge_search":
+        return _reference_summary(references or _extract_knowledge_references(tool_name, out))
+    return tracing.redact_text(_tool_output_text(out), 200)
+
+
+def _public_tool_arguments(tool_input: Any) -> dict[str, Any]:
+    """为聊天过程面板生成脱敏工具参数；metadata_only 仅展示工具名称。"""
+    from ..observability import tracing
+
+    if settings.CONTENT_CAPTURE_MODE == "metadata_only":
+        return {}
+    redacted = tracing.redact_object(tool_input, limit=240)
+    if isinstance(redacted, dict):
+        return redacted
+    return {"input": redacted}
+
+
+def _public_tool_arguments_text(arguments: dict[str, Any]) -> str | None:
+    if not arguments:
+        return None
+    return json.dumps(arguments, ensure_ascii=False, separators=(", ", ": "))
+
+
+def _public_step_summary(pending: dict) -> str | None:
+    """向聊天 UI 暴露脱敏后的真实输出，不暴露 Prompt 或模型私有推理。"""
+    from ..observability import tracing
+
+    if settings.CONTENT_CAPTURE_MODE == "metadata_only":
+        return None
+    if pending.get("references"):
+        return _reference_summary(pending["references"])
+    if pending.get("type") == "llm":
+        return tracing.redact_text(pending.get("output_summary"), 512)
+    if pending.get("type") != "tool":
+        return None
+    return tracing.redact_text(
+        pending.get("output_summary") or pending.get("error"), 240
+    )
 
 
 def _extract_text(chunk: Any) -> str:

@@ -11,6 +11,7 @@ import re
 import uuid
 
 from app.knowledge.retriever import Hit, hits_to_markdown
+from app.harness.graph_runtime import _extract_knowledge_references
 
 # 与 frontend/src/utils/trace.ts 保持一致的正则
 ANCHOR_RE = re.compile(r"KB-([0-9a-fA-F-]{36})/(\d+)")
@@ -24,6 +25,10 @@ def _hit(*, chunk_id: int = 12, kb_id: str | None = None) -> Hit:
         score=0.87,
         kb_id=uuid.UUID(kb_id) if kb_id else uuid.uuid4(),
         chunk_id=chunk_id,
+        doc_id=7,
+        heading="休假制度",
+        line_start=18,
+        line_end=21,
     )
 
 
@@ -41,6 +46,33 @@ def test_hits_to_markdown_emits_reference_anchor():
     assert f"引用: KB-{hit.kb_id}/{hit.chunk_id}" in md
     assert "来源: manual.pdf" in md
     assert "相关度 0.87" in md
+    assert "位置: 第 18-21 行" in md
+    assert "章节: 休假制度" in md
+    assert "文档ID: 7" in md
+
+
+def test_runtime_extracts_structured_references_from_tool_markdown():
+    """聊天运行步骤从完整工具输出提取来源，不依赖截断摘要。"""
+    hit = _hit(chunk_id=42)
+    references = _extract_knowledge_references(
+        "knowledge_search", hits_to_markdown([hit])
+    )
+    assert references == [
+        {
+            "rank": 1,
+            "kb_id": str(hit.kb_id),
+            "chunk_id": 42,
+            "doc_id": 7,
+            "source_file": "manual.pdf",
+            "chunk_index": 4,
+            "heading": "休假制度",
+            "line_start": 18,
+            "line_end": 21,
+            "score": 0.87,
+            "strategy": "vector",
+            "excerpt": "正式员工每年享有 12 天带薪年假。",
+        }
+    ]
 
 
 def test_parse_anchors_from_markdown():
