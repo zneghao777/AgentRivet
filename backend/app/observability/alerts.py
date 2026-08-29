@@ -61,6 +61,30 @@ _DEFAULT_RULES = [
         "window_minutes": 15,
         "min_samples": 1,
     },
+    {
+        "name": "mq-deadletter",
+        "metric": "mq_deadletter",
+        "threshold": 0,
+        "comparison": ">",
+        "window_minutes": 5,
+        "min_samples": 1,
+    },
+    {
+        "name": "mq-session-queue-depth",
+        "metric": "mq_session_queue_depth",
+        "threshold": 1000,
+        "comparison": ">",
+        "window_minutes": 10,
+        "min_samples": 1,
+    },
+    {
+        "name": "mq-publish-fallback",
+        "metric": "mq_publish_fallback_ratio",
+        "threshold": 0.05,
+        "comparison": ">",
+        "window_minutes": 5,
+        "min_samples": 1,
+    },
 ]
 
 
@@ -142,6 +166,24 @@ async def _evaluate_rule(db, rule, tenant_id: str) -> float | None:
 
         return metrics.queue_usage_ratio()
 
+    if metric == "mq_deadletter":
+        if not settings.MQ_DEADLETTER_ALERT_ENABLED:
+            return None
+        from ..observability.metrics import metrics
+
+        return float(metrics.mq_deadletter_recent(rule.window_minutes))
+
+    if metric == "mq_session_queue_depth":
+        from ..mq.connection import SESSION_QUEUE
+        from ..observability.metrics import metrics
+
+        return float(metrics.mq_queue_depth_value(SESSION_QUEUE))
+
+    if metric == "mq_publish_fallback_ratio":
+        from ..observability.metrics import metrics
+
+        return metrics.mq_publish_fallback_ratio_recent(rule.window_minutes)
+
     if metric == "cost_total":
         from ..storage.models import AgentSpan as SpanModel
 
@@ -186,9 +228,11 @@ async def _evaluate_all() -> None:
         )
         # 无租户可评估
         rules = await repo.list_alert_rules(db, tenant_id="__all__")
-        if not rules:
-            # 首次：注入默认 SLO 规则（dev 验证用，§10.2）
-            for r in _DEFAULT_RULES:
+        existing_names = {rule.name for rule in rules}
+        missing_defaults = [r for r in _DEFAULT_RULES if r["name"] not in existing_names]
+        if missing_defaults:
+            # 幂等补齐新增内置规则，避免已有环境永远缺少后续版本规则。
+            for r in missing_defaults:
                 await repo.create_alert_rule(db, values={**r, "tenant_id": "__all__"})
             rules = await repo.list_alert_rules(db, tenant_id="__all__")
 

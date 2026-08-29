@@ -35,7 +35,9 @@ class ObservabilityLogHandler(logging.Handler):
             if record.levelno < self._min_level:
                 return
             # 过滤采集器自身日志，避免写失败时回环（§8.1 可靠性）
-            if record.name.startswith("app.observability.tracing"):
+            if record.name.startswith(
+                ("app.observability.tracing", "app.mq", "aio_pika", "aiormq")
+            ):
                 return
             _export_record(record)
         except Exception:  # noqa: BLE001

@@ -132,6 +132,7 @@ class TraceContext:
     service_version: str = "0.1.0"
     environment: str = settings.APP_ENV
     agent_name: str | None = None
+    agent_id: uuid.UUID | None = None
     agent_version: str | None = None
     workflow_name: str | None = None
     model_provider: str | None = None
@@ -156,6 +157,7 @@ class TraceContext:
             "service_version": self.service_version,
             "environment": self.environment,
             "agent_name": self.agent_name,
+            "agent_id": str(self.agent_id) if self.agent_id else None,
             "agent_version": self.agent_version,
             "workflow_name": self.workflow_name,
             "model_provider": self.model_provider,
@@ -456,6 +458,8 @@ class SpanHandle:
             "request_id": ctx.request_id if ctx else None,
             "thread_id": ctx.thread_id if ctx else None,
             "links": list(ctx.links) if ctx and ctx.links else None,
+            "agent_id": ctx.agent_id if ctx else None,
+            "agent_name": ctx.agent_name if ctx else None,
             "redaction_version": getattr(settings, "REDACTION_VERSION", None),
         }
 
@@ -568,8 +572,10 @@ def _increment_dropped(count: int, reason: str) -> None:
         pass
 
 
-def _enqueue_nowait(span_snapshot: dict[str, Any], *, record_type: str = "span") -> bool:
-    """同步入队（快路径）。返回是否成功；队列满触发溢出策略。"""
+def _enqueue_local_nowait(
+    span_snapshot: dict[str, Any], *, record_type: str = "span"
+) -> bool:
+    """写入进程内降级队列；队列满触发原有溢出策略。"""
     item = {"record_type": record_type, **span_snapshot}
     try:
         queue, _ = _loop_state()
@@ -590,6 +596,26 @@ def _enqueue_nowait(span_snapshot: dict[str, Any], *, record_type: str = "span")
         return False
     except RuntimeError:
         return False
+
+
+def _enqueue_nowait(span_snapshot: dict[str, Any], *, record_type: str = "span") -> bool:
+    """优先非阻塞发布 MQ；confirm 失败时回退进程内队列。"""
+    if settings.MQ_ENABLED and settings.MQ_OBS_ENABLED:
+        try:
+            from ..mq.publisher import publish_nowait
+
+            message_type = "obs.log" if record_type == "log" else "obs.span"
+            if publish_nowait(
+                message_type,
+                span_snapshot,
+                fallback=lambda: _enqueue_local_nowait(
+                    span_snapshot, record_type=record_type
+                ),
+            ):
+                return True
+        except Exception:  # noqa: BLE001
+            logger.warning("MQ 观测发布调度失败，降级内存队列", exc_info=True)
+    return _enqueue_local_nowait(span_snapshot, record_type=record_type)
 
 
 def enqueue_log_nowait(log_snapshot: dict[str, Any]) -> bool:
@@ -691,6 +717,16 @@ def start_root_span(
     span_id = _new_span_id()
     do_sample = _should_sample() if sampled is None else sampled
     mode = content_capture_mode or getattr(settings, "CONTENT_CAPTURE_MODE", "metadata_only")
+    request_agent_id = None
+    request_agent_name = None
+    try:
+        from ..harness.context import get_tool_context
+
+        tool_context = get_tool_context()
+        request_agent_id = tool_context.agent_id
+        request_agent_name = tool_context.agent_name
+    except Exception:  # noqa: BLE001
+        pass
     ctx = TraceContext(
         trace_id=trace_id,
         root_span_id=span_id,
@@ -706,6 +742,8 @@ def start_root_span(
         links=tuple(links) if links else (),
         environment=settings.APP_ENV,
         service_name=settings.APP_NAME,
+        agent_id=request_agent_id,
+        agent_name=request_agent_name,
     )
     _current_context.set(ctx)
     handle = SpanHandle(
@@ -792,6 +830,8 @@ def record_child_span(
         "error": error,
         "request_id": ctx.request_id if ctx else None,
         "thread_id": ctx.thread_id if ctx else None,
+        "agent_id": ctx.agent_id if ctx else None,
+        "agent_name": ctx.agent_name if ctx else None,
         "cost_input": cost_input,
         "cost_output": cost_output,
         "cost_total": cost_total,

@@ -21,7 +21,27 @@ services:
     image: redis:7-alpine
     container_name: harness-redis
     ports:
-      - "6379:6379"
+      # 避免占用宿主机已有的本地 Redis（容器间仍使用 redis:6379）。
+      - "6380:6379"
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: harness-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: harness
+      RABBITMQ_DEFAULT_PASS: harness
+      RABBITMQ_DEFAULT_VHOST: /
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
 
   backend:
     build:
@@ -33,6 +53,9 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://harness:harness@postgres:5432/harness
       REDIS_URL: redis://redis:6379/0
+      MQ_ENABLED: "true"
+      RABBITMQ_URL: amqp://harness:harness@rabbitmq:5672/
+      RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
       APP_ENV: dev
     ports:
       - "8000:8000"
@@ -41,6 +64,56 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+      rabbitmq:
+        condition: service_healthy
+
+  obs-worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: harness-obs-worker
+    command: ["python", "-m", "app.workers.obs_worker"]
+    healthcheck:
+      disable: true
+    env_file:
+      - ../backend/.env.example
+    environment:
+      DATABASE_URL: postgresql+psycopg://harness:harness@postgres:5432/harness
+      REDIS_URL: redis://redis:6379/0
+      MQ_ENABLED: "true"
+      RABBITMQ_URL: amqp://harness:harness@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  session-worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: harness-session-worker
+    command: ["python", "-m", "app.workers.session_worker"]
+    healthcheck:
+      disable: true
+    env_file:
+      - ../backend/.env.example
+    environment:
+      DATABASE_URL: postgresql+psycopg://harness:harness@postgres:5432/harness
+      REDIS_URL: redis://redis:6379/0
+      MQ_ENABLED: "true"
+      RABBITMQ_URL: amqp://harness:harness@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
 
   frontend:
     build:
@@ -54,3 +127,4 @@ services:
 
 volumes:
   pgdata:
+  rabbitmqdata:

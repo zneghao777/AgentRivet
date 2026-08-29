@@ -110,12 +110,35 @@ async def audit(
         "request_id": request_id,
         "resource_id": resource_id,
     }
+    if _publish_mq_nowait(item):
+        return
+    await _enqueue_local(item)
+
+
+def _publish_mq_nowait(item: dict) -> bool:
+    """调度审计 MQ 发布；confirm 失败后回退原有审计队列。"""
+    try:
+        from ..config import settings
+        from ..mq.publisher import publish_nowait
+
+        if not settings.MQ_ENABLED or not settings.MQ_OBS_ENABLED:
+            return False
+        return publish_nowait(
+            "obs.audit", item, fallback=lambda: _enqueue_local(item)
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("MQ 审计发布调度失败，降级本地队列", exc_info=True)
+        return False
+
+
+async def _enqueue_local(item: dict) -> None:
+    """写入原有审计内存队列；队列满时同步落库。"""
     try:
         queue, _ = _loop_state()
         queue.put_nowait(item)
     except asyncio.QueueFull:
         # 溢出降级：同步写
-        logger.warning("审计队列已满，降级同步写入 action=%s", action)
+        logger.warning("审计队列已满，降级同步写入 action=%s", item["action"])
         if _db_factory is not None:
             async with _db_factory() as db:
                 await repo.add_audit(db, **item)

@@ -184,6 +184,8 @@ async def _run_trace_summary() -> None:
                     "request_id": getattr(root, "request_id", None),
                     "tenant_id": root.tenant_id,
                     "user_id": root.user_id,
+                    "agent_id": root.agent_id,
+                    "agent_name": root.agent_name,
                     "session_id": root.session_id,
                     "thread_id": getattr(root, "thread_id", None),
                     "name": root.span_name,
@@ -248,17 +250,15 @@ async def _run_hourly_aggregation() -> None:
             cost = sum(float(s.cost_total or 0) for s in spans)
             durations = [s.duration_ms for s in spans if s.duration_ms > 0]
             ttfts = [s.ttft_ms for s in spans if s.ttft_ms]
-            tool_calls = sum(
-                1
-                for s in await db.execute(
-                    select(AgentSpan).where(
-                        AgentSpan.tenant_id == tenant_id,
-                        AgentSpan.span_type == "tool",
-                        AgentSpan.started_at >= bucket,
-                        AgentSpan.started_at < bucket + timedelta(hours=1),
-                    )
-                ).scalars().all()
+            tool_result = await db.execute(
+                select(AgentSpan).where(
+                    AgentSpan.tenant_id == tenant_id,
+                    AgentSpan.span_type == "tool",
+                    AgentSpan.started_at >= bucket,
+                    AgentSpan.started_at < bucket + timedelta(hours=1),
+                )
             )
+            tool_calls = len(tool_result.scalars().all())
             await repo.upsert_metric_hourly(
                 db,
                 tenant_id=tenant_id,
