@@ -11,6 +11,8 @@ export interface SessionItem {
   thread_id: string;
   title: string | null;
   status: string;
+  agent_id: string | null;
+  agent?: { id: string; name: string; status: AgentStatus } | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -45,6 +47,8 @@ export interface HistoryMessage {
   trace_id: string | null;
   request_id: string | null;
   step_index: number | null;
+  agent_id: string | null;
+  agent_name: string | null;
   created_at: string | null;
 }
 
@@ -508,4 +512,81 @@ export interface MemorySettings {
   long_term_enabled: boolean;
   auto_extract: boolean;
   ttl_days: number;
+}
+
+// ---------- AgentHub ----------
+
+export type AgentStatus = "active" | "disabled" | "archived";
+export type AgentScope = "user" | "internal";
+
+export interface AgentBindingCounts {
+  skills: number;
+  tools: number;
+  mcp: number;
+  kbs: number;
+}
+
+export interface AgentBindings {
+  skills: Array<{ id: number; name: string; enabled: boolean; invalid: boolean }>;
+  tools: string[];
+  mcp_capabilities: Array<{ id: string; server_id: string; server_name: string; name: string; effective_name: string; enabled: boolean; invalid: boolean }>;
+  knowledge_bases: Array<{ id: string; name: string; enabled: boolean; invalid: boolean }>;
+}
+
+export interface AgentItem {
+  id: string;
+  name: string;
+  description: string;
+  system_prompt?: string | null;
+  model: string | null;
+  model_base_url: string | null;
+  memory_enabled: boolean;
+  scope: AgentScope;
+  status: AgentStatus;
+  bindings: AgentBindings;
+  binding_counts: AgentBindingCounts;
+  session_count: number;
+  last_used_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AgentListData {
+  items: AgentItem[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface AgentOptions {
+  skills: Array<{ id: number; name: string; description: string; enabled: boolean }>;
+  tools: ToolItem[];
+  mcp_servers: Array<{
+    server_id: string;
+    server_name: string;
+    enabled: boolean;
+    health_status: McpHealthStatus;
+    capabilities: Array<{ id: string; name: string; description: string; enabled: boolean }>;
+  }>;
+  knowledge_bases: Array<{ id: string; name: string; description: string | null }>;
+}
+
+export interface RouteDryRunResult {
+  mode: "direct" | "orchestrate";
+  target_agent: string;
+  confidence: number;
+  reason: string;
+  needs_clarification: boolean;
+  clarification_question?: string | null;
+  clarification_options: string[];
+  plan?: {
+    summary: string;
+    execution: "parallel" | "sequential";
+    tasks: Array<{
+      task_id: string;
+      target_agent: string;
+      goal: string;
+      constraints: string[];
+    }>;
+  } | null;
 }

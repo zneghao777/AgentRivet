@@ -1,9 +1,9 @@
 """图状态定义：基于 MessagesState 扩展。"""
 
+import operator
 from typing import Annotated
 
 from langgraph.graph import MessagesState
-from langgraph.graph.message import add_messages
 
 
 class HarnessState(MessagesState):
@@ -17,3 +17,22 @@ class HarnessState(MessagesState):
     interrupt_count: int = 0
     final_answer: str = ""
     memory_context: str = ""  # 对话前检索注入的用户长期记忆（MEMORY_SPEC §6.2）
+
+
+class SupervisorState(HarnessState):
+    """多 Agent 编排共享状态。"""
+
+    route: str = "main"
+    router_decision: dict = {}
+    plan: list[dict] = []
+    plan_summary: str = ""
+    execution: str = "parallel"
+    task: dict = {}
+    agent_outputs: Annotated[list[dict], operator.add] = []
+    verified_outputs: list[dict] = []
+    aggregated: dict = {}
+    clarification: dict = {}
+    orchestration_error: str = ""
+    session_id: str = ""
+    message_id: int | None = None
+    request_id: str = ""

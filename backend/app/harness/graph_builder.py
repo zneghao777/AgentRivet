@@ -21,6 +21,28 @@ from .state import HarnessState
 logger = logging.getLogger(__name__)
 
 
+def resolve_request_tools(tools: list) -> list:
+    """按 AgentHub 请求上下文收窄静态工具集。"""
+    ctx = get_tool_context()
+    skill_names = set(ctx.allowed_skill_names or [])
+    result = []
+    for tool in tools:
+        name = tool.name
+        if name.startswith("skill_"):
+            if ctx.allowed_skill_names is None:
+                result.append(tool)
+                continue
+            if any(name.startswith(f"skill_{skill_name}__") for skill_name in skill_names):
+                result.append(tool)
+            continue
+        if name == "memory_search" and not ctx.memory_enabled:
+            continue
+        if ctx.allowed_tool_names is not None and name not in ctx.allowed_tool_names:
+            continue
+        result.append(tool)
+    return result
+
+
 def should_continue(state: dict) -> str:
     """条件边：最后一条消息含 tool_calls → 进入 tools，否则结束。"""
     messages = state.get("messages", [])
@@ -42,7 +64,7 @@ def build_main_graph(tool_reg: ToolRegistry, *, checkpointer=None):
     def _agent(state: dict) -> dict:
         # 将工具注入 state，供 agent_node 读取
         dynamic_tools = get_tool_context().dynamic_tools or []
-        state["_tools"] = [*tools, *dynamic_tools]
+        state["_tools"] = [*resolve_request_tools(tools), *dynamic_tools]
         try:
             return agent_node(state)
         except Exception as exc:  # noqa: BLE001
@@ -54,9 +76,35 @@ def build_main_graph(tool_reg: ToolRegistry, *, checkpointer=None):
     g = StateGraph(HarnessState)
     g.add_node("agent", _agent)
 
+    _tools = make_tools_node(tools)
+
+    # 动态节点在运行时读取请求态 MCP tools；即使启动时没有静态工具也可工作。
+    g.add_node("tools", _tools)
+
+    g.add_edge(START, "agent")
+    g.add_conditional_edges("agent", should_continue, {"tools": "tools", "end": END})
+    g.add_edge("tools", "agent")
+
+    # HITL：审批类场景通过配置开启 interruptBefore（默认关闭）
+    interrupt_before = ["tools"] if settings.GRAPH_INTERRUPT_TOOLS else None
+
+    return g.compile(
+        checkpointer=checkpointer,
+        interrupt_before=interrupt_before,
+    )
+
+
+def make_tools_node(tools: list):
+    """构造运行期按 ToolContext 收窄能力的工具节点。"""
+
     async def _tools(state: dict) -> dict:
+        state_tools = state.get("_tools") or []
         available = {
-            tool.name: tool for tool in [*tools, *(get_tool_context().dynamic_tools or [])]
+            tool.name: tool
+            for tool in [
+                *(state_tools or resolve_request_tools(tools)),
+                *(get_tool_context().dynamic_tools or []),
+            ]
         }
         messages = state.get("messages", [])
         calls = getattr(messages[-1], "tool_calls", []) if messages else []
@@ -101,17 +149,4 @@ def build_main_graph(tool_reg: ToolRegistry, *, checkpointer=None):
                 )
         return {"messages": results}
 
-    # 动态节点在运行时读取请求态 MCP tools；即使启动时没有静态工具也可工作。
-    g.add_node("tools", _tools)
-
-    g.add_edge(START, "agent")
-    g.add_conditional_edges("agent", should_continue, {"tools": "tools", "end": END})
-    g.add_edge("tools", "agent")
-
-    # HITL：审批类场景通过配置开启 interruptBefore（默认关闭）
-    interrupt_before = ["tools"] if settings.GRAPH_INTERRUPT_TOOLS else None
-
-    return g.compile(
-        checkpointer=checkpointer,
-        interrupt_before=interrupt_before,
-    )
+    return _tools

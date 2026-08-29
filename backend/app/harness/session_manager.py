@@ -32,6 +32,7 @@ class SessionManager:
         tenant_id: str,
         user_id: str,
         title: str | None = None,
+        agent_id: uuid.UUID | None = None,
     ) -> dict:
         thread_id = gen_thread_id()
         session = await repo.create_session(
@@ -40,12 +41,14 @@ class SessionManager:
             tenant_id=tenant_id,
             user_id=user_id,
             title=title,
+            agent_id=agent_id,
         )
         return {
             "session_id": str(session.id),
             "thread_id": session.thread_id,
             "title": session.title,
             "status": session.status,
+            "agent_id": str(session.agent_id) if session.agent_id else None,
             "created_at": session.created_at.isoformat() if session.created_at else None,
             "updated_at": session.updated_at.isoformat() if session.updated_at else None,
         }
@@ -80,6 +83,7 @@ class SessionManager:
                 "thread_id": s.thread_id,
                 "title": title,
                 "status": s.status,
+                "agent_id": str(s.agent_id) if s.agent_id else None,
                 "created_at": s.created_at.isoformat() if s.created_at else None,
                 "updated_at": s.updated_at.isoformat() if s.updated_at else None,
             })
@@ -89,6 +93,18 @@ class SessionManager:
         self, db: AsyncSession, session_id: uuid.UUID, limit: int = 100
     ) -> list[dict]:
         msgs = await repo.list_messages(db, session_id, limit=limit)
+        agent_ids = {m.agent_id for m in msgs if m.agent_id is not None}
+        names: dict[uuid.UUID, str] = {}
+        if agent_ids:
+            from sqlalchemy import select
+
+            from ..storage.models import Agent
+
+            names = dict(
+                (
+                    await db.execute(select(Agent.id, Agent.name).where(Agent.id.in_(agent_ids)))
+                ).all()
+            )
         return [
             {
                 "id": m.id,
@@ -99,6 +115,8 @@ class SessionManager:
                 "trace_id": m.trace_id,
                 "request_id": m.request_id,
                 "step_index": m.step_index,
+                "agent_id": str(m.agent_id) if m.agent_id else None,
+                "agent_name": names.get(m.agent_id) if m.agent_id else None,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
             }
             for m in msgs

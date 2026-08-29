@@ -4,16 +4,24 @@ import ContextPanel from "@/components/layout/ContextPanel";
 import { getData } from "@/api/http";
 import { getTraceEvents } from "@/api/observability";
 import { useSessionStore } from "@/stores/sessionStore";
-import type { HistoryMessage, SkillItem } from "@/types/api";
+import type { AgentItem, AgentListData, HistoryMessage, SkillItem } from "@/types/api";
 import { traceEventsToChatRun } from "@/utils/chatRun";
 
 export default function ChatPage() {
   const { sessions, currentSessionId, setCurrentSession } = useSessionStore();
   const [skills, setSkills] = useState<SkillItem[]>([]);
+  const [agents, setAgents] = useState<AgentItem[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(false);
 
   useEffect(() => {
-    getData<SkillItem[]>("/skills").then(setSkills).catch(() => undefined);
+    Promise.all([
+      getData<SkillItem[]>("/skills"),
+      getData<AgentListData>("/agents?status=active&scope=user&page=1&page_size=100")
+        .catch(() => ({ items: [], total: 0, page: 1, page_size: 100 })),
+    ]).then(([skillRows, agentRows]) => {
+      setSkills(skillRows);
+      setAgents(agentRows.items);
+    }).catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -43,6 +51,8 @@ export default function ChatPage() {
           run: message.role === "assistant" && message.trace_id
             ? runByTrace.get(message.trace_id) ?? undefined
             : undefined,
+          agentId: message.agent_id ?? undefined,
+          agentName: message.agent_name ?? undefined,
         })));
       })
       .catch((error) => {
@@ -59,7 +69,7 @@ export default function ChatPage() {
   return (
     <div className="chat-layout">
       <section className="chat-panel">
-        {messagesLoading ? <div className="history-loading"><span className="material-symbols-rounded">progress_activity</span>正在加载会话…</div> : <ChatWindow skills={skills} />}
+        {messagesLoading ? <div className="history-loading"><span className="material-symbols-rounded">progress_activity</span>正在加载会话…</div> : <ChatWindow skills={skills} agents={agents} />}
       </section>
       <ContextPanel />
     </div>

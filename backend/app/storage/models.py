@@ -21,7 +21,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from ..config import settings
@@ -61,6 +61,10 @@ class Session(Base):
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="active"
     )  # active / completed / interrupted / deleted
+    # AgentHub 会话绑定；不加外键以保留 Agent 归档后的历史审计引用。
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -87,6 +91,10 @@ class Message(Base):
     request_id: Mapped[str | None] = mapped_column(String(128), index=True)
     turn_index: Mapped[int | None] = mapped_column(Integer)
     step_index: Mapped[int | None] = mapped_column(Integer)
+    # 记录生成该条助手消息时实际解析到的 Agent。
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -104,6 +112,151 @@ class Skill(Base):
     tags: Mapped[list | None] = mapped_column(JSON)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     loaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class Agent(Base):
+    """租户内可配置的 Agent 定义（AGENT_HUB_SPEC）。"""
+
+    __tablename__ = "agents"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_agent_tenant_name"),
+        Index("ix_agent_tenant_status", "tenant_id", "status"),
+        CheckConstraint("scope IN ('user', 'internal')", name="ck_agent_scope"),
+        CheckConstraint(
+            "status IN ('active', 'disabled', 'archived')",
+            name="ck_agent_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    system_prompt: Mapped[str | None] = mapped_column(Text)
+    model: Mapped[str | None] = mapped_column(String(128))
+    model_base_url: Mapped[str | None] = mapped_column(String(2048))
+    memory_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    scope: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_by: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class AgentSkillBinding(Base):
+    __tablename__ = "agent_skill_bindings"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "skill_id", name="uq_agent_skill_binding"),
+        Index("ix_agent_skill_binding_agent", "agent_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE")
+    )
+    skill_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("skills.id", ondelete="CASCADE")
+    )
+
+
+class AgentToolBinding(Base):
+    __tablename__ = "agent_tool_bindings"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "tool_name", name="uq_agent_tool_binding"),
+        Index("ix_agent_tool_binding_agent", "agent_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE")
+    )
+    tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
+
+
+class AgentMcpBinding(Base):
+    __tablename__ = "agent_mcp_bindings"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "capability_id", name="uq_agent_mcp_binding"),
+        Index("ix_agent_mcp_binding_agent", "agent_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE")
+    )
+    capability_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("mcp_capabilities.id", ondelete="CASCADE"),
+    )
+
+
+class AgentKbBinding(Base):
+    __tablename__ = "agent_kb_bindings"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "kb_id", name="uq_agent_kb_binding"),
+        Index("ix_agent_kb_binding_agent", "agent_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE")
+    )
+    kb_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+    )
+
+
+class AgentTask(Base):
+    """一次多 Agent 委派任务的持久化快照。"""
+
+    __tablename__ = "agent_tasks"
+    __table_args__ = (
+        Index("ix_agent_tasks_task_id", "task_id"),
+        Index("ix_agent_tasks_parent_task_id", "parent_task_id"),
+        Index("ix_agent_tasks_session_created", "session_id", "created_at"),
+        Index("ix_agent_tasks_trace_id", "trace_id"),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'done', 'failed')",
+            name="ck_agent_task_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    task_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    parent_task_id: Mapped[str | None] = mapped_column(String(32))
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("sessions.id"), nullable=False
+    )
+    message_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("messages.id"), nullable=True
+    )
+    target_agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True
+    )
+    target_agent_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    goal: Mapped[str] = mapped_column(Text, nullable=False)
+    context_brief: Mapped[str | None] = mapped_column(Text)
+    constraints: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    expected_output: Mapped[str | None] = mapped_column(Text)
+    artifacts: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    result: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    trace_id: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
@@ -185,6 +338,7 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
     __table_args__ = (
         Index("ix_audit_logs_tenant_created", "tenant_id", "created_at"),
+        Index("uq_audit_logs_mq_message_id", "mq_message_id", unique=True),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -200,6 +354,22 @@ class AuditLog(Base):
     trace_id: Mapped[str | None] = mapped_column(String(64))
     request_id: Mapped[str | None] = mapped_column(String(128))
     resource_id: Mapped[str | None] = mapped_column(String(128))
+    mq_message_id: Mapped[str | None] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+
+
+class MQProcessedMessage(Base):
+    """MQ 消费幂等凭据；Redis 不可用时作为持久化降级。"""
+
+    __tablename__ = "mq_processed_messages"
+
+    message_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    message_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="processing")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -246,8 +416,9 @@ class KnowledgeBase(Base):
         String(16), nullable=False, default="disabled"
     )
     graph_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    graph_meta: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    settings: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # JSONB:与启动迁移 SQL 的 jsonb 运算符保持一致(db.py 使用 || 拼接)
+    graph_meta: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    settings: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     # active / deleted
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(
@@ -473,6 +644,10 @@ class AgentSpan(Base):
     )
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
     user_id: Mapped[str | None] = mapped_column(String(64))
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True, index=True
+    )
+    agent_name: Mapped[str | None] = mapped_column(String(128))
     span_name: Mapped[str] = mapped_column(String(255), nullable=False)
     span_type: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="ok")
@@ -579,6 +754,10 @@ class AgentTrace(Base):
     request_id: Mapped[str | None] = mapped_column(String(128))
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     user_id: Mapped[str | None] = mapped_column(String(64))
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=True, index=True
+    )
+    agent_name: Mapped[str | None] = mapped_column(String(128))
     session_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True))
     thread_id: Mapped[str | None] = mapped_column(String(64))
     name: Mapped[str] = mapped_column(String(128), nullable=False, default="agent.run")
@@ -615,6 +794,7 @@ class ObservabilityLog(Base):
         Index("ix_obslog_trace", "trace_id"),
         Index("ix_obslog_span", "span_id"),
         Index("ix_obslog_severity", "severity_number"),
+        Index("uq_observability_logs_mq_message_id", "mq_message_id", unique=True),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -639,6 +819,7 @@ class ObservabilityLog(Base):
     exception_message: Mapped[str | None] = mapped_column(Text)
     stacktrace: Mapped[str | None] = mapped_column(Text)
     attributes: Mapped[dict | None] = mapped_column(JSON)
+    mq_message_id: Mapped[str | None] = mapped_column(String(36))
 
 
 class ModelPriceVersion(Base):

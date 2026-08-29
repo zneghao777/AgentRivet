@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 # ---------- 通用响应包装 ----------
 
@@ -26,6 +26,18 @@ class ApiError(BaseModel):
 
 class SessionCreateRequest(BaseModel):
     title: str | None = None
+    agent_id: str | None = None
+
+
+class SessionUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=128)
+    agent_id: str | None = None
+
+
+class AgentSummaryResponse(BaseModel):
+    id: str
+    name: str
+    status: str
 
 
 class SessionResponse(BaseModel):
@@ -33,6 +45,8 @@ class SessionResponse(BaseModel):
     thread_id: str
     title: str | None = None
     status: str
+    agent_id: str | None = None
+    agent: AgentSummaryResponse | None = None
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -52,6 +66,13 @@ class CapabilityRefRequest(BaseModel):
     id: str
 
 
+class ModelRuntimeConfigRequest(BaseModel):
+    """仅用于本次模型调用；供应商密钥不持久化、不进入观测字段。"""
+
+    base_url: str = Field(min_length=1, max_length=2048)
+    api_key: SecretStr | None = Field(default=None, max_length=4096)
+
+
 class MessageSendRequest(BaseModel):
     message: str = Field(min_length=1)
     skills: list[str] | None = None  # 本次会话使用的 Skill 白名单
@@ -63,7 +84,9 @@ class MessageSendRequest(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9._:/-]+$",
     )
+    provider_config: ModelRuntimeConfigRequest | None = None
     attachment_ids: list[str] | None = None
+    agent_id: str | None = None
 
 
 class MessageStreamRequest(BaseModel):
@@ -77,7 +100,9 @@ class MessageStreamRequest(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9._:/-]+$",
     )
+    provider_config: ModelRuntimeConfigRequest | None = None
     attachment_ids: list[str] | None = None
+    agent_id: str | None = None
 
 
 class MessageResponse(BaseModel):
@@ -95,6 +120,7 @@ class ModelConnectionTestRequest(BaseModel):
         pattern=r"^[A-Za-z0-9._:/-]+$",
     )
     base_url: str | None = Field(default=None, max_length=2048)
+    api_key: SecretStr | None = Field(default=None, max_length=4096)
 
 
 class HistoryMessage(BaseModel):
@@ -106,7 +132,48 @@ class HistoryMessage(BaseModel):
     trace_id: str | None = None
     request_id: str | None = None
     step_index: int | None = None
+    agent_id: str | None = None
+    agent_name: str | None = None
     created_at: str | None = None
+
+
+# ---------- AgentHub ----------
+
+
+class AgentCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    description: str = Field(min_length=1, max_length=2000)
+    system_prompt: str | None = Field(default=None, max_length=20000)
+    model: str | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9._:/-]+$", max_length=128
+    )
+    model_base_url: str | None = Field(default=None, max_length=2048)
+    memory_enabled: bool = True
+    scope: Literal["user", "internal"] = "user"
+
+
+class AgentUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    description: str | None = Field(default=None, min_length=1, max_length=2000)
+    system_prompt: str | None = Field(default=None, max_length=20000)
+    model: str | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9._:/-]+$", max_length=128
+    )
+    model_base_url: str | None = Field(default=None, max_length=2048)
+    memory_enabled: bool | None = None
+    scope: Literal["user", "internal"] | None = None
+    status: Literal["active", "disabled"] | None = None
+
+
+class AgentBindingIdsRequest(BaseModel):
+    skill_ids: list[int] | None = None
+    tool_names: list[str] | None = None
+    capability_ids: list[str] | None = None
+    kb_ids: list[str] | None = None
+
+
+class RouteDryRunRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=10000)
 
 
 class ResumeRequest(BaseModel):

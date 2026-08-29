@@ -9,6 +9,7 @@ const KnowledgeCenterPage = lazy(() => import("@/pages/KnowledgeCenterPage"));
 const KnowledgeDetailPage = lazy(() => import("@/pages/KnowledgeDetailPage"));
 const MemoryPage = lazy(() => import("@/pages/MemoryPage"));
 const SkillsPage = lazy(() => import("@/pages/SkillsPage"));
+const AgentHubPage = lazy(() => import("@/pages/AgentHubPage"));
 const SettingsPage = lazy(() => import("@/pages/SettingsPage"));
 const ObservabilityPage = lazy(() => import("@/pages/observability/ObservabilityPage"));
 const TraceDetailPage = lazy(() => import("@/pages/observability/TraceDetailPage"));
@@ -40,6 +41,7 @@ export default function App() {
           {/* Trace 详情保留为独立路由（从运行记录跳转进入） */}
           <Route path="/observability/traces/:id" element={<TraceDetailPage />} />
           <Route path="/skills" element={<SkillsPage />} />
+          <Route path="/agents" element={<AgentHubPage />} />
           <Route path="/knowledge" element={<KnowledgeCenterPage />} />
           <Route path="/knowledge/:kbId" element={<KnowledgeDetailPage />} />
           <Route path="/memory" element={<MemoryPage />} />

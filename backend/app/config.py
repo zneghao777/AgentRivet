@@ -38,6 +38,20 @@ class Settings(BaseSettings):
     # --- 缓存 ---
     REDIS_URL: str | None = None
 
+    # --- 消息队列（MQ_INTEGRATION_SPEC）---
+    MQ_ENABLED: bool = False
+    RABBITMQ_URL: str = "amqp://harness:harness@localhost:5672/"
+    MQ_CONFIRM_TIMEOUT_S: float = 2.0
+    MQ_PREFETCH: int = 200
+    MQ_OBS_ENABLED: bool = True
+    MQ_SESSION_ENABLED: bool = True
+    MQ_SESSION_MAX_RETRIES: int = 3
+    MQ_RETRY_TTLS_MS: str = "5000,30000,120000"
+    MQ_DEDUPE_TTL_S: int = 86400
+    MQ_DEADLETTER_ALERT_ENABLED: bool = True
+    RABBITMQ_MANAGEMENT_URL: str = "http://localhost:15672"
+    MQ_MONITOR_INTERVAL_S: int = 60
+
     # --- LangGraph ---
     CHECKPOINT_SAVE_MODE: str = "async"  # exit / async / sync
     GRAPH_RECURSION_LIMIT: int = 25
@@ -101,8 +115,23 @@ class Settings(BaseSettings):
     MCP_SECRET_KEY: str = ""
     MCP_ALLOWED_HOSTS: str = ""
 
-    # --- 多 Agent ---
+    # --- 多 Agent 编排（MULTI_AGENT_ORCH）---
     MULTI_AGENT_ENABLED: bool = False
+    ROUTER_CONFIDENCE_THRESHOLD: float = 0.5
+    SUPERVISOR_MODEL: str | None = None
+    MAX_PARALLEL_WORKERS: int = 5
+    PLAN_MAX_TASKS: int = 5
+    WORKER_TIMEOUT_SECONDS: float = 120.0
+    WORKER_RETRY: int = 1
+    VERIFIER_LLM_ENABLED: bool = False
+    AGENT_CIRCUIT_BREAKER_THRESHOLD: int = 3
+    AGENT_CIRCUIT_BREAKER_COOLDOWN: int = 600
+    PLAN_CONFIRM_ENABLED: bool = False
+
+    # --- AgentHub（AGENT_HUB_SPEC）---
+    AGENT_HUB_ENABLED: bool = True
+    AGENT_MAX_PER_TENANT: int = 50
+    AGENT_SYSTEM_PROMPT_MAX_CHARS: int = 20_000
 
     # --- RAG / 向量检索（BGE-M3 本地，1024 维）---
     EMBEDDING_MODEL: str = "text-embedding-bge-m3"
@@ -204,6 +233,19 @@ class Settings(BaseSettings):
     def api_keys_list(self) -> list[str]:
         """解析后的合法 API Key 列表。"""
         return [k.strip() for k in self.API_KEYS.split(",") if k.strip()]
+
+    @property
+    def mq_retry_ttls_ms_list(self) -> list[int]:
+        """解析会话任务的分级重试 TTL，并过滤非法值。"""
+        values: list[int] = []
+        for value in self.MQ_RETRY_TTLS_MS.split(","):
+            try:
+                parsed = int(value.strip())
+            except ValueError:
+                continue
+            if parsed > 0:
+                values.append(parsed)
+        return values or [5000, 30000, 120000]
 
     @property
     def langsmith_project(self) -> str:

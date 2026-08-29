@@ -33,19 +33,34 @@ SYSTEM_PROMPT_TEMPLATE = """你是企业级 Agent Harness 底座中的通用助�
 """
 
 
-def create_llm(model_id: str | None = None) -> BaseChatModel:
+def create_llm(
+    model_id: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    temperature: float | None = None,
+) -> BaseChatModel:
     """创建 OpenAI 兼容 LLM。"""
+    request_context = get_tool_context()
+    if api_key is not None:
+        resolved_api_key = api_key
+    elif request_context.model_api_key is not None:
+        resolved_api_key = request_context.model_api_key
+    else:
+        resolved_api_key = settings.LLM_API_KEY
     return ChatOpenAI(
-        model=model_id or settings.LLM_MODEL,
-        base_url=settings.LLM_BASE_URL,
-        api_key=settings.LLM_API_KEY,
-        temperature=settings.LLM_TEMPERATURE,
+        model=model_id or request_context.model_id or settings.LLM_MODEL,
+        base_url=base_url or request_context.model_base_url or settings.LLM_BASE_URL,
+        # OpenAI SDK 要求凭据非空；本地无鉴权服务使用无敏感性的占位值。
+        api_key=resolved_api_key or "not-needed",
+        temperature=settings.LLM_TEMPERATURE if temperature is None else temperature,
         max_tokens=settings.LLM_MAX_TOKENS,
     )
 
 
 def build_system_prompt(
-    skill_names: list[str], memory_context: str | None = None
+    skill_names: list[str],
+    memory_context: str | None = None,
+    agent_system_prompt: str | None = None,
 ) -> str:
     """根据已加载的 Skill 构建 system prompt。
 
@@ -68,22 +83,38 @@ def build_system_prompt(
                 bodies.append(f"### Skill: {skill.name}\n{skill.body_md}")
 
     memory_block = memory_context.strip() if memory_context else "（无已检索到的长期记忆）"
-    return SYSTEM_PROMPT_TEMPLATE.format(
+    default_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         skill_descriptions="\n".join(descriptions)
         or "（无已加载 Skill）",
         skill_bodies="\n\n".join(bodies) or "（无）",
         memory_context=memory_block,
+    )
+    if not agent_system_prompt:
+        return default_prompt
+    return (
+        "# Agent 身份与任务边界\n"
+        f"{agent_system_prompt.strip()}\n\n"
+        "--- 默认 Harness 能力与安全边界（始终生效） ---\n"
+        f"{default_prompt}"
     )
 
 
 def agent_node(state: dict) -> dict:
     """主 Agent 节点：调用 LLM（bind_tools）生成回复或工具调用。"""
     request_context = get_tool_context()
-    llm = state.get("_llm") or create_llm(request_context.model_id)
+    llm = state.get("_llm") or create_llm(
+        request_context.model_id,
+        request_context.model_base_url,
+        request_context.model_api_key,
+    )
     messages = state.get("messages", [])
     skill_names = state.get("skill_loaded", [])
     memory_context = state.get("memory_context")
-    system_prompt = build_system_prompt(skill_names, memory_context)
+    system_prompt = build_system_prompt(
+        skill_names,
+        memory_context,
+        request_context.agent_system_prompt,
+    )
 
     tools = state.get("_tools", [])
     llm_with_tools = llm.bind_tools(tools) if tools else llm

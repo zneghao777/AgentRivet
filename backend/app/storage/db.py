@@ -42,6 +42,31 @@ async def create_tables() -> None:
         # 确保 pgvector 扩展存在
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
+        # MQ 消费幂等：旧库补消息键；唯一索引封住“DB 已提交但 ack 前崩溃”的重复窗口。
+        for ddl in (
+            "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS mq_message_id VARCHAR(36)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_audit_logs_mq_message_id "
+            "ON audit_logs (mq_message_id)",
+            "ALTER TABLE observability_logs ADD COLUMN IF NOT EXISTS mq_message_id VARCHAR(36)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_observability_logs_mq_message_id "
+            "ON observability_logs (mq_message_id)",
+        ):
+            await conn.execute(text(ddl))
+        # AgentHub：旧库补会话/消息归属与观测字段；Agent 定义及绑定表由
+        # create_all 创建。历史引用刻意不添加外键，归档后仍可审计。
+        for ddl in (
+            "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS agent_id UUID",
+            "CREATE INDEX IF NOT EXISTS ix_sessions_agent_id ON sessions (agent_id)",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS agent_id UUID",
+            "CREATE INDEX IF NOT EXISTS ix_messages_agent_id ON messages (agent_id)",
+            "ALTER TABLE agent_spans ADD COLUMN IF NOT EXISTS agent_id UUID",
+            "ALTER TABLE agent_spans ADD COLUMN IF NOT EXISTS agent_name VARCHAR(128)",
+            "CREATE INDEX IF NOT EXISTS ix_agent_spans_agent_id ON agent_spans (agent_id)",
+            "ALTER TABLE agent_traces ADD COLUMN IF NOT EXISTS agent_id UUID",
+            "ALTER TABLE agent_traces ADD COLUMN IF NOT EXISTS agent_name VARCHAR(128)",
+            "CREATE INDEX IF NOT EXISTS ix_agent_traces_agent_id ON agent_traces (agent_id)",
+        ):
+            await conn.execute(text(ddl))
         # 向量维度迁移：旧库 embedding 为 1536 维（OpenAI），BGE-M3 为 1024 维。
         # 维度不匹配时 drop 重加（开发底座可接受，生产用迁移脚本）。
         dim = settings.EMBEDDING_DIM
@@ -119,6 +144,15 @@ async def create_tables() -> None:
             "(tenant_id, kb_id, COALESCE(doc_id, 0), job_type) WHERE status IN ('queued', 'running')",
         ):
             await conn.execute(text(ddl))
+        # 兼容旧库：graph_meta / settings 早期为 json 类型，而下方统计 SQL 使用
+        # jsonb 运算符(||、jsonb_build_object)。已有 json 列需幂等迁移为 jsonb。
+        for _col in ("graph_meta", "settings"):
+            await conn.execute(
+                text(
+                    f"ALTER TABLE knowledge_bases ALTER COLUMN {_col} "
+                    "TYPE JSONB USING " + _col + "::jsonb"
+                )
+            )
         # 非破坏回填：已有图数据的库保留为图谱增强，其他库按标准模式处理。
         await conn.execute(
             text(

@@ -9,9 +9,15 @@ from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import (
+    Agent,
+    AgentKbBinding,
+    AgentMcpBinding,
     AgentMetricsDaily,
     AgentMetricsHourly,
+    AgentSkillBinding,
     AgentSpan,
+    AgentTask,
+    AgentToolBinding,
     AgentTrace,
     AlertIncident,
     AlertRule,
@@ -36,12 +42,14 @@ async def create_session(
     tenant_id: str,
     user_id: str,
     title: str | None = None,
+    agent_id: uuid.UUID | None = None,
 ) -> Session:
     session = Session(
         thread_id=thread_id,
         tenant_id=tenant_id,
         user_id=user_id,
         title=title,
+        agent_id=agent_id,
         status="active",
     )
     db.add(session)
@@ -114,6 +122,31 @@ async def set_session_title(
     await db.commit()
 
 
+async def set_session_agent(
+    db: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+    tenant_id: str,
+    agent_id: uuid.UUID | None,
+) -> Session | None:
+    session = (
+        await db.execute(
+            select(Session).where(
+                Session.id == session_id,
+                Session.tenant_id == tenant_id,
+                Session.status != "deleted",
+            )
+        )
+    ).scalar_one_or_none()
+    if session is None:
+        return None
+    session.agent_id = agent_id
+    session.updated_at = datetime.now(UTC)
+    await db.commit()
+    await db.refresh(session)
+    return session
+
+
 # ---------- Message ----------
 
 
@@ -130,6 +163,7 @@ async def add_message(
     request_id: str | None = None,
     turn_index: int | None = None,
     step_index: int | None = None,
+    agent_id: uuid.UUID | None = None,
 ) -> Message:
     msg = Message(
         session_id=session_id,
@@ -142,6 +176,7 @@ async def add_message(
         request_id=request_id,
         turn_index=turn_index,
         step_index=step_index,
+        agent_id=agent_id,
     )
     db.add(msg)
     # 写入消息视为会话活跃：同步刷新会话的 updated_at，
@@ -183,6 +218,279 @@ async def list_messages(
         .limit(limit)
     )
     return list(result.scalars().all())
+
+
+# ---------- AgentHub ----------
+
+
+class AgentRepository:
+    """租户隔离的 Agent 定义与绑定仓储。"""
+
+    _binding_models = {
+        "skills": (AgentSkillBinding, "skill_id"),
+        "tools": (AgentToolBinding, "tool_name"),
+        "mcp": (AgentMcpBinding, "capability_id"),
+        "kbs": (AgentKbBinding, "kb_id"),
+    }
+
+    async def create(self, db: AsyncSession, row: Agent) -> Agent:
+        db.add(row)
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        await db.refresh(row)
+        return row
+
+    async def get(
+        self, db: AsyncSession, *, tenant_id: str, agent_id: uuid.UUID
+    ) -> Agent | None:
+        return (
+            await db.execute(
+                select(Agent).where(Agent.id == agent_id, Agent.tenant_id == tenant_id)
+            )
+        ).scalar_one_or_none()
+
+    async def get_by_name(
+        self, db: AsyncSession, *, tenant_id: str, name: str
+    ) -> Agent | None:
+        return (
+            await db.execute(
+                select(Agent).where(Agent.tenant_id == tenant_id, Agent.name == name)
+            )
+        ).scalar_one_or_none()
+
+    async def list(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        query: str | None = None,
+        status: str | None = None,
+        scope: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> tuple[list[Agent], int]:
+        filters = [Agent.tenant_id == tenant_id, Agent.status != "archived"]
+        if query:
+            pattern = f"%{query.strip()}%"
+            filters.append((Agent.name.ilike(pattern)) | (Agent.description.ilike(pattern)))
+        if status:
+            filters.append(Agent.status == status)
+        if scope:
+            filters.append(Agent.scope == scope)
+        total = (await db.execute(select(func.count(Agent.id)).where(*filters))).scalar_one()
+        rows = list(
+            (
+                await db.execute(
+                    select(Agent)
+                    .where(*filters)
+                    .order_by(Agent.updated_at.desc())
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                )
+            ).scalars().all()
+        )
+        return rows, total
+
+    async def update(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        agent_id: uuid.UUID,
+        values: dict,
+    ) -> Agent | None:
+        row = await self.get(db, tenant_id=tenant_id, agent_id=agent_id)
+        if row is None:
+            return None
+        for key, value in values.items():
+            setattr(row, key, value)
+        row.updated_at = datetime.now(UTC)
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        await db.refresh(row)
+        return row
+
+    async def archive(
+        self, db: AsyncSession, *, tenant_id: str, agent_id: uuid.UUID
+    ) -> Agent | None:
+        return await self.update(
+            db,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            values={"status": "archived"},
+        )
+
+    async def hard_delete(
+        self, db: AsyncSession, *, tenant_id: str, agent_id: uuid.UUID
+    ) -> bool:
+        row = await self.get(db, tenant_id=tenant_id, agent_id=agent_id)
+        if row is None:
+            return False
+        await db.delete(row)
+        await db.commit()
+        return True
+
+    async def count_by_tenant(self, db: AsyncSession, tenant_id: str) -> int:
+        return (
+            await db.execute(
+                select(func.count(Agent.id)).where(
+                    Agent.tenant_id == tenant_id, Agent.status != "archived"
+                )
+            )
+        ).scalar_one()
+
+    async def replace_bindings(
+        self,
+        db: AsyncSession,
+        *,
+        agent_id: uuid.UUID,
+        kind: str,
+        ids: list[int | str | uuid.UUID],
+    ) -> None:
+        if kind not in self._binding_models:
+            raise ValueError(f"unsupported binding kind: {kind}")
+        model, value_field = self._binding_models[kind]
+        await db.execute(delete(model).where(model.agent_id == agent_id))
+        for value in dict.fromkeys(ids):
+            db.add(model(agent_id=agent_id, **{value_field: value}))
+        await db.commit()
+
+    async def binding_values(
+        self, db: AsyncSession, *, agent_id: uuid.UUID, kind: str
+    ) -> list:
+        model, value_field = self._binding_models[kind]
+        column = getattr(model, value_field)
+        return list(
+            (
+                await db.execute(select(column).where(model.agent_id == agent_id))
+            ).scalars().all()
+        )
+
+    async def list_sessions_referencing(
+        self, db: AsyncSession, agent_id: uuid.UUID
+    ) -> list[Session]:
+        return list(
+            (
+                await db.execute(select(Session).where(Session.agent_id == agent_id))
+            ).scalars().all()
+        )
+
+
+agent_repository = AgentRepository()
+
+
+# ---------- Multi-Agent orchestration ----------
+
+
+async def start_agent_task(
+    db: AsyncSession,
+    *,
+    task: dict,
+    session_id: uuid.UUID,
+    message_id: int | None,
+    target_agent_id: uuid.UUID | None,
+    trace_id: str | None,
+) -> AgentTask:
+    """创建任务行；Verifier 重派时复用同一 task_id。"""
+    row = (
+        await db.execute(
+            select(AgentTask).where(
+                AgentTask.session_id == session_id,
+                AgentTask.task_id == task["task_id"],
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = AgentTask(
+            task_id=task["task_id"],
+            parent_task_id=task.get("parent_task_id"),
+            session_id=session_id,
+            message_id=message_id,
+            target_agent_id=target_agent_id,
+            target_agent_name=task["target_agent"],
+            goal=task["goal"],
+            context_brief=task.get("context_brief"),
+            constraints=task.get("constraints") or [],
+            expected_output=task.get("expected_output"),
+            artifacts=task.get("artifacts") or [],
+            status="running",
+            trace_id=trace_id,
+        )
+        db.add(row)
+    else:
+        row.status = "running"
+        row.result = None
+        row.error = None
+        row.duration_ms = None
+        row.trace_id = trace_id or row.trace_id
+        row.updated_at = datetime.now(UTC)
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def finish_agent_task(
+    db: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+    task_id: str,
+    status: str,
+    result: str | None,
+    error: str | None,
+    duration_ms: int,
+) -> AgentTask | None:
+    row = (
+        await db.execute(
+            select(AgentTask).where(
+                AgentTask.session_id == session_id,
+                AgentTask.task_id == task_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    row.status = status
+    row.result = result
+    row.error = error
+    row.duration_ms = duration_ms
+    row.updated_at = datetime.now(UTC)
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def list_agent_tasks(
+    db: AsyncSession, *, session_id: uuid.UUID
+) -> list[AgentTask]:
+    return list(
+        (
+            await db.execute(
+                select(AgentTask)
+                .where(AgentTask.session_id == session_id)
+                .order_by(AgentTask.created_at.asc(), AgentTask.task_id.asc())
+            )
+        ).scalars().all()
+    )
+
+
+async def fail_running_agent_tasks(db: AsyncSession) -> int:
+    result = await db.execute(
+        update(AgentTask)
+        .where(AgentTask.status == "running")
+        .values(
+            status="failed",
+            error="process_restarted",
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db.commit()
+    return int(result.rowcount or 0)
 
 
 # ---------- Skill ----------
@@ -249,6 +557,7 @@ async def add_audit(
     trace_id: str | None = None,
     request_id: str | None = None,
     resource_id: str | None = None,
+    mq_message_id: str | None = None,
 ) -> AuditLog:
     log = AuditLog(
         tenant_id=tenant_id,
@@ -260,6 +569,7 @@ async def add_audit(
         trace_id=trace_id,
         request_id=request_id,
         resource_id=resource_id,
+        mq_message_id=mq_message_id,
     )
     db.add(log)
     await db.commit()
@@ -370,6 +680,8 @@ async def bulk_upsert_spans(db: AsyncSession, items: list[dict]) -> int:
                 session_id=item.get("session_id"),
                 tenant_id=item.get("tenant_id", "default"),
                 user_id=item.get("user_id"),
+                agent_id=item.get("agent_id"),
+                agent_name=item.get("agent_name"),
                 span_name=item.get("span_name", ""),
                 span_type=item.get("span_type", "internal"),
                 status=item.get("status", "ok"),
@@ -644,7 +956,7 @@ async def query_traces_v2(
     if f.get("user_id"):
         stmt = stmt.where(AgentTrace.user_id == f["user_id"])
     if f.get("agent_name"):
-        stmt = stmt.where(AgentTrace.name == f["agent_name"])
+        stmt = stmt.where(AgentTrace.agent_name == f["agent_name"])
     if f.get("model"):
         stmt = stmt.where(AgentTrace.model_names.contains([f["model"]]))
     if f.get("trace_id"):
@@ -778,6 +1090,7 @@ async def bulk_add_observability_logs(db: AsyncSession, items: list[dict]) -> in
                 exception_message=item.get("exception_message"),
                 stacktrace=item.get("stacktrace"),
                 attributes=item.get("attributes"),
+                mq_message_id=item.get("mq_message_id"),
             )
         )
         written += 1

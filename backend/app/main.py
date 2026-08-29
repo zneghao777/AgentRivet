@@ -9,10 +9,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .agents.demo_subagent import build_demo_subagent
-from .agents.registry import agent_registry
 from .api import (
     router_admin,
+    router_agents,
     router_chat,
     router_knowledge,
     router_knowledge_graph,
@@ -30,6 +29,7 @@ from .observability import audit
 from .observability.aggregation import start_metric_worker, stop_metric_worker
 from .observability.tracing import init_tracing
 from .skills.manager import skill_manager
+from .storage import repositories as repo
 from .storage.checkpointer import get_checkpointer
 from .storage.db import AsyncSessionLocal, create_tables
 from .tools.registry import tool_registry
@@ -49,6 +49,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # 建表
     await create_tables()
+    async with AsyncSessionLocal() as db:
+        recovered_tasks = await repo.fail_running_agent_tasks(db)
+        if recovered_tasks:
+            logger.warning("已将 %d 个进程重启前的 running AgentTask 标记为 failed", recovered_tasks)
 
     # KBX：恢复进程中断前已持久化的排队/超时任务。
     if settings.KB_INDEX_JOBS_ENABLED:
@@ -112,9 +116,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 except McpAdapterError as exc:
                     logger.warning("MCP Server %s 恢复失败: %s", mcp_server.name, exc)
 
-    # 子 Agent 注册
-    agent_registry.register(build_demo_subagent())
-
     # Checkpointer + 图编译
     try:
         checkpointer = await get_checkpointer()
@@ -130,6 +131,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from .observability import log_export
 
     log_export.install_log_handler()
+
+    # RabbitMQ 拓扑由代码幂等声明；不可用只记录并保留本地降级路径。
+    if settings.MQ_ENABLED:
+        from .mq.connection import mq_connection
+        from .mq.monitor import start_mq_monitor
+
+        try:
+            await mq_connection.connect()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("RabbitMQ 启动连接失败，API 使用本地降级路径: %s", exc)
+        start_mq_monitor()
 
     logger.info(
         "Harness 就绪：app=%s env=%s tools=%d skills=%d multi_agent=%s",
@@ -158,6 +170,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from .observability import tracing
 
     await tracing.shutdown_tracing()
+    if settings.MQ_ENABLED:
+        from .mq.monitor import stop_mq_monitor
+        from .mq.publisher import shutdown_publisher
+
+        await stop_mq_monitor()
+        await shutdown_publisher()
 
 
 def _validate_config() -> None:
@@ -196,6 +214,7 @@ app.add_middleware(
 
 API = settings.API_PREFIX
 app.include_router(router_sessions.router, prefix=API)
+app.include_router(router_agents.router, prefix=API)
 app.include_router(router_chat.router, prefix=API)
 app.include_router(router_skills.router, prefix=API)
 app.include_router(router_tools.router, prefix=API)

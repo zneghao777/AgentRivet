@@ -1,12 +1,13 @@
-import { useEffect, useRef, useState } from "react";
-import { App as AntdApp } from "antd";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { App as AntdApp, Select } from "antd";
+import { useNavigate } from "react-router-dom";
 import MessageList from "./MessageList";
-import { deleteData, http } from "@/api/http";
+import { deleteData, http, patchData } from "@/api/http";
 import { streamChat } from "@/api/sse";
 import { CHAT_MODELS, VISION_CHAT_MODEL } from "@/constants";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
-import type { ApiResponse, SkillItem } from "@/types/api";
+import type { AgentItem, ApiResponse, SessionItem, SkillItem } from "@/types/api";
 import type { ChatAttachment } from "@/types/chat";
 import { summarize } from "@/utils/format";
 
@@ -15,17 +16,22 @@ const ACCEPTED_ATTACHMENTS = [
   ".json", ".pdf", ".docx", ".py", ".js", ".jsx", ".ts", ".tsx",
 ].join(",");
 
-export default function ChatWindow({ skills }: { skills: SkillItem[] }) {
+export default function ChatWindow({ skills, agents }: { skills: SkillItem[]; agents: AgentItem[] }) {
   const { message: toast } = AntdApp.useApp();
+  const navigate = useNavigate();
   const {
-    currentSessionId, messages, streaming, lastError, setStreaming, setError,
+    currentSessionId, sessions, messages, streaming, lastError, setStreaming, setError,
     pushMessage, updateLastAssistant, removeEmptyAssistant, beginRun, startRunStep,
     updateRunStep, endRunStep, setRunTokenUsage, finishRun, failRun, cancelRun,
-    setSessionTitle, fetchSessions,
+    setOrchestrationRouter, setOrchestrationClarification, setOrchestrationPlan,
+    startOrchestrationWorker, finishOrchestrationWorker, startOrchestrationSynthesis,
+    selectClarification, disconnectOrchestration,
+    setSessionTitle, setSessionAgent, fetchSessions,
   } = useSessionStore();
   const apiKey = useSettingsStore((state) => state.apiKey);
   const model = useSettingsStore((state) => state.model);
   const setModel = useSettingsStore((state) => state.setModel);
+  const customModels = useSettingsStore((state) => state.customModels);
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [uploading, setUploading] = useState(0);
@@ -38,6 +44,33 @@ export default function ChatWindow({ skills }: { skills: SkillItem[] }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composerRef = useRef<HTMLDivElement>(null);
   const previewUrlsRef = useRef(new Set<string>());
+  const modelOptions = useMemo(() => [
+    ...CHAT_MODELS.map((item) => ({ ...item, custom: false })),
+    ...customModels.map((item) => ({
+      value: item.modelId,
+      label: item.name,
+      description: item.description || item.modelId,
+      custom: true,
+    })),
+  ], [customModels]);
+  const activeModelLabel = modelOptions.find((item) => item.value === model)?.label ?? model;
+  const activeCustomModel = customModels.find((item) => item.modelId === model);
+  const activeSession = useMemo(
+    () => sessions.find((session) => session.session_id === currentSessionId),
+    [currentSessionId, sessions],
+  );
+  const activeAgent = agents.find((agent) => agent.id === activeSession?.agent_id);
+
+  const switchAgent = async (agentId: string) => {
+    if (!currentSessionId || streaming) return;
+    try {
+      const updated = await patchData<SessionItem>(`/sessions/${currentSessionId}`, { agent_id: agentId || null });
+      setSessionAgent(currentSessionId, updated.agent_id || null);
+      toast.success(agentId ? "Agent 已切换，将从下一条消息生效" : "已切换为默认助手");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "切换 Agent 失败");
+    }
+  };
 
   useEffect(() => {
     if (currentSessionId) inputRef.current?.focus();
@@ -125,16 +158,16 @@ export default function ChatWindow({ skills }: { skills: SkillItem[] }) {
     }
   };
 
-  const send = async () => {
-    if ((!text.trim() && !attachments.length) || !currentSessionId || streaming || uploading) return;
+  const send = async (messageOverride?: string) => {
+    if ((!messageOverride?.trim() && !text.trim() && !attachments.length) || !currentSessionId || streaming || uploading) return;
     if (!apiKey) { setError("未配置 API Key，请到「设置」页填写"); return; }
-    const message = text.trim() || "请分析这些附件";
+    const message = messageOverride?.trim() || text.trim() || "请分析这些附件";
     const pendingAttachments = attachments;
     const sessionId = currentSessionId;
-    const activeSession = useSessionStore.getState().sessions.find(
+    const currentSession = useSessionStore.getState().sessions.find(
       (session) => session.session_id === sessionId,
     );
-    if (!activeSession?.title || ["新对话", "新会话"].includes(activeSession.title)) {
+    if (!currentSession?.title || ["新对话", "新会话"].includes(currentSession.title)) {
       setSessionTitle(sessionId, summarize(message, 20));
     }
     setText("");
@@ -142,13 +175,15 @@ export default function ChatWindow({ skills }: { skills: SkillItem[] }) {
     setPlusOpen(false);
     setModelOpen(false);
     pushMessage({ role: "user", content: message, attachments: pendingAttachments });
-    pushMessage({ role: "assistant", content: "", run: { status: "running", startedAt: Date.now(), steps: [] } });
+    const selectedAgent = agents.find((agent) => agent.id === currentSession?.agent_id);
+    pushMessage({ role: "assistant", content: "", agentId: selectedAgent?.id, agentName: selectedAgent?.name, run: { status: "running", startedAt: Date.now(), steps: [] } });
     const controller = new AbortController();
     abortRef.current = controller;
     setStreaming(true);
     setError(null);
 
     const isCurrent = () => useSessionStore.getState().currentSessionId === sessionId;
+    let runFinished = false;
     const flushPendingDelta = () => {
       deltaFrameRef.current = null;
       const pending = pendingDeltaRef.current;
@@ -159,6 +194,10 @@ export default function ChatWindow({ skills }: { skills: SkillItem[] }) {
       await streamChat(sessionId, {
         message,
         model,
+        provider_config: activeCustomModel ? {
+          base_url: activeCustomModel.baseUrl,
+          api_key: activeCustomModel.apiKey,
+        } : undefined,
         attachment_ids: pendingAttachments.map((item) => item.id),
         skills: skills.filter((skill) => skill.enabled).map((skill) => skill.name),
       }, {
@@ -172,8 +211,17 @@ export default function ChatWindow({ skills }: { skills: SkillItem[] }) {
           if (deltaFrameRef.current === null) deltaFrameRef.current = window.requestAnimationFrame(flushPendingDelta);
         },
         onMessageEnd: (event) => { if (isCurrent()) setRunTokenUsage(event); },
-        onRunEnd: (event) => { if (isCurrent()) finishRun(event); },
+        onRunEnd: (event) => { runFinished = true; if (isCurrent()) finishRun(event); },
+        onOrchestrationRouterDecision: (event) => { if (isCurrent()) setOrchestrationRouter(event); },
+        onOrchestrationClarification: (event) => { if (isCurrent()) setOrchestrationClarification(event); },
+        onOrchestrationPlan: (event) => { if (isCurrent()) setOrchestrationPlan(event); },
+        onOrchestrationWorkerStarted: (event) => { if (isCurrent()) startOrchestrationWorker(event); },
+        onOrchestrationWorkerFinished: (event) => { if (isCurrent()) finishOrchestrationWorker(event); },
+        onOrchestrationSynthesis: (event) => { if (isCurrent()) startOrchestrationSynthesis(event); },
         onError: (error) => { if (isCurrent()) { setError(error.message); failRun(); } },
+        onClose: () => {
+          if (isCurrent() && !runFinished && !controller.signal.aborted) disconnectOrchestration();
+        },
       }, controller.signal);
     } catch (error) {
       if (isCurrent()) {
@@ -200,11 +248,33 @@ export default function ChatWindow({ skills }: { skills: SkillItem[] }) {
     <div className="chat-window">
       <header className="chat-header">
         <div className="chat-title"><div className="header-icon"><span className="material-symbols-rounded">forum</span></div><h1>与 Harness Agent 对话</h1></div>
-        <div className={`status-pill${currentSessionId ? " active" : ""}`} aria-live="polite"><i />{streaming ? "正在生成" : currentSessionId ? "当前状态: 活跃" : "等待会话"}</div>
+        <div className="chat-header-controls">
+          <Select
+            className="chat-agent-select"
+            value={activeSession?.agent_id || ""}
+            disabled={!currentSessionId || streaming}
+            onChange={(value) => void switchAgent(value)}
+            aria-label="选择会话 Agent"
+            options={[
+              { value: "", label: "默认助手（不使用 Agent）" },
+              ...agents.map((agent) => ({ value: agent.id, label: agent.name })),
+            ]}
+            suffixIcon={<span className="material-symbols-rounded">smart_toy</span>}
+          />
+          <div className={`status-pill${currentSessionId ? " active" : ""}`} aria-live="polite"><i />{streaming ? "正在生成" : activeAgent ? activeAgent.name : currentSessionId ? "默认助手" : "等待会话"}</div>
+        </div>
       </header>
 
       {lastError ? <div className="chat-error" role="alert"><span className="material-symbols-rounded" aria-hidden="true">error</span>{lastError}<button type="button" aria-label="关闭错误提示" onClick={() => setError(null)}>×</button></div> : null}
-      <MessageList messages={messages} streaming={streaming} />
+      <MessageList
+        messages={messages}
+        streaming={streaming}
+        onClarificationSelect={(option) => {
+          selectClarification(option);
+          void send(option);
+        }}
+        onClarificationOther={() => inputRef.current?.focus()}
+      />
 
       <footer className="composer-area">
         {!currentSessionId ? <div className="composer-hint">请先新建或选择一个会话</div> : null}
@@ -228,8 +298,8 @@ export default function ChatWindow({ skills }: { skills: SkillItem[] }) {
             </div>
             <textarea ref={inputRef} value={text} rows={1} disabled={streaming || !currentSessionId} aria-label="发送给 Harness Agent 的消息" placeholder="输入消息，Enter 发送，Shift+Enter 换行" onChange={(event) => { setText(event.target.value); if (lastError) setError(null); }} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} />
             <div className="composer-model-anchor">
-              <button type="button" className="composer-model-trigger" aria-label={`当前模型 ${model}`} aria-expanded={modelOpen} title={model} onClick={() => { setModelOpen((open) => !open); setPlusOpen(false); }}><span className="material-symbols-rounded">memory</span><b>{model}</b><span className="material-symbols-rounded">expand_more</span></button>
-              {modelOpen ? <div className="composer-popover model-menu" role="menu"><div className="popover-eyebrow">选择模型</div>{CHAT_MODELS.map((item) => <button type="button" role="menuitemradio" aria-checked={model === item.value} className={model === item.value ? "selected" : ""} key={item.value} onClick={() => { setModel(item.value); setModelOpen(false); inputRef.current?.focus(); }}><span className="model-menu-icon material-symbols-rounded">{item.value === VISION_CHAT_MODEL ? "image" : "bolt"}</span><span><b>{item.label}</b><small>{item.description}</small></span>{model === item.value ? <span className="material-symbols-rounded model-check">check</span> : null}</button>)}</div> : null}
+              <button type="button" className="composer-model-trigger" aria-label={`当前模型 ${activeModelLabel}，${model}`} aria-expanded={modelOpen} title={`${activeModelLabel} · ${model}`} onClick={() => { setModelOpen((open) => !open); setPlusOpen(false); }}><span className="material-symbols-rounded">memory</span><b>{activeModelLabel}</b><span className="material-symbols-rounded">expand_more</span></button>
+              {modelOpen ? <div className="composer-popover model-menu" role="menu"><div className="popover-eyebrow">选择模型</div>{modelOptions.map((item) => <button type="button" role="menuitemradio" aria-checked={model === item.value} className={model === item.value ? "selected" : ""} key={item.value} onClick={() => { setModel(item.value); setModelOpen(false); inputRef.current?.focus(); }}><span className="model-menu-icon material-symbols-rounded">{item.custom ? "deployed_code" : item.value === VISION_CHAT_MODEL ? "image" : "bolt"}</span><span><b>{item.label}{item.custom ? <em>自定义</em> : null}</b><small title={item.value}>{item.description}</small></span>{model === item.value ? <span className="material-symbols-rounded model-check">check</span> : null}</button>)}<button type="button" className="model-menu-manage" onClick={() => { setModelOpen(false); navigate("/settings"); }}><span className="material-symbols-rounded">settings</span><span><b>管理模型</b><small>添加、编辑或移除自定义模型</small></span><span className="material-symbols-rounded model-check">arrow_forward</span></button></div> : null}
             </div>
             {streaming ? <button type="button" className="send-button stop" title="停止生成" aria-label="停止生成" onClick={() => abortRef.current?.abort()}><span className="material-symbols-rounded" aria-hidden="true">stop</span></button> : <button type="button" className="send-button" title="发送" aria-label="发送消息" disabled={!canSend} onClick={() => void send()}><span className="material-symbols-rounded" aria-hidden="true">arrow_upward</span></button>}
           </div>

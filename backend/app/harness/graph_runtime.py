@@ -112,6 +112,7 @@ class GraphRuntime:
         session_id: str | None = None,
         memory_context: str = "",
         request_id: str | None = None,
+        message_id: int | None = None,
         links: tuple[str, ...] | None = None,
     ) -> AsyncIterator[str]:
         """流式运行，内部将 LangGraph 事件转换为 SSE 事件。"""
@@ -172,6 +173,9 @@ class GraphRuntime:
                         "interrupt_count": 0,
                         "final_answer": "",
                         "memory_context": memory_context,
+                        "session_id": session_id or "",
+                        "message_id": message_id,
+                        "request_id": request_id or "",
                     },
                     config=cfg,
                     version="v2",
@@ -202,7 +206,9 @@ class GraphRuntime:
             # 同一 run_id 只分配一次 span_id（避免重复 start 事件覆盖导致父子错乱）
             existing = pending_spans.get(run_id)
             if existing is not None:
-                existing.setdefault("attributes", {}).update(attributes or {})
+                merged_attributes = existing.get("attributes") or {}
+                merged_attributes.update(attributes or {})
+                existing["attributes"] = merged_attributes
                 if input_summary and not existing.get("input_summary"):
                     existing["input_summary"] = input_summary
                 return existing, False
@@ -299,6 +305,8 @@ class GraphRuntime:
             )
 
         final_step_frames: list[str] = []
+        final_answer = ""
+        clarification_only = False
         try:
             while True:
                 try:
@@ -333,9 +341,32 @@ class GraphRuntime:
                     yield ev.error(50001, f"graph error: {exc}")
                     break
 
-                if etype == "on_chat_model_stream":
+                if etype == "on_custom_event" and str(event.get("name", "")).startswith(
+                    "orchestration."
+                ):
+                    orchestration_name = str(event.get("name"))
+                    payload = data if isinstance(data, dict) else {"value": data}
+                    for parent_run_id in reversed(parent_ids):
+                        parent = pending_spans.get(parent_run_id)
+                        if parent is not None:
+                            attributes = parent.get("attributes") or {}
+                            attributes[
+                                orchestration_name.removeprefix("orchestration.")
+                            ] = payload
+                            parent["attributes"] = attributes
+                            break
+                    if orchestration_name == "orchestration.clarification":
+                        clarification_only = True
+                    if orchestration_name == "orchestration.error":
+                        run_status = "error"
+                        run_error = str(payload.get("message") or "orchestration failed")
+                        yield ev.error(50003, run_error)
+                    else:
+                        yield ev.sse_frame(orchestration_name, payload)
+
+                elif etype == "on_chat_model_stream":
                     chunk = data.get("chunk")
-                    if chunk is not None:
+                    if chunk is not None and _is_public_stream_event(event):
                         text = _extract_text(chunk)
                         if text:
                             _pending_reply.append(text)
@@ -426,6 +457,15 @@ class GraphRuntime:
                     if frame:
                         yield frame
 
+                elif etype in {"on_chat_model_error", "on_llm_error"}:
+                    exc = data.get("error")
+                    pending = pending_spans.get(run_id)
+                    if pending is not None:
+                        pending["error"] = tracing.sanitize_error(exc)
+                    frame = _step_end_frame(_close_span(run_id, status="error"))
+                    if frame:
+                        yield frame
+
                 elif etype == "on_tool_start":
                     tool_name = event.get("name", "")
                     tool_input = data.get("input", {})
@@ -498,13 +538,21 @@ class GraphRuntime:
                 elif etype == "on_chain_start":
                     node_name = event.get("name", "") or "agent"
                     if node_name and node_name not in {"__start__", "__end__"}:
+                        node_input = data.get("input")
+                        task_card = node_input.get("task") if isinstance(node_input, dict) else None
                         parent_id = _resolve_parent(parent_ids)
                         pending, created = _register_span(
                             run_id,
                             name=f"node.{node_name}",
                             span_type="node",
                             parent_span_id=parent_id,
-                            input_summary=_summarize_input(data.get("input")),
+                            input_summary=_summarize_input(node_input),
+                            attributes={
+                                "task_id": task_card.get("task_id"),
+                                "agent_name": task_card.get("target_agent"),
+                            }
+                            if isinstance(task_card, dict)
+                            else None,
                         )
                         if created:
                             yield ev.run_step_start(
@@ -529,6 +577,22 @@ class GraphRuntime:
 
                 elif etype == "on_chain_end":
                     node_name = event.get("name", "") or "agent"
+                    output = data.get("output")
+                    if isinstance(output, dict) and output.get("final_answer"):
+                        final_answer = str(output["final_answer"])
+                    if not parent_ids and isinstance(output, dict):
+                        state_error = str(output.get("orchestration_error") or "")
+                        if (
+                            state_error
+                            and state_error != "partial_failure"
+                            and run_status == "ok"
+                        ):
+                            run_status = "error"
+                            run_error = state_error
+                            yield ev.error(
+                                50003,
+                                final_answer or "编排执行失败，请稍后重试。",
+                            )
                     if node_name and node_name not in {"__start__", "__end__"}:
                         frame = _step_end_frame(_close_span(run_id))
                         if frame:
@@ -544,6 +608,8 @@ class GraphRuntime:
                 run_status = "interrupted"
             for rid in list(pending_spans):
                 close_status = "interrupted" if run_status == "interrupted" else run_status
+                if run_error and not pending_spans[rid].get("error"):
+                    pending_spans[rid]["error"] = run_error
                 frame = _step_end_frame(_close_span(rid, status=close_status))
                 if frame:
                     final_step_frames.append(frame)
@@ -563,9 +629,9 @@ class GraphRuntime:
         duration_ms = int((time.monotonic() - start) * 1000)
         for frame in final_step_frames:
             yield frame
-        if not msg_id:
+        if not msg_id and not clarification_only:
             yield ev.message_start()
-            yield ev.message_delta("msg_stream", _dummy_reply())
+            yield ev.message_delta("msg_stream", final_answer or _dummy_reply())
         yield ev.message_end(token_usage)
         yield ev.run_end(
             status="success" if run_status == "ok" else run_status,
@@ -583,6 +649,7 @@ class GraphRuntime:
         memory_context: str = "",
         session_id: str | None = None,
         request_id: str | None = None,
+        message_id: int | None = None,
         links: tuple[str, ...] | None = None,
     ) -> dict:
         """一次性运行（非流式），返回最终状态（含 _observability 摘要）。"""
@@ -617,6 +684,7 @@ class GraphRuntime:
         run_status = "ok"
         run_error: str | None = None
         pending_spans: dict[str, dict] = {}
+        result: dict = {}
 
         def _resolve_parent(parent_ids: list[str]) -> str | None:
             for pid in reversed(parent_ids):
@@ -682,6 +750,9 @@ class GraphRuntime:
                     "user_id": user_id,
                     "skill_loaded": skill_names,
                     "memory_context": memory_context,
+                    "session_id": session_id or "",
+                    "message_id": message_id,
+                    "request_id": request_id or "",
                 },
                 config=cfg,
                 version="v2",
@@ -730,6 +801,12 @@ class GraphRuntime:
                         pending["token_usage"] = usage
                         pending["output_summary"] = _summarize_output(output)
                     _close_span(run_id)
+                elif etype in {"on_chat_model_error", "on_llm_error"}:
+                    exc = data.get("error")
+                    pending = pending_spans.get(run_id)
+                    if pending is not None:
+                        pending["error"] = tracing.sanitize_error(exc)
+                    _close_span(run_id, status="error")
                 elif etype == "on_tool_start":
                     tool_name = event.get("name", "")
                     tool_input = data.get("input", {})
@@ -766,13 +843,21 @@ class GraphRuntime:
                 elif etype == "on_chain_start":
                     node_name = event.get("name", "") or "agent"
                     if node_name and node_name not in {"__start__", "__end__"}:
+                        node_input = data.get("input")
+                        task_card = node_input.get("task") if isinstance(node_input, dict) else None
                         pending_spans[run_id] = {
                             "span_id": tracing._new_span_id(),
                             "name": f"node.{node_name}",
                             "type": "node",
                             "parent_span_id": _resolve_parent(parent_ids),
                             "started_at": datetime.now(UTC),
-                            "input_summary": _summarize_input(data.get("input")),
+                            "input_summary": _summarize_input(node_input),
+                            "attributes": {
+                                "task_id": task_card.get("task_id"),
+                                "agent_name": task_card.get("target_agent"),
+                            }
+                            if isinstance(task_card, dict)
+                            else None,
                         }
                         _append_span_event(
                             pending_spans[run_id],
@@ -781,6 +866,9 @@ class GraphRuntime:
                         )
                 elif etype == "on_chain_end":
                     node_name = event.get("name", "") or "agent"
+                    output = data.get("output")
+                    if not parent_ids and isinstance(output, dict):
+                        result = output
                     if node_name and node_name not in {"__start__", "__end__"}:
                         _close_span(run_id)
                 elif etype == "on_chain_error":
@@ -801,16 +889,12 @@ class GraphRuntime:
             for rid in list(pending_spans):
                 _close_span(rid, status="error", error=run_error)
 
-        result = await self.app.ainvoke(
-            {
-                "messages": [("user", message)],
-                "tenant_id": tenant_id,
-                "user_id": user_id,
-                "skill_loaded": skill_names,
-                "memory_context": memory_context,
-            },
-            config=cfg,
-        )
+        if not result:
+            try:
+                snapshot = await self.app.aget_state(cfg)
+                result = dict(snapshot.values or {})
+            except Exception:  # noqa: BLE001
+                result = {}
         # 根 span 汇总
         root_span.finalize(
             status=run_status,
@@ -1149,7 +1233,7 @@ class GraphRuntime:
                     frame = _step_end_frame(_close_span(run_id, status="error"))
                     if frame:
                         yield frame
-                elif etype == "on_chat_model_error":
+                elif etype in {"on_chat_model_error", "on_llm_error"}:
                     exc = data.get("error")
                     pending = pending_spans.get(run_id)
                     if pending is not None:
@@ -1416,6 +1500,14 @@ def _public_step_summary(pending: dict) -> str | None:
     return tracing.redact_text(
         pending.get("output_summary") or pending.get("error"), 240
     )
+
+
+def _is_public_stream_event(event: dict) -> bool:
+    """只把面向用户的主 Agent/直派/Synthesizer token 写入 SSE。"""
+    node = str((event.get("metadata") or {}).get("langgraph_node") or "")
+    if not node:
+        return True
+    return node in {"agent", "main", "direct_worker", "synthesizer"}
 
 
 def _extract_text(chunk: Any) -> str:

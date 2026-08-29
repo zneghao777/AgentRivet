@@ -2,7 +2,20 @@
 import { create } from "zustand";
 import type { SessionItem, SessionListData } from "@/types/api";
 import type { ChatMessage, ChatRun, ChatRunStatus, ChatRunStepStatus } from "@/types/chat";
-import type { MessageEnd, RunEnd, RunStepEnd, RunStepStart, RunStepUpdate, TraceStart } from "@/types/sse";
+import type {
+  MessageEnd,
+  OrchestrationClarification,
+  OrchestrationPlan,
+  OrchestrationRouterDecision,
+  OrchestrationSynthesis,
+  OrchestrationWorkerFinished,
+  OrchestrationWorkerStarted,
+  RunEnd,
+  RunStepEnd,
+  RunStepStart,
+  RunStepUpdate,
+  TraceStart,
+} from "@/types/sse";
 import { runStepReferencesToKnowledgeReferences } from "@/utils/chatRun";
 import { getData } from "@/api/http";
 
@@ -48,6 +61,7 @@ interface SessionState {
   setSessions: (s: SessionItem[]) => void;
   fetchSessions: () => Promise<void>;
   setSessionTitle: (id: string, title: string) => void;
+  setSessionAgent: (id: string, agentId: string | null) => void;
   setCurrentSession: (id: string | null) => void;
   setMessages: (m: ChatMessage[]) => void;
   pushMessage: (m: ChatMessage) => void;
@@ -59,6 +73,14 @@ interface SessionState {
   endRunStep: (event: RunStepEnd) => void;
   setRunTokenUsage: (event: MessageEnd) => void;
   finishRun: (event: RunEnd) => void;
+  setOrchestrationRouter: (event: OrchestrationRouterDecision) => void;
+  setOrchestrationClarification: (event: OrchestrationClarification) => void;
+  setOrchestrationPlan: (event: OrchestrationPlan) => void;
+  startOrchestrationWorker: (event: OrchestrationWorkerStarted) => void;
+  finishOrchestrationWorker: (event: OrchestrationWorkerFinished) => void;
+  startOrchestrationSynthesis: (event: OrchestrationSynthesis) => void;
+  selectClarification: (option: string) => void;
+  disconnectOrchestration: () => void;
   failRun: () => void;
   cancelRun: () => void;
   setStreaming: (b: boolean) => void;
@@ -85,6 +107,12 @@ export const useSessionStore = create<SessionState>((set) => ({
     set((state) => ({
       sessions: state.sessions.map((session) =>
         session.session_id === id ? { ...session, title } : session
+      ),
+    })),
+  setSessionAgent: (id, agentId) =>
+    set((state) => ({
+      sessions: state.sessions.map((session) =>
+        session.session_id === id ? { ...session, agent_id: agentId } : session
       ),
     })),
   setCurrentSession: (currentSessionId) => set({ currentSessionId }),
@@ -195,7 +223,140 @@ export const useSessionStore = create<SessionState>((set) => ({
         durationMs: event.duration_ms,
         toolCalls: event.tool_calls,
       },
+      orchestration: message.orchestration ? {
+        ...message.orchestration,
+        phase: "done",
+        connectionState: "connected",
+      } : undefined,
     })),
+  })),
+  setOrchestrationRouter: (event) => set((state) => ({
+    messages: updateLastAssistant(state.messages, (message) => ({
+      ...message,
+      orchestration: {
+        mode: event.mode,
+        targetAgent: event.target_agent,
+        confidence: event.confidence,
+        reason: event.reason,
+        workers: {},
+        phase: event.mode === "orchestrate" ? "planning" : "executing",
+        connectionState: "connected",
+      },
+    })),
+  })),
+  setOrchestrationClarification: (event) => set((state) => ({
+    messages: updateLastAssistant(state.messages, (message) => ({
+      ...message,
+      orchestration: {
+        ...(message.orchestration ?? {
+          mode: "direct" as const,
+          targetAgent: "main",
+          confidence: 0,
+          reason: "需要补充信息",
+          workers: {},
+          phase: "routing" as const,
+        }),
+        clarification: { question: event.question, options: event.options },
+      },
+    })),
+  })),
+  setOrchestrationPlan: (event) => set((state) => ({
+    messages: updateLastAssistant(state.messages, (message) => ({
+      ...message,
+      orchestration: {
+        ...(message.orchestration ?? {
+          mode: "orchestrate" as const,
+          targetAgent: "main",
+          confidence: 0,
+          reason: "已生成执行计划",
+          workers: {},
+          phase: "planning" as const,
+        }),
+        mode: "orchestrate",
+        summary: event.summary,
+        execution: event.execution,
+        phase: "executing",
+        workers: Object.fromEntries(event.tasks.map((task) => [task.task_id, {
+          taskId: task.task_id,
+          agentName: task.target_agent,
+          goal: task.goal,
+          constraints: task.constraints ?? [],
+          status: "pending" as const,
+        }])),
+      },
+    })),
+  })),
+  startOrchestrationWorker: (event) => set((state) => ({
+    messages: updateLastAssistant(state.messages, (message) => {
+      if (!message.orchestration) return message;
+      const current = message.orchestration.workers[event.task_id];
+      return {
+        ...message,
+        orchestration: {
+          ...message.orchestration,
+          phase: "executing",
+          workers: {
+            ...message.orchestration.workers,
+            [event.task_id]: {
+              taskId: event.task_id,
+              agentName: event.agent_name,
+              goal: current?.goal ?? "执行子任务",
+              constraints: current?.constraints ?? [],
+              status: "running",
+            },
+          },
+        },
+      };
+    }),
+  })),
+  finishOrchestrationWorker: (event) => set((state) => ({
+    messages: updateLastAssistant(state.messages, (message) => {
+      if (!message.orchestration) return message;
+      const current = message.orchestration.workers[event.task_id];
+      const workers = {
+        ...message.orchestration.workers,
+        [event.task_id]: {
+          taskId: event.task_id,
+          agentName: event.agent_name,
+          goal: current?.goal ?? "执行子任务",
+          constraints: current?.constraints ?? [],
+          status: event.status,
+          durationMs: event.duration_ms,
+          resultPreview: event.result_preview,
+          error: event.error ?? undefined,
+        },
+      };
+      const allFinished = Object.values(workers).every((worker) => worker.status === "done" || worker.status === "failed");
+      return {
+        ...message,
+        orchestration: {
+          ...message.orchestration,
+          workers,
+          phase: allFinished ? "verifying" : "executing",
+        },
+      };
+    }),
+  })),
+  startOrchestrationSynthesis: () => set((state) => ({
+    messages: updateLastAssistant(state.messages, (message) => message.orchestration ? {
+      ...message,
+      orchestration: { ...message.orchestration, phase: "synthesizing" },
+    } : message),
+  })),
+  selectClarification: (option) => set((state) => ({
+    messages: updateLastAssistant(state.messages, (message) => message.orchestration?.clarification ? {
+      ...message,
+      orchestration: {
+        ...message.orchestration,
+        clarification: { ...message.orchestration.clarification, selected: option },
+      },
+    } : message),
+  })),
+  disconnectOrchestration: () => set((state) => ({
+    messages: updateLastAssistant(state.messages, (message) => message.orchestration ? {
+      ...message,
+      orchestration: { ...message.orchestration, connectionState: "disconnected" },
+    } : message),
   })),
   failRun: () => set((state) => ({
     messages: updateLastAssistant(state.messages, (message) => ({
@@ -207,6 +368,10 @@ export const useSessionStore = create<SessionState>((set) => ({
     messages: updateLastAssistant(state.messages, (message) => ({
       ...message,
       run: { ...ensureRun(message), status: "canceled" },
+      orchestration: message.orchestration ? {
+        ...message.orchestration,
+        connectionState: "stopped",
+      } : undefined,
     })),
   })),
   setStreaming: (streaming) => set({ streaming }),
