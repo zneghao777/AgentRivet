@@ -1,0 +1,155 @@
+# ============================================================
+# 生产环境 Docker Compose
+#   - 直接拉取 GHCR 上的构建产物镜像(不在服务器上构建)
+#   - 通过 deploy/.env.prod 注入密钥(绝不提交到仓库)
+#   - 内置 Watchtower:轮询检测 GHCR 新镜像并自动滚动更新
+#
+# 用法:
+#   cp deploy/.env.prod.example deploy/.env.prod   # 填写配置
+#   ./deploy/deploy-local.sh start                 # 一键拉取并启动
+# ============================================================
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: harness-postgres
+    environment:
+      POSTGRES_USER: harness
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: harness
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harness -d harness"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: harness-redis
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: harness-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: harness
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: /
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  backend:
+    image: ghcr.io/${GHCR_OWNER}/${GHCR_REPO}/backend:latest
+    container_name: harness-backend
+    env_file:
+      - .env.prod
+    environment:
+      APP_ENV: prod
+      DATABASE_URL: postgresql+psycopg://harness:${POSTGRES_PASSWORD}@postgres:5432/harness
+      REDIS_URL: redis://redis:6379/0
+      MQ_ENABLED: "true"
+      RABBITMQ_URL: amqp://harness:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    restart: unless-stopped
+
+  obs-worker:
+    image: ghcr.io/${GHCR_OWNER}/${GHCR_REPO}/backend:latest
+    container_name: harness-obs-worker
+    command: ["python", "-m", "app.workers.obs_worker"]
+    healthcheck:
+      disable: true
+    env_file:
+      - .env.prod
+    environment:
+      APP_ENV: prod
+      DATABASE_URL: postgresql+psycopg://harness:${POSTGRES_PASSWORD}@postgres:5432/harness
+      REDIS_URL: redis://redis:6379/0
+      MQ_ENABLED: "true"
+      RABBITMQ_URL: amqp://harness:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    restart: unless-stopped
+
+  session-worker:
+    image: ghcr.io/${GHCR_OWNER}/${GHCR_REPO}/backend:latest
+    container_name: harness-session-worker
+    command: ["python", "-m", "app.workers.session_worker"]
+    healthcheck:
+      disable: true
+    env_file:
+      - .env.prod
+    environment:
+      APP_ENV: prod
+      DATABASE_URL: postgresql+psycopg://harness:${POSTGRES_PASSWORD}@postgres:5432/harness
+      REDIS_URL: redis://redis:6379/0
+      MQ_ENABLED: "true"
+      RABBITMQ_URL: amqp://harness:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    restart: unless-stopped
+
+  frontend:
+    image: ghcr.io/${GHCR_OWNER}/${GHCR_REPO}/frontend:latest
+    container_name: harness-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    restart: unless-stopped
+
+  # Watchtower:本机检测 GHCR 上 backend/frontend 的 latest 镜像更新并自动重建容器
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: harness-watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_POLL_INTERVAL: 300          # 每 5 分钟检查一次
+      WATCHTOWER_CLEANUP: "true"             # 更新后清理旧镜像
+      WATCHTOWER_LABEL_ENABLE: "true"        # 只更新带 watchtower 标签的容器
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  rabbitmqdata:

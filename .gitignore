@@ -19,6 +19,9 @@ dist/
 .env.local
 .env.*.local
 
+# 生产部署密钥(绝不提交)
+deploy/.env.prod
+
 # IDE
 .idea/
 .vscode/

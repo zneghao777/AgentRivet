@@ -1,0 +1,17 @@
+# 依赖与构建产物
+node_modules
+dist
+*.tsbuildinfo
+
+# 环境变量
+.env
+.env.*
+.env.*.local
+
+# VCS / IDE / 杂项
+.git
+.gitignore
+Dockerfile
+.dockerignore
+*.md
+*.log

@@ -1,0 +1,44 @@
+# ============================================================
+# CD —— 部署到本机 Docker
+#
+# 方案 A(推荐,默认):Watchtower 自动更新
+#   生产 Compose 已内置 Watchtower,它每 5 分钟检测 GHCR 上
+#   backend/frontend 的 latest 镜像,有更新自动拉取并重建。
+#   → 无需本机暴露公网 IP,本机只要能访问 ghcr.io 即可。
+#   此方案不需要本文件,CI 推送镜像后本机自动完成部署。
+#
+# 方案 B(可选):SSH 触发部署
+#   如果本机有公网 IP(或配置了内网穿透),可以用本工作流
+#   在 CI 推送镜像后 SSH 到本机拉取并重建。
+#   需要配置 Secrets: DEPLOY_HOST / DEPLOY_USER / DEPLOY_SSH_KEY
+#   (以及 deployment 目录中 compose 文件路径)
+# ============================================================
+name: Deploy
+
+on:
+  workflow_dispatch:            # 手动触发
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "frontend/**"
+
+jobs:
+  deploy:
+    name: Deploy to local Docker host
+    # 没有配置 SSH 密钥时自动跳过(默认走 Watchtower 方案 A)
+    if: ${{ secrets.DEPLOY_HOST != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd ${{ secrets.DEPLOY_PATH }}
+            git pull --ff-only
+            ./deploy/deploy-local.sh update
