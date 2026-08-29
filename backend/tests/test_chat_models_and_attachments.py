@@ -19,9 +19,10 @@ async def test_model_connection_endpoint_uses_requested_model(app_client, monkey
     monkeypatch.setattr(settings, "LLM_API_KEY", "provider-secret")
     monkeypatch.setattr(settings, "LLM_BASE_URL", "https://api.deepseek.com")
 
-    async def fake_call(base_url: str, model: str):
+    async def fake_call(base_url: str, model: str, api_key: str):
         assert base_url == "https://api.deepseek.com"
         assert model == "deepseek-v4-pro"
+        assert api_key == "provider-secret"
         return {"resolved_model": model}
 
     monkeypatch.setattr(router_admin, "_call_model_connection", fake_call)
@@ -34,6 +35,110 @@ async def test_model_connection_endpoint_uses_requested_model(app_client, monkey
     assert response.status_code == 200
     assert response.json()["data"]["connected"] is True
     assert response.json()["data"]["resolved_model"] == "deepseek-v4-pro"
+
+
+@pytest.mark.asyncio
+async def test_model_connection_uses_custom_url_and_key(app_client, monkeypatch):
+    from app.api import router_admin
+
+    async def fake_call(base_url: str, model: str, api_key: str):
+        assert base_url == "https://models.example.com/v1"
+        assert model == "team-reasoner-v1"
+        assert api_key == "custom-provider-secret"
+        return {"resolved_model": model}
+
+    monkeypatch.setattr(router_admin, "_call_model_connection", fake_call)
+    response = await app_client.post(
+        "/api/v1/admin/test-connection",
+        headers=AUTH,
+        json={
+            "model": "team-reasoner-v1",
+            "base_url": "https://models.example.com/v1/",
+            "api_key": "custom-provider-secret",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["resolved_model"] == "team-reasoner-v1"
+
+
+@pytest.mark.asyncio
+async def test_model_connection_allows_custom_endpoint_without_key(app_client, monkeypatch):
+    from app.api import router_admin
+
+    async def fake_call(base_url: str, model: str, api_key: str):
+        assert base_url == "http://127.0.0.1:1234/v1"
+        assert model == "local-model"
+        assert api_key == ""
+        return {"resolved_model": model}
+
+    monkeypatch.setattr(router_admin, "_call_model_connection", fake_call)
+    response = await app_client.post(
+        "/api/v1/admin/test-connection",
+        headers=AUTH,
+        json={
+            "model": "local-model",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "api_key": "",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["connected"] is True
+
+
+def test_custom_model_runtime_config_is_request_scoped(monkeypatch):
+    from app.agents import base_agent
+    from app.harness.context import ToolContext, reset_tool_context, set_tool_context
+
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(base_agent, "ChatOpenAI", FakeChatOpenAI)
+    set_tool_context(
+        ToolContext(
+            model_id="team-reasoner-v1",
+            model_base_url="https://models.example.com/v1",
+            model_api_key="custom-provider-secret",
+        )
+    )
+    try:
+        base_agent.create_llm()
+    finally:
+        reset_tool_context()
+
+    assert captured["model"] == "team-reasoner-v1"
+    assert captured["base_url"] == "https://models.example.com/v1"
+    assert captured["api_key"] == "custom-provider-secret"
+
+
+def test_local_model_without_key_uses_non_secret_sdk_placeholder(monkeypatch):
+    from app.agents import base_agent
+    from app.harness.context import ToolContext, reset_tool_context, set_tool_context
+
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(base_agent, "ChatOpenAI", FakeChatOpenAI)
+    set_tool_context(
+        ToolContext(
+            model_id="local-model",
+            model_base_url="http://127.0.0.1:1234/v1",
+            model_api_key="",
+        )
+    )
+    try:
+        base_agent.create_llm()
+    finally:
+        reset_tool_context()
+
+    assert captured["api_key"] == "not-needed"
 
 
 @pytest.mark.asyncio

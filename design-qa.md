@@ -1,331 +1,116 @@
-# Blue frosted-glass redesign QA
-
-This report records the visual and browser acceptance pass for the blue-white
-frosted-glass iteration. The existing information architecture, routes, API
-data, and interactions remain the functional source of truth. The user's latest
-feedback replaces the previous warm paper and violet styling direction.
-
-## Source visual truth
-
-The previous implementation screenshots provide the structural comparison
-source. The user's feedback defines the required style change: a blue-white
-background, visibly translucent glass surfaces, and a softer, rounder shape
-language.
-
-- `output/redesign-2026-08-20/01-chat.png`
-- `output/redesign-2026-08-20/03-knowledge.png`
-- `output/redesign-2026-08-20/05-settings.png`
-- `output/redesign-2026-08-20/06-observability-overview.png`
-- `output/redesign-2026-08-20/08-observability-calls.png`
-
-Each source image is 1198 x 754 pixels at device scale 1. Dynamic content and
-observability totals changed between captures, so those values are excluded
-from visual fidelity judgments.
-
-## Implementation evidence
-
-The final implementation screenshots use the same 1198 x 754 CSS viewport and
-device scale 1. No density or crop normalization was required for the direct
-before-and-after comparisons.
-
-- `output/blue-glass-2026-08-20/01-chat-1198.png`
-- `output/blue-glass-2026-08-20/03-knowledge-1198.png`
-- `output/blue-glass-2026-08-20/05-settings-1198.png`
-- `output/blue-glass-2026-08-20/06-observability-overview-1198.png`
-- `output/blue-glass-2026-08-20/08-observability-calls-1198.png`
-- `output/blue-glass-2026-08-20/14-knowledge-detail-1198.png`
-- `output/blue-glass-2026-08-20/15-trace-detail-1198.png`
-
-Responsive evidence uses a 1024 x 754 CSS viewport at device scale 1:
+# 左侧导航与历史会话区 Design QA
 
-- `output/blue-glass-2026-08-20/13-knowledge-1024.png`
-
-## Full-view comparisons
-
-The following 2396 x 754 side-by-side images place the previous implementation
-on the left and the final blue frosted-glass implementation on the right:
-
-- `output/blue-glass-2026-08-20/01-chat-before-after.png`
-- `output/blue-glass-2026-08-20/03-knowledge-before-after.png`
-- `output/blue-glass-2026-08-20/05-settings-before-after.png`
-- `output/blue-glass-2026-08-20/06-overview-before-after.png`
-- `output/blue-glass-2026-08-20/08-calls-before-after.png`
-
-Focused region captures weren't needed because the same-size comparisons keep
-headers, navigation, fields, tables, message bubbles, and data cards readable.
-Knowledge detail and Trace detail were additionally captured as full views to
-inspect their dense master-detail regions.
-
-## Findings and fixes
-
-The first pass inherited three design issues from the rejected direction. All
-three were treated as blocking visual mismatches and fixed before this report
-was marked as passed.
-
-- **P1, colors and visual tokens:** The warm-white canvas and violet accents
-  conflicted with the requested blue-white direction. The palette now uses a
-  pale blue canvas, blue primary actions, blue-tinted neutrals, and transparent
-  white containers.
-- **P1, shape and surface treatment:** Square headers, connected metric strips,
-  flat tables, and sharp inspector frames made the interface feel rigid. Shared
-  radii now range from 14 to 28 pixels, and major surfaces use translucent
-  fills, light borders, blur, and blue-tinted elevation.
-- **P1, glass hierarchy:** The previous implementation looked like opaque white
-  sheets rather than glass. Sidebar, page shell, headers, toolbars, cards,
-  inspectors, composer, tabs, metrics, and observability panels now use a
-  consistent frosted-glass treatment while keeping text contrast intact.
-
-The second pass found no remaining actionable P0, P1, or P2 issues. The blue
-canvas remains intentionally restrained so body text, dense tables, and charts
-don't lose contrast behind the translucent layers.
-
-## Required fidelity surfaces
-
-The final pass covered every required fidelity surface against the user's new
-direction.
-
-- **Fonts and typography:** Existing Inter and Chinese system-font fallbacks,
-  hierarchy, weights, truncation, and tabular numerals remain readable on the
-  translucent surfaces.
-- **Spacing and layout:** Floating shell gaps, 14 to 28 pixel radii, internal
-  padding, master-detail proportions, and chart grids remain aligned at 1198
-  pixels. At 1024 pixels, inspectors move below their masters without page-level
-  horizontal overflow.
-- **Colors and tokens:** Primary, neutral, border, canvas, hover, focus, and
-  selected-state tokens map consistently to the blue-white glass direction.
-- **Image quality and assets:** The product uses its existing Material Symbols
-  icon set and has no raster imagery or generated assets in the inspected
-  screens. No placeholder art, custom SVG, or CSS illustration was introduced.
-- **Copy and content:** Existing application copy and current backend data were
-  preserved. Dynamic model names, counts, and trace values weren't replaced
-  with mock content.
-
-## Browser acceptance
+本报告验证左侧功能轨、历史会话抽屉，以及本轮新增的玻璃分裂和融回动效。
+对话区与上下文区不在修改范围内，仅作为布局联动的视觉背景。
 
-Chrome rendered every primary route and observability tab at 1371 x 810, then
-re-ran representative routes at 1198 x 754 and 1024 x 754. The checks covered
-chat, skills, knowledge, memory, settings, overview, traces, calls, logs, costs,
-quality, alerts, knowledge detail, and Trace detail.
+## 验证目标
 
-Knowledge inspector navigation opened a real knowledge detail route, Trace
-navigation opened a real trace, and the settings API key section retained a
-password input. All checked routes had equal document and viewport widths. The
-final Chrome error log was empty.
+本轮修复用户截图中可见的高亮错位、悬停提示遮挡，以及历史抽屉突然消失问题。
 
-## Result
+- 问题截图：
+  `/var/folders/n4/lqfj9l312d51ytfvxzgndmz80000gn/T/`
+  `codex-clipboard-d01c0adf-9ecf-4303-9edf-74ecbb2515ba.png`。
+- 视觉方向：
+  `frontend/design-references/sidebar-rail-glass-motion-spec.png`。
+- 折叠与 tooltip 实现：
+  `design-qa-final-collapsed-tooltip.jpg`。
+- 展开实现：`design-qa-final-expanded-after-motion.jpg`。
+- 分裂中间帧：`design-qa-motion-split.jpg`。
+- 融回中间帧：`design-qa-motion-merge.jpg`。
 
-The implementation matches the requested blue-white translucent, rounded visual
-direction without changing business behavior.
+## 视口与图像规格
 
-final result: passed
+主验收在 1536 × 1024 CSS 像素、1× 密度下完成。问题截图为桌面页面的
+466 × 1068 局部裁切，因此聚焦对照将最终实现裁切至相同的 466px 宽度，
+并通过垂直留白统一为 466 × 1068；没有对内容进行拉伸。
 
-## Trace Explorer implementation QA — August 21, 2026
+响应式补充检查覆盖 900 × 720 和 760 × 720。两个视口均无页面级横向或
+纵向溢出。
 
-This pass compares the new Trace Explorer against the user-provided desktop
-reference. It verifies the duration lanes, chronological event stream,
-independent inspector, and the current product shell.
+## 对照证据
 
-### Evidence
+全视图和动效状态对照使用 `design-qa-motion-contact-sheet.jpg`。该图从左到右
+展示分裂中间帧、融回中间帧，以及最终展开态。
 
-The source visual truth is:
+聚焦问题对照使用 `design-qa-sidebar-bugfix-comparison.png`。左侧为用户提供的
+问题截图，右侧为修复后的折叠态和 Agent 管理 tooltip。
 
-- `/var/folders/n4/lqfj9l312d51ytfvxzgndmz80000gn/T/`
-  `codex-clipboard-a3e30b35-76f4-4762-b36b-59f11369cd00.png`
+## Findings
 
-The browser-rendered implementation evidence is:
+本轮最终对照未发现仍需处理的 P0、P1 或 P2 问题。
 
-- `/tmp/myagentdemo-trace-build-20260821/03-trace-explorer-compact.jpg`
-- `/tmp/myagentdemo-trace-build-20260821/04-reference-comparison-final.png`
+- 高亮层与目标按钮的 x、y、宽度和高度偏差均为 0px。
+- tooltip 完整显示在对话面板上方，不再只露出左侧边缘。
+- 分裂与融回过程中抽屉始终保持可见的玻璃形态，没有中途切为
+  `visibility: hidden`。
+- 动效结束后，侧栏和工作区不残留 transform；页面级滚动保持为 0。
 
-The source image is 2594 by 1318 pixels. The implementation capture is 1280
-by 720 pixels from a 1280 by 720 CSS viewport. For the same-input comparison,
-the source is normalized to 1280 pixels wide, retains its aspect ratio at 650
-pixels high, and is centered on a 1280 by 720 white canvas. The implementation
-remains at 1280 by 720. Both sides of the final comparison therefore use the
-same 1280 by 720 comparison frame.
+## 必要视觉面检查
 
-The compared state is the default **Duration** view for a successful historical
-Trace, with the first user event selected and the inspector on **Summary**.
-The full-view comparison keeps the typography, lanes, list rows, inspector,
-and surrounding product navigation readable. A separate focused crop isn't
-needed because all dense controls and text remain legible in the normalized
-2560 by 720 comparison image. Browser accessibility snapshots provide focused
-evidence for the event rows and inspector fields.
-
-### Findings
-
-The final implementation has no actionable P0, P1, or P2 mismatch. The product
-shell and run-summary band intentionally remain visible because this screen is
-part of the existing Harness application, not a standalone clone.
-
-One P3 difference remains: the reference can display full system, context, and
-thinking content. Harness displays only available message history and safe
-runtime metadata when the Trace uses `metadata_only`. This is an intentional
-privacy constraint, not a visual placeholder.
-
-### Comparison history
-
-The first browser capture found one P2 density issue. At 720 pixels high, the
-summary, toolbar, and lanes left room for only two event rows. The second pass
-reduced the summary, section tabs, toolbar, lanes, inspector header, and event
-row heights. The final capture shows four event rows above the fold while
-preserving readable labels and an independent inspector.
+### 字体与排版
 
-The post-fix evidence is
-`/tmp/myagentdemo-trace-build-20260821/03-trace-explorer-compact.jpg`, and the
-post-fix side-by-side evidence is
-`/tmp/myagentdemo-trace-build-20260821/04-reference-comparison-final.png`.
-
-### Required fidelity surfaces
-
-The final comparison checks all required fidelity surfaces.
-
-- **Fonts and typography:** The implementation uses Inter and Chinese system
-  fallbacks, compact uppercase event labels, tabular metrics, and explicit ID
-  truncation. The hierarchy matches the reference while staying consistent
-  with Harness.
-- **Spacing and layout rhythm:** The three duration lanes precede a compact
-  event list and a separate inspector with a 14-pixel gap. Corners, rules, and
-  padding use the current product rhythm. The density fix removes excess
-  vertical space.
-- **Colors and visual tokens:** Model events use muted violet, tools use amber,
-  context uses green, and selection uses the product blue. Data surfaces remain
-  opaque enough for long-form scanning.
-- **Image quality and assets:** The screen contains no raster product imagery.
-  It uses the existing Material Symbols icon source and introduces no custom
-  SVG, CSS illustration, placeholder art, or rasterized text.
-- **Copy and content:** Labels match the Trace domain. Values come from the
-  backend event API, and unavailable content is described accurately instead
-  of being invented.
-
-### Browser acceptance
-
-The in-app browser loaded a real backend Trace. It verified **Duration**,
-**Calls**, search filtering, event selection, **Summary**, **Raw**, and the
-**Logs** switch. The selected LLM call displayed token totals, TTFT, generation
-time, throughput, finish reason, and Span ID. The browser development log
-contained no warnings or errors after the interaction pass.
-
-The frontend production build and the targeted backend test suite pass.
-
-final result: passed
-
-## Glass system and ApexCharts follow-up
-
-This section records the follow-up implementation that consolidates the glass
-surface rules, replaces Recharts with ApexCharts, and changes compact
-master-detail layouts to use a responsive drawer. It supersedes the earlier
-implementation evidence for the current working tree.
-
-### Current source visual truth
-
-The August 20 audit captures are the visual source for this iteration. They
-preserve the approved blue-white, rounded direction while exposing the layout
-and data-visualization issues that this pass must fix.
-
-- `output/design-audit-2026-08-20-glass-review/01-chat.png`
-- `output/design-audit-2026-08-20-glass-review/03-knowledge.png`
-- `output/design-audit-2026-08-20-glass-review/06-observability-overview.png`
-- `output/design-audit-2026-08-20-glass-review/07-observability-calls.png`
-- `output/design-audit-2026-08-20-glass-review/09-trace-detail.png`
-- `output/design-audit-2026-08-20-glass-review/10-trace-detail-1024.png`
-
-The desktop source images are 1280 x 720 pixels. The implementation captures
-are 1280 x 709 pixels because Chrome excludes its external browser chrome from
-the image. The side-by-side comparisons crop both images to 1280 x 708 pixels
-before joining them. Device scale remains 1.
-
-### Current implementation evidence
-
-Chrome rendered the following current working-tree states. The browser used a
-1280 x 900 viewport override for desktop checks and a 1024 x 820 override for
-the responsive checks. The resulting content captures are 1280 x 709 and
-1024 x 567 pixels, respectively.
-
-- `output/design-qa-2026-08-20-glass-apex/01-chat-1280.png`
-- `output/design-qa-2026-08-20-glass-apex/02-skills-1280.png`
-- `output/design-qa-2026-08-20-glass-apex/03-knowledge-1280.png`
-- `output/design-qa-2026-08-20-glass-apex/04-memory-1280.png`
-- `output/design-qa-2026-08-20-glass-apex/05-settings-1280.png`
-- `output/design-qa-2026-08-20-glass-apex/12-observability-overview-revised-1280.png`
-- `output/design-qa-2026-08-20-glass-apex/13-observability-costs-1280.png`
-- `output/design-qa-2026-08-20-glass-apex/14-observability-logs-1280.png`
-- `output/design-qa-2026-08-20-glass-apex/15-observability-quality-1280.png`
-- `output/design-qa-2026-08-20-glass-apex/16-observability-alerts-1280.png`
-- `output/design-qa-2026-08-20-glass-apex/10-trace-detail-1024.png`
-- `output/design-qa-2026-08-20-glass-apex/11-skills-drawer-1024.png`
-
-The same-input, side-by-side comparison files are:
-
-- `output/design-qa-2026-08-20-glass-apex/compare-chat-before-after.png`
-- `output/design-qa-2026-08-20-glass-apex/compare-observability-before-after.png`
-
-Focused captures aren't required for typography or controls because the
-1280-pixel captures keep those surfaces readable. The separate 1024-pixel
-drawer capture provides focused evidence for the responsive inspector state.
-
-### Comparison history
-
-The first implementation pass found three actionable issues. Each issue was
-fixed and re-captured before this report was marked as passed.
-
-- **P1, observability overview:** The trend panels drew flat zero-value charts
-  even though the KPI strip contained nonzero request, token, and latency
-  totals. The ApexCharts implementation now detects missing aggregate samples
-  and shows a precise explanatory state instead of a misleading trend.
-- **P2, calls table:** The 1280-pixel view cropped the time and Trace columns.
-  The call cell now includes its timestamp, low-priority columns use responsive
-  breakpoints, and the table keeps explicit horizontal overflow as a fallback.
-- **P2, compact inspectors:** The previous 1024-pixel layout stacked the
-  inspector below the master list. Skills, knowledge, memory, document, and
-  Trace inspectors now open in a keyboard-accessible Glass drawer at or below
-  1180 pixels.
-
-The second capture found two polish issues. The skill source path wrapped into
-several hard-to-scan lines, and the logs source text could spill into the
-message column. Source paths now retain the full value in a title while showing
-a compact tail, and log source cells now truncate within their column.
-
-The final capture contains no actionable P0, P1, or P2 difference from the
-approved direction.
-
-### Required fidelity surfaces
-
-The final pass covers each required fidelity surface against the approved
-blue-white glass direction.
-
-- **Fonts and typography:** Inter and Chinese system fallbacks remain intact.
-  Numeric metrics use tabular figures, long paths and IDs have explicit
-  truncation behavior, and chart labels use readable localized names.
-- **Spacing and layout:** The 14-pixel shell gap, 18 to 28-pixel panel radii,
-  master-detail proportions, and data-panel padding remain consistent.
-  Responsive inspectors no longer extend the page height unexpectedly.
-- **Colors and visual tokens:** Navigation, headers, toolbars, and drawers use
-  translucent glass. Tables, charts, and long text use high-opacity data
-  surfaces. Semantic success, warning, and error colors remain unchanged.
-- **Image quality and assets:** The product continues to use Material Symbols
-  and Ant Design assets. This pass introduces no generated imagery, placeholder
-  art, custom SVG, or rasterized interface text.
-- **Copy and content:** Existing routes, API fields, actions, and dynamic data
-  remain the source of truth. Empty chart states explain the difference between
-  accumulated totals and pending hourly aggregation without inventing data.
-
-### Browser acceptance
-
-Chrome tested chat, skills, knowledge, memory, settings, every observability
-tab, Trace navigation, the Trace detail tree, and the 1024-pixel drawer state.
-The responsive drawer opened from a real skill row and closed normally. Trace
-navigation opened a real backend Trace. No destructive action or form
-submission was used during acceptance.
-
-The production build completes successfully. ApexCharts remains in a separate
-lazy-loaded chart chunk, so non-observability routes do not download the chart
-runtime during initial navigation.
-
-### Current result
-
-The follow-up implementation keeps the approved rounded blue-white glass
-language while improving data readability, responsive behavior, accessibility,
-and initial bundle structure.
+字体、字号、字重、行高和截断规则保持上一版实现。新增动效只改变面板的
+transform 和 opacity，没有改变文字换行或会话密度。
+
+### 间距与布局节奏
+
+功能轨保持 64px，历史抽屉保持 224px，间距保持 8px。功能轨圆角为 26px，
+抽屉圆角为 28px。动效结束前后，工作区与侧栏边界连续，无跳帧位移。
+
+### 色彩与视觉 token
+
+继续使用蓝白半透明毛玻璃、26px blur 和 145% saturation。分裂连接面复用
+相同的蓝色透明度和高光边缘，没有引入新的高饱和颜色。
+
+### 图像与图标质量
+
+本轮没有新增位图资产。图标继续使用项目现有的 Material Symbols，尺寸和
+光学重量保持一致；没有使用占位图、CSS 绘图或近似图标。
+
+### 文案与内容
+
+导航名称、会话标题、搜索文案和操作文案均未改变。tooltip 显示真实功能名，
+没有把调试说明暴露到界面。
+
+## 交互检查
+
+交互检查覆盖鼠标悬停、展开、收起、列表滑动高亮，以及响应式布局。
+
+- 功能轨和历史列表高亮均使用统一坐标系，测得偏差为 0px。
+- 约 620ms 的 GSAP Flip 与 Timeline 协调工作区和玻璃面板。
+- 融回中间帧的抽屉宽度依次约为 152px、27px 和 0px。
+- 分裂中间帧从约 87px 的半透明玻璃面扩展至 224px。
+- 文字在玻璃面建立后进入，在融回开始时先退出。
+- 900px 视口保留 64px 功能轨；760px 视口切换为底部圆角工具条。
+- `prefers-reduced-motion` 分支跳过形变并直接提交布局状态。
+- 浏览器控制台没有 error 或 warning。
+
+## 比较历史
+
+1. P1：功能轨悬停高亮向左偏移 8px、向上偏移 76px。原因是嵌套按钮的
+   `offsetLeft` 和 `offsetTop` 属于不同 offset parent。修复后改为基于
+   `getBoundingClientRect()` 的同一坐标系，最终偏差为 0px。
+2. P1：折叠态 tooltip 被对话区覆盖。原因是侧栏的隔离堆叠上下文没有外部
+   z-index。修复后侧栏建立明确层级，tooltip 在聚焦对照中完整可见。
+3. P1：收起时抽屉突然消失。原因是在约 100ms 时提交折叠状态，CSS 立即将
+   宽度和可见性清零。修复后新增正式的 `splitting` 和 `merging` 阶段，
+   抽屉在整个形变周期内保持渲染。
+4. P1：首版形变草案的临时 DOM class 被 React 重渲染覆盖，暂停的 Flip
+   动画还可能残留 transform。修复后阶段由 React state 管理，Flip 与玻璃
+   Timeline 并行播放；最终截图和浏览器测量均无残留状态。
+
+## 实现检查清单
+
+- [x] 修复功能轨和历史列表的高亮坐标。
+- [x] 修复折叠态 tooltip 的堆叠层级。
+- [x] 实现玻璃抽屉的分裂和融回形变。
+- [x] 保持圆角、毛玻璃和历史会话密度。
+- [x] 验证桌面与窄屏无页面级溢出。
+- [x] 通过 TypeScript 和 Vite 生产构建。
+
+## Follow-up polish
+
+没有阻塞交付的 P3 项。若后续需要更强的物理感，可以在用户确认当前节奏后，
+微调连接面的透明度或 620ms 时长，不建议增加弹跳或大幅旋转。
 
 final result: passed

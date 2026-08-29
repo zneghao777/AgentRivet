@@ -4,6 +4,7 @@ export const DEFAULT_API_KEY = "sk-dev-key-1";
 export const API_KEY_STORAGE_KEY = "harness_api_key";
 export const MODEL_STORAGE_KEY = "harness_model";
 export const BASE_URL_STORAGE_KEY = "harness_base_url";
+export const CUSTOM_MODELS_STORAGE_KEY = "harness_custom_models";
 
 export const CHAT_MODELS = [
   { value: "deepseek-v4-pro", label: "deepseek-v4-pro", description: "通用对话与工具调用" },
