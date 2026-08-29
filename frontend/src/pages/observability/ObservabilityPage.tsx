@@ -3,11 +3,12 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import { Button, Tag, message } from "antd";
 import { useSearchParams } from "react-router-dom";
-import { getOverview } from "@/api/observability";
-import type { OverviewData } from "@/types/observability";
+import { getOverview, getRouterStats } from "@/api/observability";
+import type { OverviewData, RouterStatsData } from "@/types/observability";
 import { formatTime } from "@/utils/format";
 import { MetricStrip, WorkspaceHeader } from "@/components/common/Workspace";
 import { GlassEmptyState } from "@/components/common/Glass";
+import { agentColor } from "@/utils/agentColor";
 
 const OverviewCharts = lazy(() => import("@/components/observability/OverviewCharts"));
 const TraceListPage = lazy(() => import("./TraceListPage"));
@@ -31,13 +32,15 @@ type TabKey = (typeof TABS)[number]["key"];
 
 function OverviewTab() {
   const [data, setData] = useState<OverviewData | null>(null);
+  const [routerStats, setRouterStats] = useState<RouterStatsData | null>(null);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const d = await getOverview();
+      const [d, routes] = await Promise.all([getOverview(), getRouterStats()]);
       setData(d);
+      setRouterStats(routes);
     } catch (e) {
       message.error(e instanceof Error ? e.message : "加载观测数据失败");
     } finally {
@@ -86,6 +89,25 @@ function OverviewTab() {
       <Suspense fallback={<div className="obs-chart-loading"><GlassEmptyState icon="progress_activity" title="正在加载图表" description="观测指标已就绪，正在准备交互图表…" /></div>}>
         <OverviewCharts data={d} />
       </Suspense>
+
+      <section className="obs-panel obs-router-distribution" aria-labelledby="obs-router-distribution-title">
+        <header className="obs-panel-title">
+          <span className="material-symbols-rounded" aria-hidden="true">route</span>
+          <div><b id="obs-router-distribution-title">路由分布</b><small>{routerStats?.total ?? 0} 次决策 · {routerStats?.clarifications ?? 0} 次澄清</small></div>
+        </header>
+        {routerStats && routerStats.total > 0 ? (
+          <div className="obs-router-bars">
+            {Object.entries(routerStats.by_agent).sort(([, a], [, b]) => b.count - a.count).map(([name, item]) => (
+              <div className="obs-router-row" key={name}>
+                <span title={name}>{name}</span>
+                <div><i style={{ width: `${Math.max(4, item.count / routerStats.total * 100)}%`, background: agentColor(name) }} /></div>
+                <b>{item.count}</b>
+                <small>{Math.round(item.avg_confidence * 100)}%</small>
+              </div>
+            ))}
+          </div>
+        ) : <GlassEmptyState icon="route" title="暂无路由决策" description="开启多 Agent 编排并发送消息后，这里会显示各 Agent 的命中次数与平均置信度。" />}
+      </section>
 
       {d.recent_errors.length > 0 ? (
         <div className="obs-panel">

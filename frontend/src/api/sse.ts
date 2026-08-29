@@ -13,6 +13,12 @@ import type {
   MessageEnd,
   RunEnd,
   SseError,
+  OrchestrationRouterDecision,
+  OrchestrationClarification,
+  OrchestrationPlan,
+  OrchestrationWorkerStarted,
+  OrchestrationWorkerFinished,
+  OrchestrationSynthesis,
 } from "@/types/sse";
 import { API_KEY_STORAGE_KEY, DEFAULT_API_KEY } from "@/constants";
 
@@ -29,6 +35,12 @@ export interface StreamHandlers {
   onMessageEnd?(d: MessageEnd): void;
   onRunEnd?(d: RunEnd): void;
   onError?(d: SseError): void;
+  onOrchestrationRouterDecision?(d: OrchestrationRouterDecision): void;
+  onOrchestrationClarification?(d: OrchestrationClarification): void;
+  onOrchestrationPlan?(d: OrchestrationPlan): void;
+  onOrchestrationWorkerStarted?(d: OrchestrationWorkerStarted): void;
+  onOrchestrationWorkerFinished?(d: OrchestrationWorkerFinished): void;
+  onOrchestrationSynthesis?(d: OrchestrationSynthesis): void;
   onClose?(): void;
 }
 
@@ -39,7 +51,12 @@ export async function streamChat(
     skills?: string[];
     knowledge_bases?: string[];
     model?: string;
+    provider_config?: {
+      base_url: string;
+      api_key: string;
+    };
     attachment_ids?: string[];
+    agent_id?: string;
   },
   handlers: StreamHandlers,
   signal?: AbortSignal
@@ -122,6 +139,24 @@ export async function streamChat(
           break;
         case "error":
           handlers.onError?.(d as SseError);
+          break;
+        case "orchestration.router_decision":
+          handlers.onOrchestrationRouterDecision?.(d as OrchestrationRouterDecision);
+          break;
+        case "orchestration.clarification":
+          handlers.onOrchestrationClarification?.(d as OrchestrationClarification);
+          break;
+        case "orchestration.plan":
+          handlers.onOrchestrationPlan?.(d as OrchestrationPlan);
+          break;
+        case "orchestration.worker_started":
+          handlers.onOrchestrationWorkerStarted?.(d as OrchestrationWorkerStarted);
+          break;
+        case "orchestration.worker_finished":
+          handlers.onOrchestrationWorkerFinished?.(d as OrchestrationWorkerFinished);
+          break;
+        case "orchestration.synthesis":
+          handlers.onOrchestrationSynthesis?.(d as OrchestrationSynthesis);
           break;
         default:
           break;

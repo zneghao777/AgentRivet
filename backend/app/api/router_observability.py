@@ -149,6 +149,7 @@ def _span_lane(span: AgentSpan) -> str | None:
 
 def _safe_span_raw(span: AgentSpan, capture_mode: str) -> dict:
     """按采集策略返回检视原始数据，metadata_only 不泄露内容字段。"""
+    attributes = span.attributes or {}
     base = {
         "span_id": span.span_id,
         "parent_span_id": span.parent_span_id,
@@ -171,6 +172,8 @@ def _safe_span_raw(span: AgentSpan, capture_mode: str) -> dict:
         "error": span.error,
         "attribute_keys": sorted((span.attributes or {}).keys()),
         "events": span.events or [],
+        "task_id": attributes.get("task_id"),
+        "agent_name": attributes.get("agent_name"),
     }
     if capture_mode != "metadata_only":
         base.update(
@@ -332,6 +335,12 @@ async def collector_health(
             else None,
         }
     )
+
+
+@router.get("/router-stats", response_model=ApiResponse)
+async def router_stats(auth: AuthContext = Depends(require_auth)):
+    """返回当前进程内的 Router 命中分布与平均置信度。"""
+    return ApiResponse(data=metrics.router_stats(auth.tenant.tenant_id))
 
 
 @router.get("/metrics", response_model=ApiResponse)
@@ -784,6 +793,7 @@ async def get_trace_events(
             "output_summary": visible_output,
             "error": span.error,
             "capture_mode": capture_mode,
+            "task_id": (span.attributes or {}).get("task_id"),
             "references": (
                 (span.attributes or {}).get("references", [])
                 if capture_mode != "metadata_only"

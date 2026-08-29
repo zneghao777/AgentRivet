@@ -108,10 +108,11 @@ function LaneOverview({ blocks, totalMs, selectedId, onSelect }: {
   );
 }
 
-const EventRow = memo(function EventRow({ event, selected, onSelect }: {
+const EventRow = memo(function EventRow({ event, selected, onSelect, depth = 0 }: {
   event: TraceEventItem;
   selected: boolean;
   onSelect: (eventId: string) => void;
+  depth?: number;
 }) {
   const meta = EVENT_META[event.kind];
   return (
@@ -120,6 +121,7 @@ const EventRow = memo(function EventRow({ event, selected, onSelect }: {
       <button
         type="button"
         className={`trace-event-row ${event.kind}${selected ? " selected" : ""}`}
+        style={{ marginLeft: `${Math.min(4, depth) * 14}px` }}
         onClick={() => onSelect(event.event_id)}
         aria-pressed={selected}
       >
@@ -137,6 +139,7 @@ const EventRow = memo(function EventRow({ event, selected, onSelect }: {
             {event.model ? <span>{event.model}</span> : null}
             {event.kind === "tool" ? <span>1 tool call</span> : null}
             {event.token_usage ? <span>{tokenValue(event.token_usage, "total", "total").toLocaleString()} tokens</span> : null}
+            {event.task_id ? <span className="trace-task-badge" title={event.task_id}>task {event.task_id.slice(0, 8)}</span> : null}
           </span>
         </span>
         <span className="trace-event-step">Step {event.step_index}</span>
@@ -309,6 +312,24 @@ export default function TraceDetailPage() {
     });
   }, [data, keyword, mode]);
 
+  const eventDepths = useMemo(() => {
+    const bySpan = new Map(data?.events.filter((event) => event.span_id).map((event) => [event.span_id as string, event]) ?? []);
+    const depths = new Map<string, number>();
+    const depthOf = (event: TraceEventItem, seen = new Set<string>()): number => {
+      if (!event.span_id || !event.parent_span_id || seen.has(event.span_id)) return 0;
+      const cached = depths.get(event.span_id);
+      if (cached != null) return cached;
+      const parent = bySpan.get(event.parent_span_id);
+      if (!parent) return 0;
+      seen.add(event.span_id);
+      const depth = Math.min(4, depthOf(parent, seen) + 1);
+      depths.set(event.span_id, depth);
+      return depth;
+    };
+    data?.events.forEach((event) => depths.set(event.event_id, depthOf(event)));
+    return depths;
+  }, [data]);
+
   useEffect(() => {
     if (filteredEvents.length && !filteredEvents.some((event) => event.event_id === selectedId)) {
       setSelectedId(filteredEvents[0].event_id);
@@ -393,7 +414,7 @@ export default function TraceDetailPage() {
                 <header><div><strong>执行事件</strong><span>{filteredEvents.length} 条</span></div><small>按真实发生时间排序</small></header>
                 <div className="trace-event-list">
                   {filteredEvents.length ? filteredEvents.map((event) => (
-                    <EventRow key={event.event_id} event={event} selected={event.event_id === selectedId} onSelect={setSelectedId} />
+                    <EventRow key={event.event_id} event={event} selected={event.event_id === selectedId} onSelect={setSelectedId} depth={eventDepths.get(event.event_id) ?? 0} />
                   )) : <Empty description="没有匹配的事件" />}
                 </div>
               </section>

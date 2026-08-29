@@ -3,46 +3,45 @@
 from __future__ import annotations
 
 import time
-from urllib.parse import urlparse
+import uuid
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..agents.model_endpoint import ModelEndpointError, validate_model_base_url
+from ..agents.resolver import resolve_orchestration_agents
 from ..config import settings
+from ..harness.planner import create_plan
+from ..harness.router import decide_route
 from ..observability.metrics import metrics
 from ..storage import repositories as repo
 from ..storage.db import get_db
 from .deps import AuthContext, require_auth
-from .schemas import ApiResponse, AuditResponse, ModelConnectionTestRequest
+from .schemas import (
+    ApiResponse,
+    AuditResponse,
+    ModelConnectionTestRequest,
+    RouteDryRunRequest,
+)
 
 router = APIRouter(tags=["admin"])
 
 
 def _allowed_model_base_url(base_url: str) -> str:
-    normalized = base_url.rstrip("/")
-    parsed = urlparse(normalized)
-    configured_host = urlparse(settings.LLM_BASE_URL).hostname
-    allowed_hosts = {
-        host.strip().lower()
-        for host in settings.LLM_ALLOWED_BASE_HOSTS.split(",")
-        if host.strip()
-    }
-    if configured_host:
-        allowed_hosts.add(configured_host.lower())
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise HTTPException(status_code=422, detail="Base URL 必须是有效的 HTTP(S) 地址")
-    if parsed.hostname.lower() not in allowed_hosts:
-        raise HTTPException(status_code=422, detail="Base URL 主机不在允许列表中")
-    return normalized
+    try:
+        return validate_model_base_url(base_url)
+    except ModelEndpointError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-async def _call_model_connection(base_url: str, model: str) -> dict:
+async def _call_model_connection(base_url: str, model: str, api_key: str) -> dict:
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     async with httpx.AsyncClient(timeout=20.0) as client:
         response = await client.post(
             f"{base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {settings.LLM_API_KEY}"},
+            headers=headers,
             json={
                 "model": model,
                 "messages": [{"role": "user", "content": "Reply with OK."}],
@@ -52,7 +51,7 @@ async def _call_model_connection(base_url: str, model: str) -> dict:
             },
         )
     if response.is_error:
-        detail = response.text.replace(settings.LLM_API_KEY, "***")[:300]
+        detail = response.text.replace(api_key, "***")[:300] if api_key else response.text[:300]
         raise HTTPException(
             status_code=502,
             detail=f"模型服务返回 HTTP {response.status_code}: {detail}",
@@ -66,12 +65,19 @@ async def test_model_connection(
     body: ModelConnectionTestRequest,
     auth: AuthContext = Depends(require_auth),
 ):
-    """使用后端已配置的供应商密钥验证指定模型。"""
-    if not settings.LLM_API_KEY:
+    """使用请求级凭据或后端默认凭据验证指定模型。"""
+    custom_credential_supplied = "api_key" in body.model_fields_set
+    if body.api_key is not None:
+        provider_api_key = body.api_key.get_secret_value()
+    elif custom_credential_supplied:
+        provider_api_key = ""
+    else:
+        provider_api_key = settings.LLM_API_KEY
+    if not provider_api_key and not custom_credential_supplied:
         raise HTTPException(status_code=503, detail="后端尚未配置 LLM_API_KEY")
     base_url = _allowed_model_base_url(body.base_url or settings.LLM_BASE_URL)
     started = time.monotonic()
-    result = await _call_model_connection(base_url, body.model)
+    result = await _call_model_connection(base_url, body.model, provider_api_key)
     return ApiResponse(
         data={
             "connected": True,
@@ -80,6 +86,34 @@ async def test_model_connection(
             "latency_ms": int((time.monotonic() - started) * 1000),
         }
     )
+
+
+@router.post("/admin/agents/{agent_id}/route-dry-run", response_model=ApiResponse)
+async def route_dry_run(
+    agent_id: uuid.UUID,
+    body: RouteDryRunRequest,
+    auth: AuthContext = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    """只执行 Router（以及编排模式的 Plan 预览），不执行任何 Worker。"""
+    row = await repo.agent_repository.get(
+        db, tenant_id=auth.tenant.tenant_id, agent_id=agent_id
+    )
+    if row is None or row.status == "archived":
+        raise HTTPException(status_code=404, detail="Agent 不存在")
+    agents = await resolve_orchestration_agents(
+        db, tenant_id=auth.tenant.tenant_id
+    )
+    decision = await decide_route(
+        body.message,
+        tenant_id=auth.tenant.tenant_id,
+        agents=agents,
+    )
+    data = decision.model_dump()
+    if decision.mode == "orchestrate" and not decision.needs_clarification:
+        plan = await create_plan(body.message, agents=agents)
+        data["plan"] = plan.model_dump() if plan else None
+    return ApiResponse(data=data)
 
 
 @router.get("/health")

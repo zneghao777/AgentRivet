@@ -92,3 +92,51 @@ export interface SseError {
   code: number;
   message: string;
 }
+
+export interface OrchestrationRouterDecision {
+  mode: "direct" | "orchestrate";
+  target_agent: string;
+  confidence: number;
+  reason: string;
+  needs_clarification: boolean;
+  ts?: string;
+}
+
+export interface OrchestrationClarification {
+  question: string;
+  options: string[];
+  ts?: string;
+}
+
+export interface OrchestrationPlan {
+  summary: string;
+  execution: "parallel" | "sequential";
+  tasks: Array<{
+    task_id: string;
+    target_agent: string;
+    goal: string;
+    constraints?: string[];
+  }>;
+  ts?: string;
+}
+
+export interface OrchestrationWorkerStarted {
+  task_id: string;
+  agent_name: string;
+  ts?: string;
+}
+
+export interface OrchestrationWorkerFinished {
+  task_id: string;
+  agent_name: string;
+  status: "done" | "failed";
+  duration_ms: number;
+  result_preview: string;
+  error?: string | null;
+  ts?: string;
+}
+
+export interface OrchestrationSynthesis {
+  phase: "started";
+  ts?: string;
+}

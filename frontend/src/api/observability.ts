@@ -9,10 +9,15 @@ import type {
   TraceDetail,
   TraceListData,
   TrendPoint,
+  RouterStatsData,
 } from "@/types/observability";
 
 export function getOverview(): Promise<OverviewData> {
   return getData<OverviewData>("/observability/overview");
+}
+
+export function getRouterStats(): Promise<RouterStatsData> {
+  return getData<RouterStatsData>("/observability/router-stats");
 }
 
 export function getTraces(params: {

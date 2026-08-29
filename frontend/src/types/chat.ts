@@ -60,6 +60,32 @@ export interface ChatRun {
   steps: ChatRunStep[];
 }
 
+export type OrchestrationWorkerStatus = "pending" | "running" | "done" | "failed";
+
+export interface OrchestrationWorkerState {
+  taskId: string;
+  agentName: string;
+  goal: string;
+  constraints: string[];
+  status: OrchestrationWorkerStatus;
+  durationMs?: number;
+  resultPreview?: string;
+  error?: string;
+}
+
+export interface ChatOrchestration {
+  mode: "direct" | "orchestrate";
+  targetAgent: string;
+  confidence: number;
+  reason: string;
+  summary?: string;
+  execution?: "parallel" | "sequential";
+  workers: Record<string, OrchestrationWorkerState>;
+  phase: "routing" | "planning" | "executing" | "verifying" | "synthesizing" | "done";
+  clarification?: { question: string; options: string[]; selected?: string };
+  connectionState?: "connected" | "disconnected" | "stopped";
+}
+
 export interface ChatMessage {
   id?: number | string;
   role: "user" | "assistant" | "system";
@@ -67,6 +93,9 @@ export interface ChatMessage {
   createdAt?: string;
   run?: ChatRun;
   attachments?: ChatAttachment[];
+  agentId?: string;
+  agentName?: string;
+  orchestration?: ChatOrchestration;
 }
 
 export interface ChatAttachment {

@@ -43,6 +43,12 @@ export interface OverviewData {
   recent_errors: RecentErrorTrace[];
 }
 
+export interface RouterStatsData {
+  total: number;
+  clarifications: number;
+  by_agent: Record<string, { count: number; avg_confidence: number }>;
+}
+
 export interface TraceItem {
   trace_id: string;
   span_id: string;
@@ -163,6 +169,7 @@ export interface TraceEventItem {
   output_summary: string | null;
   error: string | null;
   capture_mode: string;
+  task_id?: string | null;
   references?: RunStepReference[];
   raw: Record<string, unknown>;
   turn_index: number;

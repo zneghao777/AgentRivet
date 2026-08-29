@@ -12,6 +12,9 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..agents.model_endpoint import ModelEndpointError, validate_model_base_url
+from ..agents.models import ResolvedAgentCapabilities
+from ..agents.resolver import resolve_agent_capabilities, resolve_orchestration_agents
 from ..chat.attachments import (
     ChatAttachmentError,
     delete_attachment,
@@ -71,8 +74,21 @@ def _request_model_and_attachments(
     body: MessageSendRequest | MessageStreamRequest,
     tenant_id: str,
     session_id: uuid.UUID,
-) -> tuple[str, list[dict]]:
-    model_id = body.model or settings.LLM_MODEL
+    agent: ResolvedAgentCapabilities | None = None,
+) -> tuple[str, str | None, str | None, list[dict]]:
+    model_id = body.model or (agent.model if agent else None) or settings.LLM_MODEL
+    model_base_url: str | None = agent.model_base_url if agent else None
+    model_api_key: str | None = None
+    if body.provider_config is not None:
+        try:
+            model_base_url = validate_model_base_url(body.provider_config.base_url)
+        except ModelEndpointError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        model_api_key = (
+            body.provider_config.api_key.get_secret_value()
+            if body.provider_config.api_key is not None
+            else ""
+        )
     try:
         attachments = prepare_attachments(tenant_id, session_id, body.attachment_ids)
     except ChatAttachmentError as exc:
@@ -82,7 +98,65 @@ def _request_model_and_attachments(
             status_code=422,
             detail=f"图片附件需要使用视觉模型 {VISION_MODEL}",
         )
-    return model_id, attachments
+    return model_id, model_base_url, model_api_key, attachments
+
+
+def _body_agent_id(body: MessageSendRequest | MessageStreamRequest) -> uuid.UUID | None:
+    if not body.agent_id:
+        return None
+    try:
+        return uuid.UUID(body.agent_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="agent_id 无效") from exc
+
+
+async def _resolve_request_agent(
+    db: AsyncSession,
+    *,
+    tenant_id: str,
+    session,
+    body: MessageSendRequest | MessageStreamRequest,
+) -> ResolvedAgentCapabilities:
+    if not settings.AGENT_HUB_ENABLED:
+        return ResolvedAgentCapabilities()
+    requested = _body_agent_id(body)
+    return await resolve_agent_capabilities(
+        db,
+        tenant_id=tenant_id,
+        agent_id=requested if requested is not None else session.agent_id,
+    )
+
+
+async def _resolve_orchestration_context(
+    db: AsyncSession, *, tenant_id: str
+):
+    if not settings.MULTI_AGENT_ENABLED:
+        return {}
+    return await resolve_orchestration_agents(db, tenant_id=tenant_id)
+
+
+def _resolve_skill_names(
+    body: MessageSendRequest | MessageStreamRequest,
+    agent: ResolvedAgentCapabilities,
+) -> list[str]:
+    if not agent.active:
+        return body.skills or []
+    bound = agent.allowed_skill_names or []
+    if body.skills is None:
+        return bound
+    requested = set(body.skills)
+    return [name for name in bound if name in requested]
+
+
+def _resolve_mcp_ids(
+    body: MessageSendRequest | MessageStreamRequest,
+    agent: ResolvedAgentCapabilities,
+) -> set[uuid.UUID] | None:
+    requested = _requested_mcp_ids(body.capabilities)
+    if not agent.active:
+        return requested
+    bound = agent.allowed_capability_ids or set()
+    return bound if requested is None else bound & requested
 
 
 @router.post("/{session_id}/attachments", response_model=ApiResponse)
@@ -155,16 +229,31 @@ def _schedule_memory_extract(
     """
     if not settings.MEMORY_ENABLED:
         return
-    task = asyncio.create_task(
-        _run_memory_extract(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            user_msg=user_msg,
-            assistant_msg=assistant_msg,
-            session_id=session_id,
-            session_title=session_title,
-        )
-    )
+    kwargs = {
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "user_msg": user_msg,
+        "assistant_msg": assistant_msg,
+        "session_id": session_id,
+        "session_title": session_title,
+    }
+    if settings.MQ_ENABLED and settings.MQ_SESSION_ENABLED:
+        from ..mq.publisher import publish_nowait
+        from ..observability.tracing import redact_text
+
+        payload = {
+            **kwargs,
+            "session_id": str(session_id),
+            "user_msg": redact_text(user_msg) or "",
+            "assistant_msg": redact_text(assistant_msg) or "",
+        }
+        if publish_nowait(
+            "session.postprocess",
+            payload,
+            fallback=lambda: _run_memory_extract(**kwargs),
+        ):
+            return
+    task = asyncio.create_task(_run_memory_extract(**kwargs))
     _extract_tasks.add(task)
     task.add_done_callback(_extract_tasks.discard)
 
@@ -226,22 +315,26 @@ async def send_message(
 ):
     """发送消息（非流式，返回完整回复）。"""
     sess = await repo.get_session(db, session_id)
-    if sess is None or sess.status == "deleted":
+    if sess is None or sess.tenant_id != auth.tenant.tenant_id or sess.status == "deleted":
         raise HTTPException(status_code=404, detail="session not found")
 
     start = time.monotonic()
     if harness_app.runtime is None:
         raise HTTPException(status_code=503, detail="harness not ready")
 
-    model_id, attachments = _request_model_and_attachments(
+    resolved_agent = await _resolve_request_agent(
+        db, tenant_id=auth.tenant.tenant_id, session=sess, body=body
+    )
+    model_id, model_base_url, model_api_key, attachments = _request_model_and_attachments(
         body=body,
         tenant_id=auth.tenant.tenant_id,
         session_id=session_id,
+        agent=resolved_agent,
     )
 
     request_id = f"req-{uuid.uuid4().hex[:12]}"
     await _ensure_session_title(db, sess, body.message)
-    await repo.add_message(
+    user_message_row = await repo.add_message(
         db,
         session_id=session_id,
         role="user",
@@ -249,25 +342,38 @@ async def send_message(
         request_id=request_id,
         step_index=1,
     )
-    skill_names = body.skills or []
+    skill_names = _resolve_skill_names(body, resolved_agent)
     kb_names = body.knowledge_bases or []
 
     # RAG 上下文注入：解析会话绑定的知识库白名单，供 knowledge_search 工具读取
-    allowed_kb_ids = await knowledge_service.resolve_ids_by_names(
+    requested_kb_ids = await knowledge_service.resolve_ids_by_names(
         db, tenant_id=auth.tenant.tenant_id, names=kb_names
     )
+    if resolved_agent.active and resolved_agent.allowed_kb_ids:
+        allowed_kb_ids = (
+            resolved_agent.allowed_kb_ids
+            if body.knowledge_bases is None
+            else [value for value in requested_kb_ids if value in set(resolved_agent.allowed_kb_ids)]
+        )
+    else:
+        allowed_kb_ids = requested_kb_ids
     # 长期记忆自动注入：对话前检索当前用户记忆（MEMORY_SPEC §6.2 方式 A）
-    memory_context = await _retrieve_memory_context(
-        db,
-        tenant_id=auth.tenant.tenant_id,
-        user_id=auth.user_id,
-        query=body.message,
-    )
-    requested_mcp = _requested_mcp_ids(body.capabilities)
+    memory_context = ""
+    if resolved_agent.memory_enabled:
+        memory_context = await _retrieve_memory_context(
+            db,
+            tenant_id=auth.tenant.tenant_id,
+            user_id=auth.user_id,
+            query=body.message,
+        )
+    requested_mcp = _resolve_mcp_ids(body, resolved_agent)
     dynamic_tools = await mcp_manager.resolve_tools(
         db,
         tenant_id=auth.tenant.tenant_id,
         requested_capability_ids=requested_mcp,
+    )
+    orchestration_agents = await _resolve_orchestration_context(
+        db, tenant_id=auth.tenant.tenant_id
     )
     set_tool_context(
         ToolContext(
@@ -276,7 +382,20 @@ async def send_message(
             allowed_kb_ids=allowed_kb_ids,
             dynamic_tools=dynamic_tools,
             model_id=model_id,
+            model_base_url=model_base_url,
+            model_api_key=model_api_key,
             attachments=attachments,
+            agent_id=resolved_agent.agent_id,
+            agent_name=resolved_agent.agent_name,
+            agent_system_prompt=resolved_agent.system_prompt_block,
+            allowed_skill_names=resolved_agent.allowed_skill_names if resolved_agent.active else None,
+            allowed_tool_names=resolved_agent.allowed_tool_names if resolved_agent.active else None,
+            allowed_capability_ids=requested_mcp,
+            memory_enabled=resolved_agent.memory_enabled,
+            orchestration_agents=orchestration_agents,
+            session_id=session_id,
+            message_id=user_message_row.id,
+            request_id=request_id,
         )
     )
     try:
@@ -289,6 +408,7 @@ async def send_message(
             memory_context,
             session_id=str(session_id),
             request_id=request_id,
+            message_id=user_message_row.id,
         )
     finally:
         reset_tool_context()
@@ -300,6 +420,8 @@ async def send_message(
     trace_id = obs.get("trace_id")
     if trace_id:
         await repo.link_messages_to_trace(db, request_id=request_id, trace_id=trace_id)
+    routed_name = (result.get("router_decision") or {}).get("target_agent")
+    routed_agent = orchestration_agents.get(routed_name) if routed_name else None
     await repo.add_message(
         db,
         session_id=session_id,
@@ -309,17 +431,19 @@ async def send_message(
         trace_id=trace_id,
         request_id=request_id,
         step_index=2,
+        agent_id=routed_agent.agent_id if routed_agent else resolved_agent.agent_id,
     )
 
     # 对话结束后台提炼长期记忆（不阻塞响应，MEMORY_SPEC §6.1）
-    _schedule_memory_extract(
-        tenant_id=auth.tenant.tenant_id,
-        user_id=auth.user_id,
-        user_msg=body.message,
-        assistant_msg=reply,
-        session_id=session_id,
-        session_title=sess.title,
-    )
+    if resolved_agent.memory_enabled:
+        _schedule_memory_extract(
+            tenant_id=auth.tenant.tenant_id,
+            user_id=auth.user_id,
+            user_msg=body.message,
+            assistant_msg=reply,
+            session_id=session_id,
+            session_title=sess.title,
+        )
 
     # 从运行结果提取工具调用次数与 token 用量
     tool_calls_count, token_usage = _extract_usage(result)
@@ -331,10 +455,14 @@ async def send_message(
         "chat.send",
         user_id=auth.user_id,
         session_id=session_id,
-        detail={"model": model_id, "tool_calls": tool_calls_count},
+        detail={"model": model_id, "tool_calls": tool_calls_count, "agent_id": str(resolved_agent.agent_id) if resolved_agent.agent_id else None},
     )
     metrics.record_request(
-        auth.tenant.tenant_id, ok=run_ok, duration_ms=duration_ms, token_usage=token_usage
+        auth.tenant.tenant_id,
+        ok=run_ok,
+        duration_ms=duration_ms,
+        token_usage=token_usage,
+        agent_id=str(resolved_agent.agent_id) if resolved_agent.agent_id else None,
     )
 
     return ApiResponse(
@@ -361,20 +489,24 @@ async def stream_message(
     MUST：连接关闭或客户端断开后清理运行资源。
     """
     sess = await repo.get_session(db, session_id)
-    if sess is None or sess.status == "deleted":
+    if sess is None or sess.tenant_id != auth.tenant.tenant_id or sess.status == "deleted":
         raise HTTPException(status_code=404, detail="session not found")
     if harness_app.runtime is None:
         raise HTTPException(status_code=503, detail="harness not ready")
 
-    model_id, attachments = _request_model_and_attachments(
+    resolved_agent = await _resolve_request_agent(
+        db, tenant_id=auth.tenant.tenant_id, session=sess, body=body
+    )
+    model_id, model_base_url, model_api_key, attachments = _request_model_and_attachments(
         body=body,
         tenant_id=auth.tenant.tenant_id,
         session_id=session_id,
+        agent=resolved_agent,
     )
 
     request_id = f"req-{uuid.uuid4().hex[:12]}"
     await _ensure_session_title(db, sess, body.message)
-    await repo.add_message(
+    user_message_row = await repo.add_message(
         db,
         session_id=session_id,
         role="user",
@@ -382,7 +514,7 @@ async def stream_message(
         request_id=request_id,
         step_index=1,
     )
-    skill_names = body.skills or []
+    skill_names = _resolve_skill_names(body, resolved_agent)
     kb_names = body.knowledge_bases or []
     thread_id = sess.thread_id
     tenant_id = auth.tenant.tenant_id
@@ -390,25 +522,37 @@ async def stream_message(
     client_ip = get_client_ip(request)
 
     # 解析会话绑定的知识库白名单（用于 SSE generator 内注入工具上下文）
-    allowed_kb_ids = await knowledge_service.resolve_ids_by_names(
+    requested_kb_ids = await knowledge_service.resolve_ids_by_names(
         db, tenant_id=tenant_id, names=kb_names
     )
+    if resolved_agent.active and resolved_agent.allowed_kb_ids:
+        allowed_kb_ids = (
+            resolved_agent.allowed_kb_ids
+            if body.knowledge_bases is None
+            else [value for value in requested_kb_ids if value in set(resolved_agent.allowed_kb_ids)]
+        )
+    else:
+        allowed_kb_ids = requested_kb_ids
     # 长期记忆自动注入：对话前检索当前用户记忆（MEMORY_SPEC §6.2 方式 A）
-    memory_context = await _retrieve_memory_context(
-        db, tenant_id=tenant_id, user_id=user_id, query=body.message
-    )
-    requested_mcp = _requested_mcp_ids(body.capabilities)
+    memory_context = ""
+    if resolved_agent.memory_enabled:
+        memory_context = await _retrieve_memory_context(
+            db, tenant_id=tenant_id, user_id=user_id, query=body.message
+        )
+    requested_mcp = _resolve_mcp_ids(body, resolved_agent)
     dynamic_tools = await mcp_manager.resolve_tools(
         db,
         tenant_id=tenant_id,
         requested_capability_ids=requested_mcp,
     )
+    orchestration_agents = await _resolve_orchestration_context(db, tenant_id=tenant_id)
 
     metrics.session_open(str(session_id))
     trace_id: str | None = None
+    routed_agent_name: str | None = None
 
     async def event_stream():
-        nonlocal trace_id
+        nonlocal trace_id, routed_agent_name
         reply_parts: list[str] = []
         stream_start = time.monotonic()
         run_status = "ok"
@@ -420,7 +564,20 @@ async def stream_message(
                 allowed_kb_ids=allowed_kb_ids,
                 dynamic_tools=dynamic_tools,
                 model_id=model_id,
+                model_base_url=model_base_url,
+                model_api_key=model_api_key,
                 attachments=attachments,
+                agent_id=resolved_agent.agent_id,
+                agent_name=resolved_agent.agent_name,
+                agent_system_prompt=resolved_agent.system_prompt_block,
+                allowed_skill_names=resolved_agent.allowed_skill_names if resolved_agent.active else None,
+                allowed_tool_names=resolved_agent.allowed_tool_names if resolved_agent.active else None,
+                allowed_capability_ids=requested_mcp,
+                memory_enabled=resolved_agent.memory_enabled,
+                orchestration_agents=orchestration_agents,
+                session_id=session_id,
+                message_id=user_message_row.id,
+                request_id=request_id,
             )
         )
         try:
@@ -433,6 +590,7 @@ async def stream_message(
                 session_id=str(session_id),
                 memory_context=memory_context,
                 request_id=request_id,
+                message_id=user_message_row.id,
             ):
                 if "event: trace_start" in frame:
                     try:
@@ -441,6 +599,15 @@ async def stream_message(
                             "{}",
                         )
                         trace_id = json.loads(data).get("trace_id") or trace_id
+                    except json.JSONDecodeError:
+                        pass
+                if "event: orchestration.router_decision" in frame:
+                    try:
+                        data = next(
+                            (line[6:] for line in frame.splitlines() if line.startswith("data: ")),
+                            "{}",
+                        )
+                        routed_agent_name = json.loads(data).get("target_agent") or routed_agent_name
                     except json.JSONDecodeError:
                         pass
                 # 从 run_end 事件提取实际状态（C-07：不固定按成功写）
@@ -471,6 +638,11 @@ async def stream_message(
             if trace_id:
                 await repo.link_messages_to_trace(db, request_id=request_id, trace_id=trace_id)
             if reply:
+                routed_agent = (
+                    orchestration_agents.get(routed_agent_name)
+                    if routed_agent_name
+                    else None
+                )
                 await repo.add_message(
                     db,
                     session_id=session_id,
@@ -479,9 +651,10 @@ async def stream_message(
                     trace_id=trace_id,
                     request_id=request_id,
                     step_index=2,
+                    agent_id=routed_agent.agent_id if routed_agent else resolved_agent.agent_id,
                 )
             # 对话结束后台提炼长期记忆（不阻塞响应，MEMORY_SPEC §6.1）
-            if reply:
+            if reply and resolved_agent.memory_enabled:
                 _schedule_memory_extract(
                     tenant_id=tenant_id,
                     user_id=user_id,
@@ -495,11 +668,16 @@ async def stream_message(
                 "chat.stream",
                 user_id=user_id,
                 session_id=session_id,
-                detail={"model": model_id},
+                detail={"model": model_id, "agent_id": str(resolved_agent.agent_id) if resolved_agent.agent_id else None},
                 ip=client_ip,
             )
             # C-06/C-07：使用真实耗时与状态
-            metrics.record_request(tenant_id, ok=(run_status == "ok"), duration_ms=duration_ms)
+            metrics.record_request(
+                tenant_id,
+                ok=(run_status == "ok"),
+                duration_ms=duration_ms,
+                agent_id=str(resolved_agent.agent_id) if resolved_agent.agent_id else None,
+            )
 
     return StreamingResponse(
         event_stream(),

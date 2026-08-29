@@ -2,7 +2,17 @@ import { useEffect, useRef } from "react";
 import type { ChatMessage } from "@/stores/sessionStore";
 import MessageBubble from "./MessageBubble";
 
-export default function MessageList({ messages, streaming }: { messages: ChatMessage[]; streaming: boolean }) {
+export default function MessageList({
+  messages,
+  streaming,
+  onClarificationSelect,
+  onClarificationOther,
+}: {
+  messages: ChatMessage[];
+  streaming: boolean;
+  onClarificationSelect?: (option: string) => void;
+  onClarificationOther?: () => void;
+}) {
   const bottomRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -24,7 +34,13 @@ export default function MessageList({ messages, streaming }: { messages: ChatMes
     <div className="message-list">
       <div className="message-column">
         {messages.map((message, index) => (
-          <MessageBubble key={`${message.createdAt ?? "local"}-${index}`} message={message} streaming={streaming && index === messages.length - 1} />
+          <MessageBubble
+            key={`${message.createdAt ?? "local"}-${index}`}
+            message={message}
+            streaming={streaming && index === messages.length - 1}
+            onClarificationSelect={index === messages.length - 1 ? onClarificationSelect : undefined}
+            onClarificationOther={index === messages.length - 1 ? onClarificationOther : undefined}
+          />
         ))}
         <div ref={bottomRef} />
       </div>
