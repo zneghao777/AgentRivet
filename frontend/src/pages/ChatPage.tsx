@@ -6,12 +6,14 @@ import { getTraceEvents } from "@/api/observability";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { AgentItem, AgentListData, HistoryMessage, SkillItem } from "@/types/api";
 import { traceEventsToChatRun } from "@/utils/chatRun";
+import { chatRunManager } from "@/services/chatRunManager";
 
 export default function ChatPage() {
   const { sessions, currentSessionId, setCurrentSession } = useSessionStore();
   const [skills, setSkills] = useState<SkillItem[]>([]);
   const [agents, setAgents] = useState<AgentItem[]>([]);
-  const [messagesLoading, setMessagesLoading] = useState(false);
+  const messagesLoading = useSessionStore((state) => currentSessionId
+    ? state.loadingBySession[currentSessionId] ?? false : false);
 
   useEffect(() => {
     Promise.all([
@@ -25,10 +27,10 @@ export default function ChatPage() {
   }, []);
 
   useEffect(() => {
-    if (!currentSessionId) { useSessionStore.getState().setMessages([]); return; }
+    if (!currentSessionId) return;
     const sessionId = currentSessionId;
     const controller = new AbortController();
-    setMessagesLoading(true);
+    useSessionStore.getState().setLoading(sessionId, true);
     getData<HistoryMessage[]>(`/sessions/${sessionId}/messages`, { signal: controller.signal })
       .then(async (messages) => {
         const traceIds = Array.from(new Set(messages
@@ -42,8 +44,7 @@ export default function ChatPage() {
           }
         }));
         const runByTrace = new Map(replays);
-        if (useSessionStore.getState().currentSessionId !== sessionId) return;
-        useSessionStore.getState().setMessages(messages.map((message) => ({
+        useSessionStore.getState().setMessages(sessionId, messages.map((message) => ({
           id: message.id,
           role: message.role as "user" | "assistant" | "system",
           content: message.content,
@@ -54,11 +55,12 @@ export default function ChatPage() {
           agentId: message.agent_id ?? undefined,
           agentName: message.agent_name ?? undefined,
         })));
+        await chatRunManager.restoreSession(sessionId);
       })
       .catch((error) => {
-        if (!controller.signal.aborted) useSessionStore.getState().setError(error instanceof Error ? error.message : "加载消息失败");
+        if (!controller.signal.aborted) useSessionStore.getState().setError(sessionId, error instanceof Error ? error.message : "加载消息失败");
       })
-      .finally(() => { if (!controller.signal.aborted) setMessagesLoading(false); });
+      .finally(() => { if (!controller.signal.aborted) useSessionStore.getState().setLoading(sessionId, false); });
     return () => controller.abort();
   }, [currentSessionId]);
 

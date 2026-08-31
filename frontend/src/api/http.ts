@@ -34,6 +34,7 @@ http.interceptors.response.use(
   },
   (error) => {
     const status = error?.response?.status;
+    const bodyMessage = error?.response?.data?.message;
     const detail = error?.response?.data?.detail;
     const detailMessage = typeof detail === "string" ? detail : detail?.message;
     if (status === 401) {
@@ -42,10 +43,12 @@ http.interceptors.response.use(
       );
     }
     if (status === 503) {
-      return Promise.reject(new Error(detailMessage || "服务未就绪(503)：请检查后端是否启动"));
+      return Promise.reject(new Error(
+        bodyMessage || detailMessage || "服务未就绪(503)：请检查后端是否启动"
+      ));
     }
-    if (detailMessage) {
-      return Promise.reject(new Error(detailMessage));
+    if (bodyMessage || detailMessage) {
+      return Promise.reject(new Error(bodyMessage || detailMessage));
     }
     if (!error?.response) {
       return Promise.reject(

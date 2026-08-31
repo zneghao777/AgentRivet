@@ -36,6 +36,36 @@ export interface MessageSendResponse {
   token_usage: Record<string, number>;
   tool_calls: number;
   duration_ms: number;
+  cache_hit: boolean;
+}
+
+export type DurableRunStatus = "queued" | "running" | "pending_approval" | "succeeded" | "failed" | "canceled";
+
+export interface ChatRunItem {
+  run_id: string;
+  session_id: string;
+  request_id: string;
+  status: DurableRunStatus;
+  content: string;
+  trace_id: string | null;
+  token_usage: Record<string, number> | null;
+  pending_approval: import("@/types/sse").InterruptRequested | null;
+  attempt: number;
+  error_code: string | null;
+  error_message: string | null;
+  last_event_sequence: number;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string | null;
+  events_url: string;
+}
+
+export interface ChatRunListData {
+  items: ChatRunItem[];
+  total: number;
+  page: number;
+  page_size: number;
 }
 
 export interface HistoryMessage {

@@ -2,6 +2,7 @@
 import { create } from "zustand";
 import {
   API_KEY_STORAGE_KEY,
+  APPROVAL_MODE_STORAGE_KEY,
   BASE_URL_STORAGE_KEY,
   CUSTOM_MODELS_STORAGE_KEY,
   DEFAULT_API_KEY,
@@ -20,6 +21,7 @@ export interface CustomChatModel {
 }
 
 export type CustomChatModelInput = Pick<CustomChatModel, "name" | "modelId" | "description" | "baseUrl" | "apiKey">;
+export type ApprovalMode = "manual" | "auto";
 
 // 读取本地存储中的 API Key，无则使用本地开发默认 key（与 backend/.env 对应）
 function loadApiKey(): string {
@@ -62,6 +64,10 @@ function loadCustomModels(): CustomChatModel[] {
   }
 }
 
+function loadApprovalMode(): ApprovalMode {
+  return localStorage.getItem(APPROVAL_MODE_STORAGE_KEY) === "manual" ? "manual" : "auto";
+}
+
 function persistCustomModels(models: CustomChatModel[]) {
   localStorage.setItem(CUSTOM_MODELS_STORAGE_KEY, JSON.stringify(models));
 }
@@ -77,9 +83,11 @@ interface SettingsState {
   model: string;
   baseUrl: string;
   customModels: CustomChatModel[];
+  approvalMode: ApprovalMode;
   setApiKey: (k: string) => void;
   setModel: (m: string) => void;
   setBaseUrl: (b: string) => void;
+  setApprovalMode: (mode: ApprovalMode) => void;
   addCustomModel: (input: CustomChatModelInput) => CustomChatModel;
   updateCustomModel: (id: string, input: CustomChatModelInput) => void;
   removeCustomModel: (id: string) => void;
@@ -90,6 +98,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   model: loadModel(),
   baseUrl: localStorage.getItem(BASE_URL_STORAGE_KEY) ?? "https://api.deepseek.com",
   customModels: loadCustomModels(),
+  approvalMode: loadApprovalMode(),
   setApiKey: (k) => {
     localStorage.setItem(API_KEY_STORAGE_KEY, k);
     set({ apiKey: k });
@@ -101,6 +110,10 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   setBaseUrl: (b) => {
     localStorage.setItem(BASE_URL_STORAGE_KEY, b);
     set({ baseUrl: b });
+  },
+  setApprovalMode: (approvalMode) => {
+    localStorage.setItem(APPROVAL_MODE_STORAGE_KEY, approvalMode);
+    set({ approvalMode });
   },
   addCustomModel: (input) => {
     const customModel: CustomChatModel = {

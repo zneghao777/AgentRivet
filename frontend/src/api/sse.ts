@@ -13,6 +13,8 @@ import type {
   MessageEnd,
   RunEnd,
   SseError,
+  QueueStatus,
+  DegradeStatus,
   OrchestrationRouterDecision,
   OrchestrationClarification,
   OrchestrationPlan,
@@ -35,6 +37,8 @@ export interface StreamHandlers {
   onMessageEnd?(d: MessageEnd): void;
   onRunEnd?(d: RunEnd): void;
   onError?(d: SseError): void;
+  onQueue?(d: QueueStatus): void;
+  onDegrade?(d: DegradeStatus): void;
   onOrchestrationRouterDecision?(d: OrchestrationRouterDecision): void;
   onOrchestrationClarification?(d: OrchestrationClarification): void;
   onOrchestrationPlan?(d: OrchestrationPlan): void;
@@ -44,27 +48,57 @@ export interface StreamHandlers {
   onClose?(): void;
 }
 
+export interface ChatRuntimeOptions {
+  skills?: string[];
+  knowledge_bases?: string[];
+  capabilities?: Array<{ kind: "skill" | "mcp_tool"; id: string }>;
+  model?: string;
+  provider_config?: {
+    base_url: string;
+    api_key: string;
+  };
+  attachment_ids?: string[];
+  agent_id?: string;
+}
+
+export interface ChatStreamRequest extends ChatRuntimeOptions {
+  message: string;
+  approval_mode?: "manual" | "auto";
+}
+
+export interface ChatResumeRequest extends ChatRuntimeOptions {
+  input: string;
+  decision: "approve" | "reject";
+}
+
 export async function streamChat(
   sessionId: string,
-  body: {
-    message: string;
-    skills?: string[];
-    knowledge_bases?: string[];
-    model?: string;
-    provider_config?: {
-      base_url: string;
-      api_key: string;
-    };
-    attachment_ids?: string[];
-    agent_id?: string;
-  },
+  body: ChatStreamRequest,
   handlers: StreamHandlers,
   signal?: AbortSignal
+): Promise<void> {
+  return postStream(`/sessions/${sessionId}/messages/stream`, body, handlers, signal);
+}
+
+export async function resumeChat(
+  sessionId: string,
+  body: ChatResumeRequest,
+  handlers: StreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  return postStream(`/sessions/${sessionId}/resume`, body, handlers, signal);
+}
+
+async function postStream(
+  path: string,
+  body: ChatStreamRequest | ChatResumeRequest,
+  handlers: StreamHandlers,
+  signal?: AbortSignal,
 ): Promise<void> {
   const apiKey = localStorage.getItem(API_KEY_STORAGE_KEY) || DEFAULT_API_KEY;
   const base = import.meta.env.VITE_API_BASE ?? "/api/v1";
 
-  const resp = await fetch(`${base}/sessions/${sessionId}/messages/stream`, {
+  const resp = await fetch(`${base}${path}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -75,20 +109,41 @@ export async function streamChat(
   });
 
   if (!resp.ok || !resp.body) {
-    let detail = "";
+    let payload: {
+      code?: number;
+      message?: string;
+      retry_after_ms?: number;
+      detail?: string | {
+        code?: number;
+        message?: string;
+        retry_after_ms?: number;
+      };
+    } = {};
     try {
-      const payload = await resp.json() as { detail?: string | { message?: string } };
-      detail = typeof payload.detail === "string" ? payload.detail : payload.detail?.message ?? "";
+      payload = await resp.json();
     } catch {
-      detail = "";
+      payload = {};
     }
+    const detail = typeof payload.detail === "string" ? payload.detail : payload.detail?.message ?? "";
     const msg =
       resp.status === 401
         ? "鉴权失败(401)：请确认 API Key 已配置且与后端一致"
         : resp.status === 503
-          ? detail || "服务未就绪(503)：请检查后端是否启动"
-          : detail || `请求失败: HTTP ${resp.status}`;
-    handlers.onError?.({ code: resp.status, message: msg });
+          ? payload.message || detail || "服务未就绪(503)：请检查后端是否启动"
+          : payload.message || detail || `请求失败: HTTP ${resp.status}`;
+    const retryAfterHeader = Number(resp.headers.get("Retry-After"));
+    const retryAfterMs = payload.retry_after_ms
+      ?? (payload.detail && typeof payload.detail === "object" ? payload.detail.retry_after_ms : undefined)
+      ?? (Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+        ? retryAfterHeader * 1000
+        : undefined);
+    handlers.onError?.({
+      code: payload.code
+        ?? (payload.detail && typeof payload.detail === "object" ? payload.detail.code : undefined)
+        ?? resp.status,
+      message: msg,
+      retry_after_ms: retryAfterMs,
+    });
     handlers.onClose?.();
     return;
   }
@@ -139,6 +194,12 @@ export async function streamChat(
           break;
         case "error":
           handlers.onError?.(d as SseError);
+          break;
+        case "queue":
+          handlers.onQueue?.(d as QueueStatus);
+          break;
+        case "degrade":
+          handlers.onDegrade?.(d as DegradeStatus);
           break;
         case "orchestration.router_decision":
           handlers.onOrchestrationRouterDecision?.(d as OrchestrationRouterDecision);

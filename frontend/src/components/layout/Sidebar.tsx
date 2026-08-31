@@ -16,6 +16,7 @@ import { deleteData, postData } from "@/api/http";
 import type { SessionItem } from "@/types/api";
 import { useSessionStore } from "@/stores/sessionStore";
 import { summarize } from "@/utils/format";
+import { chatRunManager } from "@/services/chatRunManager";
 import "@/styles/sidebar.css";
 
 gsap.registerPlugin(useGSAP, Flip);
@@ -112,7 +113,7 @@ export default function Sidebar() {
     setSessions,
     setCurrentSession,
     sessions,
-    streaming,
+    runsBySession,
     fetchSessions,
   } = useSessionStore();
   const [creating, setCreating] = useState(false);
@@ -133,7 +134,9 @@ export default function Sidebar() {
   const transitionRunningRef = useRef(false);
 
   useEffect(() => {
-    void fetchSessions();
+    void fetchSessions().then(() => {
+      return chatRunManager.restoreAllActiveRuns();
+    });
   }, [fetchSessions]);
 
   const pinnedSet = useMemo(() => new Set(pinnedIds), [pinnedIds]);
@@ -372,7 +375,6 @@ export default function Sidebar() {
   });
 
   const createNew = async () => {
-    if (streaming) return;
     setCreating(true);
     try {
       const session = await postData<SessionItem>("/sessions", { title: "新对话" });
@@ -386,7 +388,6 @@ export default function Sidebar() {
   };
 
   const removeSession = async (sessionId: string) => {
-    if (streaming) return;
     setDeletingId(sessionId);
     try {
       await deleteData(`/sessions/${sessionId}`);
@@ -487,7 +488,7 @@ export default function Sidebar() {
             data-tooltip={creating ? "创建中…" : "新建会话"}
             aria-label={creating ? "正在创建会话" : "新建会话"}
             onClick={() => void createNew()}
-            disabled={creating || streaming}
+            disabled={creating}
           >
             <span className={`material-symbols-rounded${creating ? " is-spinning" : ""}`}>
               {creating ? "progress_activity" : "edit_square"}
@@ -602,6 +603,15 @@ export default function Sidebar() {
               {group.sessions.map((session) => {
                 const active = currentSessionId === session.session_id;
                 const pinned = pinnedSet.has(session.session_id);
+                const run = runsBySession[session.session_id];
+                const runActive = run && ["queued", "running", "pending_approval"].includes(run.status);
+                const runLabel = run?.status === "queued" ? "排队中"
+                  : run?.status === "running" ? "正在回复…"
+                    : run?.status === "pending_approval" ? "需要审批"
+                      : run?.status === "failed" ? "运行失败 · 打开重试"
+                        : run?.status === "canceled" ? "已停止"
+                          : run?.status === "succeeded" && run.unseen ? "已完成"
+                            : formatSessionTime(session);
                 return (
                   <div
                     className={`sidebar-session-row${active ? " is-active" : ""}`}
@@ -616,15 +626,14 @@ export default function Sidebar() {
                         setCurrentSession(session.session_id);
                         navigate("/");
                       }}
-                      disabled={streaming && !active}
                       aria-current={active ? "page" : undefined}
                     >
                       <span className="material-symbols-rounded sidebar-session-icon">chat_bubble</span>
                       <span className="sidebar-session-copy">
                         <strong>{summarize(session.title || "新对话", 18)}</strong>
-                        <small className={streaming && active ? "is-streaming" : ""}>
-                          {streaming && active ? <i aria-hidden="true" /> : null}
-                          {streaming && active ? "正在回复…" : formatSessionTime(session)}
+                        <small className={runActive ? "is-streaming" : ""}>
+                          {runActive ? <i aria-hidden="true" /> : null}
+                          {runLabel}
                         </small>
                       </span>
                     </button>
@@ -650,7 +659,7 @@ export default function Sidebar() {
                           type="button"
                           title="删除会话"
                           aria-label={`删除会话：${session.title || "新对话"}`}
-                          disabled={streaming || deletingId === session.session_id}
+                          disabled={Boolean(runActive) || deletingId === session.session_id}
                         >
                           <span className={`material-symbols-rounded${deletingId === session.session_id ? " is-spinning" : ""}`}>
                             {deletingId === session.session_id ? "progress_activity" : "delete"}

@@ -74,7 +74,18 @@ export interface ToolEnd {
 export interface InterruptRequested {
   id: string;
   reason: string;
-  state: Record<string, unknown>;
+  state: ToolApprovalState;
+}
+
+export interface ToolApprovalState {
+  type: "tool_approval";
+  reason: string;
+  tool_calls: Array<{
+    id: string;
+    name: string;
+    description: string;
+    arguments: Record<string, unknown>;
+  }>;
 }
 
 export interface MessageEnd {
@@ -90,7 +101,20 @@ export interface RunEnd {
 
 export interface SseError {
   code: number;
-  message: string;
+  message?: string;
+  retry_after_ms?: number;
+}
+
+export interface QueueStatus {
+  position: number;
+  queue_size: number;
+  estimated_wait_ms: number;
+}
+
+export interface DegradeStatus {
+  level: number;
+  reason: string;
+  effects: string[];
 }
 
 export interface OrchestrationRouterDecision {
