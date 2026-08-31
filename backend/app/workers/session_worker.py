@@ -209,6 +209,12 @@ async def _renew_lease(message_id: str) -> None:
 
 async def _run(stop: asyncio.Event) -> None:
     await create_tables()
+    from ..harness.guard_metrics_bridge import (
+        start_guard_metrics_bridge,
+        stop_guard_metrics_bridge,
+    )
+
+    start_guard_metrics_bridge(collect_remote=False)
     channel = await mq_connection.open_consumer_channel()
     queue = await channel.get_queue(SESSION_QUEUE, ensure=True)
     semaphore = asyncio.Semaphore(3)
@@ -235,6 +241,7 @@ async def _run(stop: asyncio.Event) -> None:
             task.cancel()
     await deduplicator.close()
     await mq_connection.close()
+    await stop_guard_metrics_bridge()
 
 
 async def main() -> None:

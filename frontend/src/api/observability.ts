@@ -141,6 +141,7 @@ export interface AlertRuleItem {
   window_minutes: number;
   min_samples: number;
   enabled: boolean;
+  severity: "warning" | "critical";
   created_at: string | null;
 }
 
@@ -148,6 +149,7 @@ export interface IncidentItem {
   id: number;
   rule_id: number | null;
   status: string;
+  severity: "warning" | "critical";
   metric: string;
   threshold: number;
   current_value: number;

@@ -5,8 +5,8 @@ from __future__ import annotations
 import time
 import uuid
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
+from langchain_core.messages import HumanMessage
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,27 +37,19 @@ def _allowed_model_base_url(base_url: str) -> str:
 
 
 async def _call_model_connection(base_url: str, model: str, api_key: str) -> dict:
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.post(
-            f"{base_url}/chat/completions",
-            headers=headers,
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": "Reply with OK."}],
-                "temperature": 0,
-                "max_tokens": 1,
-                "stream": False,
-            },
-        )
-    if response.is_error:
-        detail = response.text.replace(api_key, "***")[:300] if api_key else response.text[:300]
-        raise HTTPException(
-            status_code=502,
-            detail=f"模型服务返回 HTTP {response.status_code}: {detail}",
-        )
-    payload = response.json()
-    return {"resolved_model": payload.get("model") or model}
+    from ..agents.base_agent import create_llm
+
+    llm = create_llm(
+        model_id=model,
+        base_url=base_url,
+        api_key=api_key,
+        temperature=0,
+        call_channel="online",
+        max_tokens=1,
+    )
+    response = await llm.ainvoke([HumanMessage(content="Reply with OK.")])
+    metadata = getattr(response, "response_metadata", {}) or {}
+    return {"resolved_model": metadata.get("model_name") or model}
 
 
 @router.post("/admin/test-connection", response_model=ApiResponse)
@@ -163,6 +155,20 @@ async def list_audit(
 @router.get("/metrics")
 async def get_metrics(
     group_by: str | None = Query(None),
+    guard_first_outcome_after: int | None = Query(None, ge=0),
+    guard_queue_wait_after: int | None = Query(None, ge=0),
+    guard_degrade_after: int | None = Query(None, ge=0),
     auth: AuthContext = Depends(require_auth),
 ):
-    return ApiResponse(data=metrics.summary(group_by=group_by))
+    data = metrics.summary(group_by=group_by)
+    if (
+        guard_first_outcome_after is not None
+        or guard_queue_wait_after is not None
+        or guard_degrade_after is not None
+    ) and isinstance(data, dict):
+        data["concurrency_guard"] = metrics.guard_snapshot(
+            first_outcome_after=guard_first_outcome_after,
+            queue_wait_after=guard_queue_wait_after,
+            degrade_after=guard_degrade_after,
+        )
+    return ApiResponse(data=data)

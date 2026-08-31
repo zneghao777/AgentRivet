@@ -1448,6 +1448,7 @@ async def list_alerts(
                     "window_minutes": r.window_minutes,
                     "min_samples": r.min_samples,
                     "enabled": r.enabled,
+                    "severity": r.severity,
                     "created_at": _dt(r.created_at),
                 }
                 for r in rows
@@ -1476,6 +1477,7 @@ async def create_alert(
             "window_minutes": body.window_minutes,
             "min_samples": body.min_samples,
             "enabled": body.enabled,
+            "severity": body.severity,
         },
     )
     await audit.audit(
@@ -1502,6 +1504,7 @@ async def list_incidents(
                     "id": r.id,
                     "rule_id": r.rule_id,
                     "status": r.status,
+                    "severity": r.severity,
                     "metric": r.metric,
                     "threshold": r.threshold,
                     "current_value": r.current_value,

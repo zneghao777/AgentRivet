@@ -12,6 +12,11 @@ const INCIDENT_COLOR: Record<string, string> = {
   resolved: "success",
 };
 
+const SEVERITY_COLOR: Record<string, string> = {
+  warning: "gold",
+  critical: "red",
+};
+
 export default function AlertsPage({ hideHeader = false }: { hideHeader?: boolean } = {}) {
   const [rules, setRules] = useState<AlertRuleItem[]>([]);
   const [incidents, setIncidents] = useState<IncidentItem[]>([]);
@@ -45,11 +50,13 @@ export default function AlertsPage({ hideHeader = false }: { hideHeader?: boolea
     window: r.window_minutes,
     min_samples: r.min_samples,
     enabled: r.enabled,
+    severity: r.severity,
   }));
 
   const incidentRows = incidents.map((i) => ({
     key: i.id,
     status: i.status,
+    severity: i.severity,
     metric: i.metric,
     current_value: i.current_value,
     threshold: i.threshold,
@@ -128,6 +135,7 @@ export default function AlertsPage({ hideHeader = false }: { hideHeader?: boolea
             columns={[
               { title: "规则", dataIndex: "name", key: "name" },
               { title: "指标", dataIndex: "metric", key: "metric" },
+              { title: "级别", dataIndex: "severity", key: "severity", render: (v: string) => <Tag color={SEVERITY_COLOR[v] || "default"}>{v.toUpperCase()}</Tag> },
               { title: "阈值", key: "threshold", render: (_: unknown, r: { threshold: number; comparison: string }) => `${r.comparison} ${r.threshold}` },
               { title: "窗口", dataIndex: "window", key: "window", render: (v: number) => `${v} 分钟` },
               { title: "最小样本", dataIndex: "min_samples", key: "min_samples" },
@@ -155,6 +163,7 @@ export default function AlertsPage({ hideHeader = false }: { hideHeader?: boolea
             pagination={false}
             columns={[
               { title: "状态", dataIndex: "status", key: "status", width: 110, render: (v: string) => <Tag color={INCIDENT_COLOR[v] || "default"}>{v}</Tag> },
+              { title: "级别", dataIndex: "severity", key: "severity", width: 100, render: (v: string) => <Tag color={SEVERITY_COLOR[v] || "default"}>{v.toUpperCase()}</Tag> },
               { title: "指标", dataIndex: "metric", key: "metric", width: 130 },
               { title: "当前值 / 阈值", key: "value", width: 150, render: (_: unknown, r: { current_value: number; threshold: number }) => `${r.current_value.toFixed(3)} / ${r.threshold}` },
               { title: "消息", dataIndex: "message", key: "message", ellipsis: true },
