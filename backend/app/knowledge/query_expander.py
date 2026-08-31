@@ -13,6 +13,7 @@ import logging
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from ..config import settings
+from ..harness.llm_guard import LLMGuardError
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,8 @@ async def expand_query(query: str, llm: BaseChatModel | None = None) -> str:
         if not rewritten:
             return query
         return rewritten
+    except LLMGuardError:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("Query 改写失败，使用原始 query: %s", exc)
         return query

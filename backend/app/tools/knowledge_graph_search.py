@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
@@ -57,10 +56,19 @@ async def _graph_search_async(
         return "（未配置工具运行上下文，无法检索）"
 
     strategy = strategy if strategy in VALID_STRATEGIES else "auto"
+    top_k = ctx.effective_rag_top_k
     try:
         async with AsyncSessionLocal() as db:
-            results = await _run(db, ctx.tenant_id, ctx.allowed_kb_ids, knowledge_base,
-                                  query, strategy, hop)
+            results = await _run(
+                db,
+                ctx.tenant_id,
+                ctx.allowed_kb_ids,
+                knowledge_base,
+                query,
+                strategy,
+                hop,
+                top_k=top_k,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.error("图谱检索失败: %s", exc)
         return f"（图谱检索失败: {exc}）"
@@ -74,15 +82,24 @@ async def _graph_search_async(
             "kb": knowledge_base,
             "strategy": strategy,
             "hop": hop,
+            "top_k": top_k,
             "entities": len(results.get("entities", [])),
             "relations": len(results.get("relations", [])),
         },
     )
-    return _to_markdown(results, strategy)
+    return _to_markdown(results, strategy, top_k=top_k)
 
 
-async def _run(db, tenant_id: str, allowed_kb_ids, kb_name: str | None,
-               query: str, strategy: str, hop: int) -> dict:
+async def _run(
+    db,
+    tenant_id: str,
+    allowed_kb_ids,
+    kb_name: str | None,
+    query: str,
+    strategy: str,
+    hop: int,
+    top_k: int,
+) -> dict:
     """解析知识库并执行图检索。"""
     from ..knowledge.service import knowledge_service
 
@@ -104,16 +121,26 @@ async def _run(db, tenant_id: str, allowed_kb_ids, kb_name: str | None,
     seen_chunks: set[int] = set()
     for kb_id in resolved:
         r = await graph_retriever.hybrid_search(
-            db, tenant_id=tenant_id, kb_id=kb_id,
-            query=query, strategy=strategy, hop=hop, top_k=10,
+            db,
+            tenant_id=tenant_id,
+            kb_id=kb_id,
+            query=query,
+            strategy=strategy,
+            hop=hop,
+            top_k=top_k,
         )
         merged["entities"].extend(
             e for e in r["entities"] if str(e) not in seen_entities
         )
         seen_entities.update(str(e) for e in r["entities"])
         merged["relations"].extend(
-            rel for rel in r["relations"]
-            if f"{rel['source_entity_id']}-{rel['relation_type']}-{rel['target_entity_id']}" not in seen_relations
+            rel
+            for rel in r["relations"]
+            if (
+                f"{rel['source_entity_id']}-{rel['relation_type']}-"
+                f"{rel['target_entity_id']}"
+            )
+            not in seen_relations
         )
         seen_relations.update(
             f"{rel['source_entity_id']}-{rel['relation_type']}-{rel['target_entity_id']}"
@@ -126,10 +153,13 @@ async def _run(db, tenant_id: str, allowed_kb_ids, kb_name: str | None,
                 seen_chunks.add(c)
         merged["hits"].extend(r["hits"])
     merged["evidence_chunk_ids"] = sorted(seen_chunks)
+    for key in ("entities", "relations", "communities", "events", "hits"):
+        merged[key] = merged[key][:top_k]
+    merged["evidence_chunk_ids"] = merged["evidence_chunk_ids"][:top_k]
     return merged
 
 
-def _to_markdown(results: dict, strategy: str) -> str:
+def _to_markdown(results: dict, strategy: str, *, top_k: int) -> str:
     """将图检索结果拼为 markdown（供 Agent 阅读）。"""
     parts: list[str] = []
     entities = results.get("entities", [])
@@ -139,26 +169,26 @@ def _to_markdown(results: dict, strategy: str) -> str:
 
     if communities:
         parts.append("【社区摘要】")
-        for c in communities:
+        for c in communities[:top_k]:
             kw = "、".join(c.get("keywords", []) or [])
             parts.append(f"- {c.get('summary')}" + (f"（关键词：{kw}）" if kw else ""))
 
     if entities:
         parts.append("【相关实体】")
-        for e in entities:
+        for e in entities[:top_k]:
             name = e.get("canonical_name") or e.get("name")
             parts.append(f"- {name}（{e.get('entity_type')}）")
 
     if relations:
         parts.append("【实体关系】")
-        for r in relations:
+        for r in relations[:top_k]:
             parts.append(
                 f"- {r.get('source_name')} —[{r.get('relation_type')}]→ {r.get('target_name')}"
             )
 
     if events:
         parts.append("【事件时间线】")
-        for ev in events:
+        for ev in events[:top_k]:
             parts.append(
                 f"- {ev.get('order_no')}. {ev.get('summary') or ''}"
                 f"（{ev.get('subject_entity_id')} {ev.get('predicate')} {ev.get('object') or ''}）"
@@ -168,7 +198,7 @@ def _to_markdown(results: dict, strategy: str) -> str:
     evidence = [h for h in hits if h.source_chunk_id]
     if evidence:
         parts.append("【证据片段】")
-        for h in evidence[:5]:
+        for h in evidence[:top_k]:
             parts.append(f"- chunk #{h.source_chunk_id}: {h.text}")
 
     if not parts:

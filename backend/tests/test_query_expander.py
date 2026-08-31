@@ -11,6 +11,7 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from app.config import settings
+from app.harness.llm_guard import LLMGuardOpenError
 from app.knowledge.query_expander import expand_query
 
 
@@ -45,6 +46,16 @@ async def test_expand_failure_returns_original():
     llm = _FakeLLM(exc=TimeoutError("llm timeout"))
     out = await expand_query("原始问题", llm=llm)
     assert out == "原始问题"
+
+
+@pytest.mark.asyncio
+async def test_expand_preserves_guard_capacity_error():
+    llm = _FakeLLM(exc=LLMGuardOpenError(retry_after_ms=1234))
+
+    with pytest.raises(LLMGuardOpenError) as error:
+        await expand_query("原始问题", llm=llm)
+
+    assert error.value.retry_after_ms == 1234
 
 
 @pytest.mark.asyncio

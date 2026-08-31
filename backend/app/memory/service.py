@@ -96,14 +96,12 @@ async def _decide_conflict(
         'MERGE（合并文本，两者都保留）。'
     )
     try:
-        from langchain_openai import ChatOpenAI
+        from ..agents.base_agent import create_llm
 
-        llm = ChatOpenAI(
-            model=settings.LLM_MODEL,
-            base_url=settings.LLM_BASE_URL,
-            api_key=settings.LLM_API_KEY,
+        llm = create_llm(
             temperature=0,
             max_tokens=64,
+            call_channel="background",
         )
         resp = await llm.ainvoke(prompt)
         decision = (resp.content or "").strip().upper()

@@ -109,14 +109,12 @@ async def extract(
     prompt = _EXTRACT_PROMPT.format(conversation=conversation)
 
     try:
-        from langchain_openai import ChatOpenAI
+        from ..agents.base_agent import create_llm
 
-        llm = ChatOpenAI(
-            model=settings.LLM_MODEL,
-            base_url=settings.LLM_BASE_URL,
-            api_key=settings.LLM_API_KEY,
+        llm = create_llm(
             temperature=0.2,
             max_tokens=settings.LLM_MAX_TOKENS,
+            call_channel="background",
         )
         resp = await llm.ainvoke(prompt)
         raw = resp.content if isinstance(resp.content, str) else ""

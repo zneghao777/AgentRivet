@@ -13,9 +13,9 @@ import json
 import logging
 import re
 
-import httpx
-
+from ...agents.base_agent import create_llm
 from ...config import settings
+from ...harness.llm_guard import LLMGuardError
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +71,6 @@ async def _chat_completion_inner(
     json_mode: bool,
 ) -> str:
     """chat_completion 内部实现（拆分便于按批覆盖 max_tokens）。"""
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
     payload: dict = {
         "model": model,
         "messages": messages,
@@ -85,7 +81,7 @@ async def _chat_completion_inner(
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
-    content = await _post_chat(base_url, api_key, payload, headers, json_mode=json_mode)
+    content = await _post_chat(base_url, api_key, payload, {}, json_mode=json_mode)
     if isinstance(content, list):
         return "".join(
             str(part.get("text", "")) if isinstance(part, dict) else str(part)
@@ -97,35 +93,35 @@ async def _chat_completion_inner(
 async def _post_chat(
     base_url: str, api_key: str, payload: dict, headers: dict, *, json_mode: bool
 ) -> str:
-    """POST chat/completions；json_mode 失败时去掉 response_format 重试一次。"""
+    """Call the shared background LLM guard; retry once without JSON mode."""
+    del headers  # 保留历史测试 seam，鉴权由 create_llm 统一注入。
+    llm = create_llm(
+        model_id=str(payload["model"]),
+        base_url=base_url,
+        api_key=api_key,
+        temperature=float(payload.get("temperature", 0.2)),
+        call_channel="background",
+        max_tokens=int(payload.get("max_tokens", 2048)),
+    )
+
+    invoke_kwargs: dict = {}
+    if json_mode:
+        invoke_kwargs["response_format"] = {"type": "json_object"}
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                f"{base_url}/chat/completions", json=payload, headers=headers
-            )
-    except httpx.HTTPError as exc:
-        raise ExtractLLMError(f"抽取 LLM 网络错误: {exc}") from exc
-    # json_mode 报错（如服务不支持 response_format）→ 去掉后重试
-    if resp.status_code != 200 and json_mode:
-        retry_payload = dict(payload)
-        retry_payload.pop("response_format", None)
+        response = await llm.ainvoke(payload["messages"], **invoke_kwargs)
+    except LLMGuardError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if not json_mode:
+            raise ExtractLLMError(f"抽取 LLM 调用失败: {exc}") from exc
+        # 部分 OpenAI 兼容服务不支持 response_format；去掉后仅重试一次。
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(
-                    f"{base_url}/chat/completions", json=retry_payload, headers=headers
-                )
-        except httpx.HTTPError as exc:
-            raise ExtractLLMError(f"抽取 LLM 网络错误: {exc}") from exc
-    if resp.status_code != 200:
-        raise ExtractLLMError(
-            f"抽取 LLM HTTP {resp.status_code}: {resp.text[:300]}"
-        )
-    try:
-        body = resp.json()
-        content = body["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ExtractLLMError("抽取 LLM 响应格式异常") from exc
-    return content
+            response = await llm.ainvoke(payload["messages"])
+        except LLMGuardError:
+            raise
+        except Exception as retry_exc:  # noqa: BLE001
+            raise ExtractLLMError(f"抽取 LLM 调用失败: {retry_exc}") from retry_exc
+    return response.content
 
 
 def parse_json_object(text: str) -> dict:

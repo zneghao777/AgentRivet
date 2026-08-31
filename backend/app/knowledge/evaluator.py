@@ -159,7 +159,7 @@ async def generate_answer(query: str, contexts: list[str], llm=None) -> str:
         if llm is None:
             from ..agents.base_agent import create_llm
 
-            llm = create_llm()
+            llm = create_llm(call_channel="background")
         prompt = _ANSWER_PROMPT.format(
             query=query, contexts="\n---\n".join(contexts)[:4000]
         )
@@ -181,7 +181,7 @@ async def judge_answer(
         if llm is None:
             from ..agents.base_agent import create_llm
 
-            llm = create_llm()
+            llm = create_llm(call_channel="background")
         prompt = _JUDGE_PROMPT.format(
             query=query,
             contexts="\n---\n".join(contexts)[:4000] or "（无）",

@@ -73,7 +73,10 @@ async def _knowledge_search_async(
         logger.warning("knowledge_search 缺少运行上下文（tenant_id 为空）")
         return "（未配置工具运行上下文，无法检索）"
 
-    top_k = max(1, min(int(top_k or 5), 10))
+    top_k = min(
+        max(1, min(int(top_k or 5), 10)),
+        ctx.effective_rag_top_k,
+    )
     try:
         async with AsyncSessionLocal() as db:
             hits = await knowledge_service.retrieve_v2(
@@ -88,6 +91,8 @@ async def _knowledge_search_async(
                 expand_query=expand_query,
                 mode=mode,
             )
+            # D2 必须在所有文本/图谱/融合与 rerank 分支之后统一截断。
+            hits = hits[:top_k]
     except EmbeddingError as exc:
         return f"（检索失败: {exc}）"
 
