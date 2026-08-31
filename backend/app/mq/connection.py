@@ -13,13 +13,18 @@ logger = logging.getLogger(__name__)
 
 OBS_EXCHANGE = "obs.exchange"
 SESSION_EXCHANGE = "session.exchange"
+CHAT_EXCHANGE = "chat.exchange"
 OBS_DLX = "obs.dlx"
 SESSION_DLX = "session.dlx"
+CHAT_DLX = "chat.dlx"
 OBS_SPANS_QUEUE = "obs.spans.q"
 OBS_AUDIT_QUEUE = "obs.audit.q"
 SESSION_QUEUE = "session.postprocess.q"
+CHAT_RUN_QUEUE = "chat.run.q"
+CHAT_RESUME_QUEUE = "chat.resume.q"
 OBS_DEAD_QUEUE = "obs.deadletter.q"
 SESSION_DEAD_QUEUE = "session.deadletter.q"
+CHAT_DEAD_QUEUE = "chat.deadletter.q"
 
 
 def retry_queue_name(index: int) -> str:
@@ -36,17 +41,25 @@ async def declare_topology(channel: Any) -> None:
     session_exchange = await channel.declare_exchange(
         SESSION_EXCHANGE, aio_pika.ExchangeType.DIRECT, durable=True
     )
+    chat_exchange = await channel.declare_exchange(
+        CHAT_EXCHANGE, aio_pika.ExchangeType.DIRECT, durable=True
+    )
     obs_dlx = await channel.declare_exchange(
         OBS_DLX, aio_pika.ExchangeType.DIRECT, durable=True
     )
     session_dlx = await channel.declare_exchange(
         SESSION_DLX, aio_pika.ExchangeType.DIRECT, durable=True
     )
+    chat_dlx = await channel.declare_exchange(
+        CHAT_DLX, aio_pika.ExchangeType.DIRECT, durable=True
+    )
 
     obs_dead = await channel.declare_queue(OBS_DEAD_QUEUE, durable=True)
     session_dead = await channel.declare_queue(SESSION_DEAD_QUEUE, durable=True)
+    chat_dead = await channel.declare_queue(CHAT_DEAD_QUEUE, durable=True)
     await obs_dead.bind(obs_dlx, routing_key="deadletter")
     await session_dead.bind(session_dlx, routing_key="deadletter")
+    await chat_dead.bind(chat_dlx, routing_key="deadletter")
 
     quorum_args = {
         "x-queue-type": "quorum",
@@ -67,10 +80,22 @@ async def declare_topology(channel: Any) -> None:
         durable=True,
         arguments={**quorum_args, "x-dead-letter-exchange": SESSION_DLX},
     )
+    chat = await channel.declare_queue(
+        CHAT_RUN_QUEUE,
+        durable=True,
+        arguments={**quorum_args, "x-dead-letter-exchange": CHAT_DLX},
+    )
+    chat_resume = await channel.declare_queue(
+        CHAT_RESUME_QUEUE,
+        durable=True,
+        arguments={**quorum_args, "x-dead-letter-exchange": CHAT_DLX},
+    )
     await spans.bind(obs_exchange, routing_key="obs.span.#")
     await spans.bind(obs_exchange, routing_key="obs.log")
     await audit.bind(obs_exchange, routing_key="obs.audit")
     await session.bind(session_exchange, routing_key="postprocess")
+    await chat.bind(chat_exchange, routing_key="run.requested")
+    await chat_resume.bind(chat_exchange, routing_key="run.resume")
 
     for index, ttl_ms in enumerate(settings.mq_retry_ttls_ms_list):
         await channel.declare_queue(

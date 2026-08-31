@@ -23,6 +23,7 @@ from ..storage.db import AsyncSessionLocal
 from .agent_circuit_breaker import agent_circuit_breaker
 from .context import get_tool_context, pop_tool_context, push_tool_context
 from .graph_builder import resolve_request_tools
+from .llm_guard import LLMGuardError
 from .models import TaskCard
 from .orchestration_events import emit
 
@@ -36,6 +37,9 @@ RESPONSIBILITY_TEMPLATE = """# 职责边界
 必要上下文：{context_brief}
 约束：{constraints}
 期望输出：{expected_output}
+
+# 最近会话任务上下文
+{conversation_context}
 """
 
 
@@ -81,6 +85,7 @@ async def execute_task(
                     agent,
                     task,
                     base_tools,
+                    conversation_context=str(state.get("conversation_context") or ""),
                     verification_reason=verification_reason,
                     previous_error=error,
                 ),
@@ -94,6 +99,8 @@ async def execute_task(
             break
         except TimeoutError:
             error = "worker_timeout"
+        except LLMGuardError:
+            raise
         except Exception as exc:  # noqa: BLE001
             error = f"worker_error: {str(exc)[:500]}"
             logger.warning(
@@ -146,6 +153,7 @@ async def _run_agent(
     task: TaskCard,
     base_tools: list,
     *,
+    conversation_context: str,
     verification_reason: str | None,
     previous_error: str | None,
 ) -> str:
@@ -178,6 +186,7 @@ async def _run_agent(
             context_brief=task.context_brief or "（无）",
             constraints="；".join(task.constraints) or "（无）",
             expected_output=task.expected_output or "（未指定）",
+            conversation_context=conversation_context or "（无）",
         )
         if verification_reason:
             boundary += (
@@ -216,6 +225,8 @@ async def _run_agent(
                         value = await tool.ainvoke(call.get("args") or {})
                         content = _tool_text(value)
                         status = "success"
+                    except LLMGuardError:
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         content = f"工具执行失败: {str(exc)[:500]}"
                         status = "error"

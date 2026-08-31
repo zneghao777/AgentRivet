@@ -162,6 +162,41 @@ async def test_connection_failures_use_backoff(monkeypatch):
     assert calls == 1
 
 
+@pytest.mark.asyncio
+async def test_chat_run_and_resume_use_separate_queues():
+    from app.mq.connection import (
+        CHAT_RESUME_QUEUE,
+        CHAT_RUN_QUEUE,
+        declare_topology,
+    )
+
+    bindings: list[tuple[str, str, str]] = []
+
+    class FakeExchange:
+        def __init__(self, name: str):
+            self.name = name
+
+    class FakeQueue:
+        def __init__(self, name: str):
+            self.name = name
+
+        async def bind(self, exchange, *, routing_key: str):
+            bindings.append((self.name, exchange.name, routing_key))
+
+    class FakeChannel:
+        async def declare_exchange(self, name, *_args, **_kwargs):
+            return FakeExchange(name)
+
+        async def declare_queue(self, name, **_kwargs):
+            return FakeQueue(name)
+
+    await declare_topology(FakeChannel())
+
+    assert (CHAT_RUN_QUEUE, "chat.exchange", "run.requested") in bindings
+    assert (CHAT_RESUME_QUEUE, "chat.exchange", "run.resume") in bindings
+    assert (CHAT_RUN_QUEUE, "chat.exchange", "run.resume") not in bindings
+
+
 def test_log_export_ignores_amqp_client_logs(monkeypatch):
     import logging
 

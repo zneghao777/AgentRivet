@@ -6,6 +6,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..agents.base_agent import create_llm
 from ..config import settings
+from .llm_guard import LLMGuardError
 
 SYNTHESIZER_PROMPT = """你是结果综合器。请把多个 Agent 的子任务结果综合为最终回答。
 
@@ -14,6 +15,7 @@ SYNTHESIZER_PROMPT = """你是结果综合器。请把多个 Agent 的子任务�
 2. 结论冲突时显式标注各 Agent 观点，不得擅自裁决。
 3. 存在失败分支时说明缺失部分及原因，并基于成功部分回答。
 4. 关键结论标注来源 Agent。
+5. 最终回答必须回应原始会话任务和当前用户请求，不得只罗列分支结果。
 """
 
 
@@ -25,7 +27,11 @@ def aggregate_outputs(outputs: list[dict]) -> dict:
     }
 
 
-async def synthesize(aggregated: dict) -> tuple[str, str | None]:
+async def synthesize(
+    aggregated: dict,
+    *,
+    request_context: str = "",
+) -> tuple[str, str | None]:
     results = aggregated.get("results", [])
     failures = aggregated.get("failures", [])
     if not results:
@@ -56,13 +62,21 @@ async def synthesize(aggregated: dict) -> tuple[str, str | None]:
         response = await llm.ainvoke(
             [
                 SystemMessage(content=SYNTHESIZER_PROMPT),
-                HumanMessage(content="\n\n".join(branches)),
+                HumanMessage(
+                    content=(
+                        f"# 原始会话任务\n{request_context.strip() or '（无）'}\n\n"
+                        "# Agent 分支结果\n"
+                        + "\n\n".join(branches)
+                    )
+                ),
             ]
         )
         content = getattr(response, "content", response)
         answer = content.strip() if isinstance(content, str) else str(content)
         if answer:
             return answer, "partial_failure" if failures else None
+    except LLMGuardError:
+        raise
     except Exception:  # noqa: BLE001
         pass
     answer = "\n\n".join(

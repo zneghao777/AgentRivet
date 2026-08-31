@@ -1,18 +1,20 @@
 # 消息队列（RabbitMQ）接入技术规格书
 
-版本：v1.0.0
+版本：v1.1.0
 日期：2026-08-28
-状态：待评审
+状态：既有观测/会话规范待评审；ChatRun 扩展已实现
 关联文档：`docs/SPEC.md`、`docs/OBSERVABILITY_SPEC.md`、`docs/MEMORY_SPEC.md`、
 `docs/MESSAGE_QUEUE_HA_ANALYSIS.md`
 
 本规格定义 RabbitMQ 在本项目中的接入范围、拓扑设计、消息模型、可靠性语义、
-降级策略、配置、测试与验收标准。**本期只覆盖两个场景**：
+降级策略、配置、测试与验收标准。当前覆盖三个场景：
 
 1. **观测体系**：Trace/Span、结构化日志、审计日志的旁路落库；
-2. **会话进行中的任务**：对话结束后的收尾工作（首期为长期记忆提炼）。
+2. **会话收尾任务**：对话结束后的长期记忆提炼；
+3. **异步对话运行**：可靠投递 `ChatRun` 创建和恢复命令。
 
-多 Agent 编排、知识库索引、定时任务调度**不在本期范围内**（见 §2.2 非目标）。
+多 Agent 子任务分发、知识库索引和定时任务调度不在本期范围内。ChatRun 的
+业务状态、事件和完整请求载荷仍以 PostgreSQL 为事实源，MQ 不传输 Token 帧。
 
 ---
 
@@ -115,11 +117,14 @@
 | --- | --- | --- | --- |
 | `obs.exchange` | topic | durable | 观测数据入口 |
 | `session.exchange` | direct | durable | 会话收尾任务入口 |
+| `chat.exchange` | direct | durable | ChatRun 命令入口 |
 | `obs.spans.q` | quorum | durable, DLX=`obs.dlx` | span + 结构化日志（`record_type` 区分） |
 | `obs.audit.q` | quorum | durable, DLX=`obs.dlx` | 审计（强合规，独立队列便于单独控保留） |
 | `session.postprocess.q` | quorum | durable, DLX=`session.dlx` | 会话收尾任务 |
-| `obs.dlx` / `session.dlx` | direct | durable | 死信交换机 |
-| `obs.deadletter.q` / `session.deadletter.q` | classic | durable | 死信队列（人工排查 + 告警数据源） |
+| `chat.run.q` | quorum | durable, DLX=`chat.dlx` | 新运行命令 |
+| `chat.resume.q` | quorum | durable, DLX=`chat.dlx` | HITL 恢复命令 |
+| `obs.dlx` / `session.dlx` / `chat.dlx` | direct | durable | 死信交换机 |
+| `*.deadletter.q` | classic | durable | 死信队列与告警数据源 |
 | `session.retry.q` | classic | durable, `x-message-ttl`（分级）, DLX=`session.exchange` | 延迟重试队列（TTL 到期后回投原交换机） |
 
 Binding：
@@ -129,6 +134,8 @@ obs.exchange  --obs.span.#-->  obs.spans.q      （routing key: obs.span / obs.l
 obs.exchange  --obs.audit-->   obs.audit.q
 session.exchange --postprocess--> session.postprocess.q
 session.retry.q --(TTL 到期)--> session.exchange（回投 postprocess）
+chat.exchange --run.requested--> chat.run.q
+chat.exchange --run.resume--> chat.resume.q
 ```
 
 ### 4.2 消息信封（统一格式）
@@ -138,7 +145,7 @@ session.retry.q --(TTL 到期)--> session.exchange（回投 postprocess）
 ```json
 {
   "message_id": "uuid（幂等键）",
-  "type": "obs.span | obs.log | obs.audit | session.postprocess",
+  "type": "obs.span | obs.log | obs.audit | session.postprocess | run.requested | run.resume",
   "version": 1,
   "created_at": "2026-08-28T12:00:00.000Z",
   "retry_count": 0,
@@ -180,6 +187,10 @@ session.retry.q --(TTL 到期)--> session.exchange（回投 postprocess）
 
 幂等键：`message_id` + `payload.session_id`。消费端以 `message_id` 做判重（Redis `SET NX EX 86400`，Redis 不可用时降级查 `agent_memories` 近期提炼记录）。
 
+**run.requested / run.resume**：消息只携带 `run_id`、命令类型、幂等
+`message_id` 和 TraceContext。Worker 按 `run_id` 从 PostgreSQL 读取不可变请求
+快照，并通过数据库状态和租约实现重复投递幂等。
+
 ---
 
 ## 5. 可靠性语义
@@ -211,6 +222,14 @@ session.retry.q --(TTL 到期)--> session.exchange（回投 postprocess）
 - 消息 `delivery_mode=2`（持久化），队列 durable；
 - Worker 无状态，可任意扩容（竞争消费）；同一队列消息按 prefetch 分摊，不重复消费。
 
+### 5.4 ChatRun 可靠性
+
+ChatRun 不使用“失败后降级到内存任务”的策略。API 在一个事务中写入
+`chat_runs` 和 `chat_run_outbox`，Outbox dispatcher 使用
+`FOR UPDATE SKIP LOCKED` 领取，publisher confirm 后才标记已发布。MQ 不可用时
+运行保持 `queued`，恢复后继续投递；独立 `chat-worker` 通过数据库租约领取，
+成功提交终态后才确认消息。
+
 ---
 
 ## 6. 代码改造点
@@ -226,6 +245,7 @@ backend/app/mq/
 backend/app/workers/
   obs_worker.py        # 消费 obs.*，批量落 PG（复用 repositories）
   session_worker.py    # 消费 session.postprocess，执行记忆提炼
+  chat_worker.py       # 消费 ChatRun 创建/恢复命令，按数据库租约执行
 ```
 
 依赖：`aio-pika>=9`（asyncio 原生，加入 `requirements.txt`）。
@@ -246,6 +266,7 @@ backend/app/workers/
 ```
 python -m app.workers.obs_worker      # 或 uvicorn 独立进程脚本
 python -m app.workers.session_worker
+python -m app.workers.chat_worker
 ```
 
 Worker 启动流程：初始化 DB 工厂 → `init_tracing`（Worker 自身 span 也走 MQ 或直写）→ 声明拓扑 → 启动消费。Worker 内部产生的 span（如 `memory.extract` 子 span）直接批量写 PG（避免自我回环）。
@@ -266,6 +287,7 @@ Worker 启动流程：初始化 DB 工厂 → `init_tracing`（Worker 自身 spa
 | `MQ_RETRY_TTLS_MS` | `[5000, 30000, 120000]` | 分级重试 TTL |
 | `MQ_DEDUPE_TTL_S` | `86400` | 幂等键保留时长 |
 | `MQ_DEADLETTER_ALERT_ENABLED` | `true` | 死信触发告警 |
+| `CHAT_RUN_DURABLE_ENABLED` | `false` | 启用 Outbox 和独立 ChatRun Worker |
 
 ---
 
@@ -329,6 +351,7 @@ Worker 启动流程：初始化 DB 工厂 → `init_tracing`（Worker 自身 spa
 | M1 | 观测链路切换：span/log/audit 发布 + obs-worker + 降级路径 | §9.3 前两项演练通过 |
 | M2 | 会话收尾切换：postprocess 发布 + session-worker + 幂等/重试/死信 | §9.3 全部演练通过 |
 | M3 | 监控告警接入 + 性能验收 + 文档更新（README/SPEC 关联） | §8 指标上线，§9.4 达标 |
+| M4 | ChatRun Outbox、独立队列、chat-worker、租约恢复 | 异步运行可可靠投递和恢复 |
 
 每阶段独立可回滚：`MQ_ENABLED=false` 即回到现状。
 

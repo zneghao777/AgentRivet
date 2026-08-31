@@ -58,4 +58,6 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)"
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# 并发防护当前为进程内状态。保持单 worker，避免每个 worker 各自放行一整套
+# LLM_MAX_CONCURRENCY；多副本部署前必须先把闸门/熔断/降级迁移到 Redis。
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

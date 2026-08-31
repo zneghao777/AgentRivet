@@ -20,8 +20,10 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from ..config import settings
@@ -89,6 +91,13 @@ class Message(Base):
     trace_id: Mapped[str | None] = mapped_column(String(64), index=True)
     span_id: Mapped[str | None] = mapped_column(String(64))
     request_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    # 顶层异步对话运行关联；历史消息保持 nullable。
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("chat_runs.id", name="fk_messages_run_id", use_alter=True),
+        nullable=True,
+        index=True,
+    )
     turn_index: Mapped[int | None] = mapped_column(Integer)
     step_index: Mapped[int | None] = mapped_column(Integer)
     # 记录生成该条助手消息时实际解析到的 Agent。
@@ -98,6 +107,137 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
+
+
+class ChatRun(Base):
+    """一条用户消息触发的顶层、可恢复 Agent 运行。"""
+
+    __tablename__ = "chat_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "user_id",
+            "client_request_id",
+            name="uq_chat_runs_client_request",
+        ),
+        Index("ix_chat_runs_session_created", "session_id", "created_at"),
+        Index(
+            "ix_chat_runs_tenant_user_status_created",
+            "tenant_id",
+            "user_id",
+            "status",
+            "created_at",
+        ),
+        Index(
+            "uq_chat_runs_session_active",
+            "session_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('queued', 'running', 'pending_approval')"
+            ),
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'running', 'pending_approval', "
+            "'succeeded', 'failed', 'canceled')",
+            name="ck_chat_run_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    client_request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_message_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("messages.id"), nullable=True
+    )
+    assistant_message_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("messages.id"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="queued")
+    request_payload: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+    trace_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    last_event_sequence: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ChatRunEvent(Base):
+    """供 Chat UI 重放的有序运行事件。"""
+
+    __tablename__ = "chat_run_events"
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence", name="uq_chat_run_event_sequence"),
+        Index("ix_chat_run_events_run_sequence", "run_id", "sequence"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("chat_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+
+
+class ChatRunOutbox(Base):
+    """ChatRun 命令的 Transactional Outbox。"""
+
+    __tablename__ = "chat_run_outbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id", "command_type", "message_id", name="uq_chat_run_outbox_message"
+        ),
+        Index("ix_chat_run_outbox_unpublished", "published_at", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("chat_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    command_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False, default=uuid.uuid4
+    )
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
 
 
 class Skill(Base):
@@ -900,6 +1040,7 @@ class AlertRule(Base):
     window_minutes: Mapped[int] = mapped_column(default=15)
     min_samples: Mapped[int] = mapped_column(default=1)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default="warning")
     silent_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     notify_channels: Mapped[list | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -918,6 +1059,7 @@ class AlertIncident(Base):
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
     rule_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("alert_rules.id"))
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")  # pending/firing/acknowledged/resolved
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default="warning")
     metric: Mapped[str] = mapped_column(String(64))
     threshold: Mapped[float] = mapped_column(Float, default=0)
     current_value: Mapped[float] = mapped_column(Float, default=0)

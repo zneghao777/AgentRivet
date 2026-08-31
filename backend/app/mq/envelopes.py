@@ -11,7 +11,14 @@ from typing import Any
 from ..observability.tracing import TraceContext, get_trace_context
 
 MESSAGE_TYPES = frozenset(
-    {"obs.span", "obs.log", "obs.audit", "session.postprocess"}
+    {
+        "obs.span",
+        "obs.log",
+        "obs.audit",
+        "session.postprocess",
+        "run.requested",
+        "run.resume",
+    }
 )
 
 

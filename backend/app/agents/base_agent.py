@@ -5,12 +5,23 @@ LLM 创建工厂放在此，供主 Agent 与子 Agent 复用。
 
 from __future__ import annotations
 
+import time
+from typing import Any
+
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 
 from ..config import settings
 from ..harness.context import get_tool_context
+from ..harness.llm_guard import (
+    CallChannel,
+    GuardedChatModel,
+    GuardedEndpoint,
+    endpoint_circuit_breaker,
+    get_llm_pool,
+    thinking_override,
+)
 from ..skills.manager import skill_manager
 
 SYSTEM_PROMPT_TEMPLATE = """你是企业级 Agent Harness 底座中的通用助手，代号「Harness Agent」。
@@ -38,8 +49,11 @@ def create_llm(
     base_url: str | None = None,
     api_key: str | None = None,
     temperature: float | None = None,
+    *,
+    call_channel: CallChannel | None = None,
+    max_tokens: int | None = None,
 ) -> BaseChatModel:
-    """创建 OpenAI 兼容 LLM。"""
+    """创建 OpenAI 兼容 LLM，并统一接入并发与端点防护。"""
     request_context = get_tool_context()
     if api_key is not None:
         resolved_api_key = api_key
@@ -47,14 +61,83 @@ def create_llm(
         resolved_api_key = request_context.model_api_key
     else:
         resolved_api_key = settings.LLM_API_KEY
-    return ChatOpenAI(
-        model=model_id or request_context.model_id or settings.LLM_MODEL,
-        base_url=base_url or request_context.model_base_url or settings.LLM_BASE_URL,
+    resolved_model = model_id or request_context.model_id or settings.LLM_MODEL
+    resolved_base_url = base_url or request_context.model_base_url or settings.LLM_BASE_URL
+    resolved_temperature = settings.LLM_TEMPERATURE if temperature is None else temperature
+    resolved_channel = call_channel or request_context.call_channel
+    degrade_level = request_context.resolved_degrade_level
+    resolved_max_tokens = settings.LLM_MAX_TOKENS if max_tokens is None else max(1, max_tokens)
+    if degrade_level >= 1:
+        resolved_max_tokens = max(1, resolved_max_tokens // 2)
+
+    call_timeout = float(settings.LLM_CALL_TIMEOUT_SECONDS)
+    if (
+        resolved_channel == "online"
+        and request_context.outcome_deadline_monotonic is not None
+    ):
+        call_timeout = min(
+            call_timeout,
+            max(0.05, request_context.outcome_deadline_monotonic - time.monotonic()),
+        )
+
+    provider_kwargs: dict[str, Any] = {
+        "base_url": resolved_base_url,
         # OpenAI SDK 要求凭据非空；本地无鉴权服务使用无敏感性的占位值。
-        api_key=resolved_api_key or "not-needed",
-        temperature=settings.LLM_TEMPERATURE if temperature is None else temperature,
-        max_tokens=settings.LLM_MAX_TOKENS,
+        "api_key": resolved_api_key or "not-needed",
+        "temperature": resolved_temperature,
+        "max_tokens": resolved_max_tokens,
+        # 429 必须由 Guard 逐次观测并执行 AIMD；SDK 内部重试会隐藏中间 429。
+        "max_retries": 0,
+        "timeout": call_timeout,
+        # invoke() 仍通过 provider stream 聚合为完整 AIMessage，使 LangGraph
+        # 能产生 on_chat_model_stream 并记录真实 first-token TTFT。
+        "streaming": True,
+    }
+    if request_context.user_id:
+        provider_kwargs["model_kwargs"] = {"user": request_context.user_id}
+    extra_body = thinking_override(resolved_base_url, resolved_model, degrade_level)
+    if extra_body:
+        provider_kwargs["extra_body"] = extra_body
+
+    inner = ChatOpenAI(model=resolved_model, **provider_kwargs)
+    if not settings.GUARD_ENABLED:
+        return inner
+
+    fallback_endpoints = tuple(
+        GuardedEndpoint(
+            model=ChatOpenAI(model=fallback_model, **provider_kwargs),
+            base_url=resolved_base_url,
+            model_name=fallback_model,
+        )
+        for fallback_model in _fallback_models(resolved_model)
     )
+    return GuardedChatModel(
+        inner=inner,
+        pool=get_llm_pool(resolved_channel),
+        base_url=resolved_base_url,
+        model_name=resolved_model,
+        request_id=request_context.request_id,
+        outcome_deadline_monotonic=(
+            request_context.outcome_deadline_monotonic
+            if resolved_channel == "online"
+            else None
+        ),
+        fallback_endpoints=fallback_endpoints,
+        circuit_breaker=endpoint_circuit_breaker,
+    )
+
+
+def _fallback_models(primary_model: str) -> list[str]:
+    """解析有序 fallback 链，并去除空值、重复项与主模型。"""
+    seen = {primary_model}
+    models: list[str] = []
+    for item in settings.LLM_FALLBACK_MODELS.split(","):
+        model = item.strip()
+        if not model or model in seen:
+            continue
+        seen.add(model)
+        models.append(model)
+    return models
 
 
 def build_system_prompt(
@@ -75,17 +158,14 @@ def build_system_prompt(
         if not skill:
             continue
         if skill.enabled:
-            descriptions.append(
-                f"- {skill.name}: {skill.description}"
-            )
+            descriptions.append(f"- {skill.name}: {skill.description}")
             # 正文按需注入：内置示例 skill 直接注入其正文
             if skill.body_md:
                 bodies.append(f"### Skill: {skill.name}\n{skill.body_md}")
 
     memory_block = memory_context.strip() if memory_context else "（无已检索到的长期记忆）"
     default_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        skill_descriptions="\n".join(descriptions)
-        or "（无已加载 Skill）",
+        skill_descriptions="\n".join(descriptions) or "（无已加载 Skill）",
         skill_bodies="\n\n".join(bodies) or "（无）",
         memory_context=memory_block,
     )
@@ -107,7 +187,10 @@ def agent_node(state: dict) -> dict:
         request_context.model_base_url,
         request_context.model_api_key,
     )
-    messages = state.get("messages", [])
+    messages = _messages_for_degrade(
+        state.get("messages", []),
+        request_context.resolved_degrade_level,
+    )
     skill_names = state.get("skill_loaded", [])
     memory_context = state.get("memory_context")
     system_prompt = build_system_prompt(
@@ -119,14 +202,83 @@ def agent_node(state: dict) -> dict:
     tools = state.get("_tools", [])
     llm_with_tools = llm.bind_tools(tools) if tools else llm
 
-    from langchain_core.messages import SystemMessage
-
     prompt = [
         SystemMessage(content=system_prompt),
         *_with_attachments(messages, request_context.attachments or []),
     ]
     response: AIMessage = llm_with_tools.invoke(prompt)
     return {"messages": [response]}
+
+
+_D2_RECENT_MESSAGE_BUDGET = 6
+
+
+def _messages_for_degrade(messages: list[Any], degrade_level: int) -> list[Any]:
+    """Retain D2 history without splitting tool exchanges or losing attachments."""
+    if degrade_level < 2:
+        return messages
+    system_prefix: list[Any] = []
+    for message in messages:
+        if not isinstance(message, SystemMessage):
+            break
+        system_prefix.append(message)
+    remaining = messages[len(system_prefix) :]
+    groups = _history_message_groups(remaining)
+    if not groups:
+        return system_prefix
+
+    selected: set[int] = set()
+    retained_messages = 0
+    for index in range(len(groups) - 1, -1, -1):
+        if retained_messages >= _D2_RECENT_MESSAGE_BUDGET:
+            break
+        selected.add(index)
+        retained_messages += len(groups[index])
+
+    # Attachments are injected after trimming. Keep the latest user message even
+    # when a long tool loop would otherwise move it outside the recent window.
+    latest_user = next(
+        (message for message in reversed(remaining) if isinstance(message, HumanMessage)),
+        None,
+    )
+    if latest_user is not None:
+        for index, group in enumerate(groups):
+            if any(message is latest_user for message in group):
+                selected.add(index)
+                break
+
+    trimmed = [message for index in sorted(selected) for message in groups[index]]
+    return [*system_prefix, *trimmed]
+
+
+def _history_message_groups(messages: list[Any]) -> list[list[Any]]:
+    """Group an assistant tool request with its contiguous matching results.
+
+    A standalone ``ToolMessage`` cannot be sent back to an OpenAI-compatible
+    provider, so malformed source-history orphans are omitted during D2 trimming.
+    """
+
+    groups: list[list[Any]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if isinstance(message, ToolMessage):
+            index += 1
+            continue
+
+        group = [message]
+        index += 1
+        if isinstance(message, AIMessage) and message.tool_calls:
+            tool_call_ids = {
+                str(call.get("id")) for call in message.tool_calls if call.get("id") is not None
+            }
+            while index < len(messages) and isinstance(messages[index], ToolMessage):
+                tool_message = messages[index]
+                if not tool_call_ids or str(tool_message.tool_call_id) in tool_call_ids:
+                    group.append(tool_message)
+                index += 1
+        groups.append(group)
+    return groups
 
 
 def _with_attachments(messages: list, attachments: list[dict]) -> list:

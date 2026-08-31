@@ -153,6 +153,8 @@ def test_sse_event_stream_shapes(clean_registry):
 
     txt = asyncio.run(run())
     assert "event: session_start" in txt
-    assert "event: message_start" in txt
     assert "event: message_end" in txt
     assert "event: run_end" in txt
+    # 中断/错误运行不得补造 dummy assistant 内容。
+    if '"status": "interrupted"' in txt or "event: error" in txt:
+        assert "event: message_delta" not in txt

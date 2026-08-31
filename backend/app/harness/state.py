@@ -1,7 +1,7 @@
 """图状态定义：基于 MessagesState 扩展。"""
 
 import operator
-from typing import Annotated
+from typing import Annotated, Literal
 
 from langgraph.graph import MessagesState
 
@@ -15,6 +15,8 @@ class HarnessState(MessagesState):
     skill_loaded: Annotated[list[str], lambda a, b: list(dict.fromkeys(a + b))] = []
     tool_calls_total: int = 0
     interrupt_count: int = 0
+    approval_mode: Literal["manual", "auto"] = "auto"
+    tool_approval_decision: Literal["approve", "reject"] | None = None
     final_answer: str = ""
     memory_context: str = ""  # 对话前检索注入的用户长期记忆（MEMORY_SPEC §6.2）
 
@@ -23,6 +25,7 @@ class SupervisorState(HarnessState):
     """多 Agent 编排共享状态。"""
 
     route: str = "main"
+    conversation_context: str = ""
     router_decision: dict = {}
     plan: list[dict] = []
     plan_summary: str = ""

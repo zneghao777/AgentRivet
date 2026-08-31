@@ -8,6 +8,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..agents.base_agent import create_llm
 from ..config import settings
+from .llm_guard import LLMGuardError
 from .worker import execute_task
 
 REFUSAL_MARKERS = ("CANNOT_HANDLE:", "无法处理", "不能处理", "抱歉，我无法")
@@ -75,5 +76,7 @@ async def _llm_critic(output: dict) -> tuple[bool, str]:
     try:
         data = json.loads(str(getattr(response, "content", response)))
         return bool(data.get("pass")), str(data.get("reason") or "critic_rejected")
+    except LLMGuardError:
+        raise
     except Exception:  # noqa: BLE001
         return False, "critic_invalid_output"

@@ -3,6 +3,8 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 pyyaml>=6.0
+limits>=3.13,<6
+slowapi>=0.1.9,<0.2
 
 # LangGraph / LangChain
 langgraph>=1.0
@@ -18,6 +20,7 @@ opentelemetry-sdk>=1.24
 
 # Data
 sqlalchemy>=2.0
+alembic>=1.13
 psycopg[binary]>=3.1
 aio-pika>=9.5,<10
 redis>=5.0

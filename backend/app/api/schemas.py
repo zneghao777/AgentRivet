@@ -103,6 +103,16 @@ class MessageStreamRequest(BaseModel):
     provider_config: ModelRuntimeConfigRequest | None = None
     attachment_ids: list[str] | None = None
     agent_id: str | None = None
+    approval_mode: Literal["manual", "auto"] = "auto"
+
+
+class ChatRunCreateRequest(MessageStreamRequest):
+    """创建可恢复 ChatRun；敏感 Provider 密钥不会进入持久化快照。"""
+
+
+class ChatRunResumeRequest(BaseModel):
+    decision: Literal["approve", "reject"]
+    input: str = Field(default="", max_length=20_000)
 
 
 class MessageResponse(BaseModel):
@@ -111,6 +121,7 @@ class MessageResponse(BaseModel):
     token_usage: dict[str, int] = Field(default_factory=dict)
     tool_calls: int = 0
     duration_ms: int = 0
+    cache_hit: bool = False
 
 
 class ModelConnectionTestRequest(BaseModel):
@@ -177,8 +188,20 @@ class RouteDryRunRequest(BaseModel):
 
 
 class ResumeRequest(BaseModel):
-    input: str
-    decision: str | None = None
+    input: str = Field(default="", max_length=2000)
+    decision: Literal["approve", "reject"] = "approve"
+    skills: list[str] | None = None
+    knowledge_bases: list[str] | None = None
+    capabilities: list[CapabilityRefRequest] | None = None
+    model: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:/-]+$",
+    )
+    provider_config: ModelRuntimeConfigRequest | None = None
+    attachment_ids: list[str] | None = None
+    agent_id: str | None = None
 
 
 # ---------- Skill ----------
@@ -662,6 +685,7 @@ class AlertRuleCreateRequest(BaseModel):
     window_minutes: int = 15
     min_samples: int = 1
     enabled: bool = True
+    severity: Literal["warning", "critical"] = "warning"
 
 
 class AlertIncidentUpdateRequest(BaseModel):

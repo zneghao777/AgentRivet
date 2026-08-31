@@ -26,11 +26,45 @@ from ..config import settings
 from ..observability.costing import compute_cost as _compute_cost
 from . import events as ev
 from .context import get_tool_context
+from .llm_guard import LLMGuardError, LLMResponseTimeoutError, cancel_request
 
 logger = logging.getLogger(__name__)
 
 # SSE 帧类型：字符串
 SseEvent = str
+
+FIRST_FEEDBACK_ORCHESTRATION_EVENTS = frozenset(
+    {
+        "orchestration.router_decision",
+        "orchestration.clarification",
+        "orchestration.plan",
+        "orchestration.worker_started",
+        "orchestration.worker_finished",
+        "orchestration.synthesis",
+    }
+)
+
+
+def is_first_feedback_event_name(name: str) -> bool:
+    """Return whether a public SSE event satisfies the first-feedback contract."""
+
+    return name in FIRST_FEEDBACK_ORCHESTRATION_EVENTS
+
+
+class _GraphIdleTimeout(TimeoutError):
+    """No graph event arrived within the configured idle budget."""
+
+
+def _guard_error_frame(exc: BaseException) -> str | None:
+    """Map LLM guard failures to the stable public SSE error contract."""
+    if not isinstance(exc, LLMGuardError):
+        return None
+    if not exc.rejection_recorded:
+        from ..observability.metrics import metrics
+
+        metrics.record_guard_rejected(exc.reason)
+        exc.rejection_recorded = True
+    return ev.error(exc.code, str(exc), retry_after_ms=exc.retry_after_ms)
 
 
 def _span_event(
@@ -95,12 +129,71 @@ def _config(thread_id: str, tenant_id: str) -> dict:
     }
 
 
+async def _iter_with_idle_timeout(events: AsyncIterator[dict]) -> AsyncIterator[dict]:
+    """Yield graph events while bounding every no-event interval."""
+
+    iterator = events.__aiter__()
+    next_event: asyncio.Task[dict] | None = None
+    try:
+        while True:
+            next_event = asyncio.create_task(anext(iterator))
+            done, _ = await asyncio.wait(
+                {next_event},
+                timeout=settings.AGENT_TIMEOUT_SECONDS,
+            )
+            if not done:
+                next_event.cancel()
+                await asyncio.gather(next_event, return_exceptions=True)
+                next_event = None
+                raise _GraphIdleTimeout("graph execution timeout")
+            try:
+                event = next_event.result()
+            except StopAsyncIteration:
+                next_event = None
+                return
+            next_event = None
+            yield event
+    finally:
+        if next_event is not None:
+            if not next_event.done():
+                next_event.cancel()
+            await asyncio.gather(next_event, return_exceptions=True)
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            try:
+                await close()
+            except RuntimeError:
+                # The source may already have closed after __anext__ cancellation.
+                pass
+
+
 class GraphRuntime:
     """封装图运行，对外提供统一接口。"""
 
     def __init__(self, app: CompiledStateGraph, checkpointer: Any | None = None) -> None:
         self.app = app
         self.checkpointer = checkpointer
+
+    async def pending_approval(
+        self,
+        thread_id: str,
+        tenant_id: str,
+    ) -> dict[str, Any] | None:
+        """读取持久化检查点中的工具审批，不推进图。"""
+        if self.checkpointer is None:
+            return None
+        snapshot = await self.app.aget_state(_config(thread_id, tenant_id))
+        for task in snapshot.tasks:
+            for pending in task.interrupts:
+                value = pending.value
+                if not isinstance(value, dict) or value.get("type") != "tool_approval":
+                    continue
+                return {
+                    "id": str(pending.id),
+                    "reason": str(value.get("reason") or "Agent 请求调用工具"),
+                    "state": value,
+                }
+        return None
 
     async def astream(
         self,
@@ -114,6 +207,8 @@ class GraphRuntime:
         request_id: str | None = None,
         message_id: int | None = None,
         links: tuple[str, ...] | None = None,
+        approval_mode: str = "auto",
+        chat_run_id: str | None = None,
     ) -> AsyncIterator[str]:
         """流式运行，内部将 LangGraph 事件转换为 SSE 事件。"""
         cfg = _config(thread_id, tenant_id)
@@ -142,6 +237,7 @@ class GraphRuntime:
                 "user_message": tracing.sanitize_text(message, 256),
                 "skill_loaded": skill_names,
                 "memory_injected": bool(memory_context),
+                "chat.run_id": chat_run_id,
             },
         )
         # SSE：Trace 创建后发送 trace_start（§12.4）
@@ -171,6 +267,9 @@ class GraphRuntime:
                         "skill_loaded": skill_names,
                         "tool_calls_total": 0,
                         "interrupt_count": 0,
+                        "approval_mode": (
+                            "manual" if approval_mode == "manual" else "auto"
+                        ),
                         "final_answer": "",
                         "memory_context": memory_context,
                         "session_id": session_id or "",
@@ -307,6 +406,7 @@ class GraphRuntime:
         final_step_frames: list[str] = []
         final_answer = ""
         clarification_only = False
+        pending_approval: dict[str, Any] | None = None
         try:
             while True:
                 try:
@@ -314,13 +414,22 @@ class GraphRuntime:
                 except TimeoutError:
                     run_status = "timeout"
                     run_error = "graph execution timeout"
+                    response_timeout = LLMResponseTimeoutError()
+                    # A synchronous Agent node may still be blocked in its
+                    # executor thread. Release its request-scoped LLM slot now
+                    # and leave a cancellation marker so it cannot start a
+                    # retry/fallback after the outer graph deadline.
+                    if request_id:
+                        cancel_request(request_id)
                     # 关闭所有进行中的子 span 为 timeout（C-08）
                     for rid in list(pending_spans):
                         pending_spans[rid]["error"] = run_error
                         frame = _step_end_frame(_close_span(rid, status="timeout"))
                         if frame:
                             yield frame
-                    yield ev.error(50001, run_error)
+                    error_frame = _guard_error_frame(response_timeout)
+                    assert error_frame is not None
+                    yield error_frame
                     break
                 if event is None:
                     break
@@ -338,7 +447,12 @@ class GraphRuntime:
                         frame = _step_end_frame(_close_span(rid, status="error"))
                         if frame:
                             yield frame
-                    yield ev.error(50001, f"graph error: {exc}")
+                    guard_frame = _guard_error_frame(exc)
+                    yield guard_frame or ev.error(
+                        50001,
+                        "模型执行失败，请稍后重试",
+                        retry_after_ms=1_000,
+                    )
                     break
 
                 if etype == "on_custom_event" and str(event.get("name", "")).startswith(
@@ -350,9 +464,7 @@ class GraphRuntime:
                         parent = pending_spans.get(parent_run_id)
                         if parent is not None:
                             attributes = parent.get("attributes") or {}
-                            attributes[
-                                orchestration_name.removeprefix("orchestration.")
-                            ] = payload
+                            attributes[orchestration_name.removeprefix("orchestration.")] = payload
                             parent["attributes"] = attributes
                             break
                     if orchestration_name == "orchestration.clarification":
@@ -375,7 +487,11 @@ class GraphRuntime:
                                 msg_id = "msg_stream"
                             yield ev.message_delta(msg_id, text[:64])
                         # TTFT：首个非空 chunk（§5.3）
-                        if run_id in pending_spans and "ttft_recorded" not in pending_spans[run_id]:
+                        if (
+                            text
+                            and run_id in pending_spans
+                            and "ttft_recorded" not in pending_spans[run_id]
+                        ):
                             pending_spans[run_id]["ttft_recorded"] = True
                             pending_spans[run_id]["ttft_ms"] = int(
                                 (
@@ -396,11 +512,7 @@ class GraphRuntime:
 
                 elif etype == "on_chat_model_start":
                     # 记录每次 LLM 调用的独立 span（C-03/C-04/C-05）
-                    model = (
-                        data.get("model")
-                        or get_tool_context().model_id
-                        or settings.LLM_MODEL
-                    )
+                    model = data.get("model") or get_tool_context().model_id or settings.LLM_MODEL
                     parent_id = _resolve_parent(parent_ids)
                     input_summary = _summarize_input(data.get("input"))
                     pending, created = _register_span(
@@ -578,15 +690,12 @@ class GraphRuntime:
                 elif etype == "on_chain_end":
                     node_name = event.get("name", "") or "agent"
                     output = data.get("output")
-                    if isinstance(output, dict) and output.get("final_answer"):
-                        final_answer = str(output["final_answer"])
+                    answer = _extract_graph_answer(output)
+                    if answer:
+                        final_answer = answer
                     if not parent_ids and isinstance(output, dict):
                         state_error = str(output.get("orchestration_error") or "")
-                        if (
-                            state_error
-                            and state_error != "partial_failure"
-                            and run_status == "ok"
-                        ):
+                        if state_error and state_error != "partial_failure" and run_status == "ok":
                             run_status = "error"
                             run_error = state_error
                             yield ev.error(
@@ -603,9 +712,18 @@ class GraphRuntime:
                 await task
             except asyncio.CancelledError:
                 pass
+            pending_approval = await self.pending_approval(thread_id, tenant_id)
             # HITL 中断检测（§5.3）：流正常结束但仍有未关闭节点 → interrupted
-            if run_status == "ok" and pending_spans:
+            if run_status == "ok" and (pending_spans or pending_approval is not None):
                 run_status = "interrupted"
+            if (
+                run_status == "ok"
+                and not msg_id
+                and not clarification_only
+                and not final_answer.strip()
+            ):
+                run_status = "error"
+                run_error = "graph produced no assistant response"
             for rid in list(pending_spans):
                 close_status = "interrupted" if run_status == "interrupted" else run_status
                 if run_error and not pending_spans[rid].get("error"):
@@ -629,9 +747,21 @@ class GraphRuntime:
         duration_ms = int((time.monotonic() - start) * 1000)
         for frame in final_step_frames:
             yield frame
-        if not msg_id and not clarification_only:
+        if pending_approval is not None:
+            yield ev.interrupt_requested(
+                pending_approval["reason"],
+                pending_approval["state"],
+                interrupt_id=pending_approval["id"],
+            )
+        if run_status == "ok" and not msg_id and not clarification_only:
             yield ev.message_start()
-            yield ev.message_delta("msg_stream", final_answer or _dummy_reply())
+            yield ev.message_delta("msg_stream", final_answer.strip())
+        elif run_error == "graph produced no assistant response":
+            yield ev.error(
+                50002,
+                "执行未生成回复，请稍后重试",
+                retry_after_ms=1_000,
+            )
         yield ev.message_end(token_usage)
         yield ev.run_end(
             status="success" if run_status == "ok" else run_status,
@@ -685,6 +815,7 @@ class GraphRuntime:
         run_error: str | None = None
         pending_spans: dict[str, dict] = {}
         result: dict = {}
+        guard_error: LLMGuardError | None = None
 
         def _resolve_parent(parent_ids: list[str]) -> str | None:
             for pid in reversed(parent_ids):
@@ -742,32 +873,29 @@ class GraphRuntime:
                 events=pending.get("events"),
             )
 
+        events = self.app.astream_events(
+            {
+                "messages": [("user", message)],
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "skill_loaded": skill_names,
+                "memory_context": memory_context,
+                "session_id": session_id or "",
+                "message_id": message_id,
+                "request_id": request_id or "",
+            },
+            config=cfg,
+            version="v2",
+        )
         try:
-            async for event in self.app.astream_events(
-                {
-                    "messages": [("user", message)],
-                    "tenant_id": tenant_id,
-                    "user_id": user_id,
-                    "skill_loaded": skill_names,
-                    "memory_context": memory_context,
-                    "session_id": session_id or "",
-                    "message_id": message_id,
-                    "request_id": request_id or "",
-                },
-                config=cfg,
-                version="v2",
-            ):
+            async for event in _iter_with_idle_timeout(events):
                 etype = event.get("event", "")
                 data = event.get("data") or {}
                 run_id = event.get("run_id") or ""
                 parent_ids = event.get("parent_ids") or []
 
                 if etype == "on_chat_model_start":
-                    model = (
-                        data.get("model")
-                        or get_tool_context().model_id
-                        or settings.LLM_MODEL
-                    )
+                    model = data.get("model") or get_tool_context().model_id or settings.LLM_MODEL
                     pending_spans[run_id] = {
                         "span_id": tracing._new_span_id(),
                         "name": "llm.chat",
@@ -877,24 +1005,45 @@ class GraphRuntime:
                     if pending is not None:
                         pending["error"] = tracing.sanitize_error(exc)
                     _close_span(run_id, status="error")
+        except _GraphIdleTimeout:
+            run_status = "timeout"
+            run_error = "graph execution timeout"
+            guard_error = LLMResponseTimeoutError()
+            if request_id:
+                cancel_request(request_id)
+            for rid in list(pending_spans):
+                _close_span(rid, status="timeout", error=run_error)
         except asyncio.CancelledError:
             run_status = "canceled"
             run_error = "client disconnected"
+            if request_id:
+                cancel_request(request_id)
             for rid in list(pending_spans):
-                _close_span(rid, status="canceled")
+                _close_span(rid, status="canceled", error=run_error)
+            root_span.finalize(
+                status=run_status,
+                token_usage=token_usage,
+                error=run_error,
+                attributes={"memory_injected": bool(memory_context)},
+            )
             raise
         except Exception as exc:  # noqa: BLE001
             run_status = "error"
             run_error = tracing.sanitize_error(exc)
+            if isinstance(exc, LLMGuardError):
+                guard_error = exc
             for rid in list(pending_spans):
                 _close_span(rid, status="error", error=run_error)
 
-        if not result:
+        if not result and run_status != "timeout":
             try:
                 snapshot = await self.app.aget_state(cfg)
                 result = dict(snapshot.values or {})
             except Exception:  # noqa: BLE001
                 result = {}
+        if run_status == "ok" and not _extract_graph_answer(result):
+            run_status = "error"
+            run_error = "graph produced no assistant response"
         # 根 span 汇总
         root_span.finalize(
             status=run_status,
@@ -908,9 +1057,17 @@ class GraphRuntime:
             "trace_id": root_span.trace_id,
             "request_id": request_id,
             "status": run_status,
+            "error_code": (
+                50002
+                if run_error == "graph produced no assistant response"
+                else (50001 if run_status != "ok" else None)
+            ),
+            "error": run_error,
             "token_usage": token_usage,
             "duration_ms": int((time.monotonic() - start) * 1000),
         }
+        if guard_error is not None:
+            raise guard_error
         return result
 
     async def resume(
@@ -924,6 +1081,7 @@ class GraphRuntime:
         session_id: str | None = None,
         request_id: str | None = None,
         link_trace_id: str | None = None,
+        chat_run_id: str | None = None,
     ) -> AsyncIterator[str]:
         """HITL 恢复：向挂起的 interrupt 提交输入后继续执行（流式）。"""
         from langgraph.types import Command
@@ -954,19 +1112,16 @@ class GraphRuntime:
                 "user_input": tracing.sanitize_text(user_input, 256),
                 "linked_trace_id": link_trace_id,
                 "links": list(links) if links else None,
+                "chat.run_id": chat_run_id,
             },
         )
-        yield ev.trace_start(
-            trace_id=root_span.trace_id,
-            request_id=request_id,
-            session_id=session_id,
-        )
-
         msg_id = ""
         tool_calls_count = 0
         token_usage: dict[str, int] = {"input": 0, "output": 0, "total": 0}
         run_status = "ok"
+        run_error: str | None = None
         _pending_reply: list[str] = []
+        final_answer = ""
         pending_spans: dict[str, dict] = {}
 
         def _resolve_parent(parent_ids: list[str]) -> str | None:
@@ -1041,12 +1196,24 @@ class GraphRuntime:
                 references=pending.get("references"),
             )
 
+        events = self.app.astream_events(
+            Command(
+                resume={
+                    "decision": "approve" if decision == "approve" else "reject",
+                    "input": user_input,
+                }
+            ),
+            config=cfg,
+            version="v2",
+        )
+        pending_approval: dict[str, Any] | None = None
         try:
-            async for event in self.app.astream_events(
-                Command(resume=user_input),
-                config=cfg,
-                version="v2",
-            ):
+            yield ev.trace_start(
+                trace_id=root_span.trace_id,
+                request_id=request_id,
+                session_id=session_id,
+            )
+            async for event in _iter_with_idle_timeout(events):
                 etype = event.get("event", "")
                 data = event.get("data") or {}
                 run_id = event.get("run_id") or ""
@@ -1062,7 +1229,11 @@ class GraphRuntime:
                                 yield ev.message_start()
                                 msg_id = "msg_resume"
                             yield ev.message_delta(msg_id, text[:64])
-                        if run_id in pending_spans and "ttft_recorded" not in pending_spans[run_id]:
+                        if (
+                            text
+                            and run_id in pending_spans
+                            and "ttft_recorded" not in pending_spans[run_id]
+                        ):
                             pending_spans[run_id]["ttft_recorded"] = True
                             pending_spans[run_id]["ttft_ms"] = int(
                                 (
@@ -1081,11 +1252,7 @@ class GraphRuntime:
                                 detail={"ttft_ms": pending_spans[run_id]["ttft_ms"]},
                             )
                 elif etype == "on_chat_model_start":
-                    model = (
-                        data.get("model")
-                        or get_tool_context().model_id
-                        or settings.LLM_MODEL
-                    )
+                    model = data.get("model") or get_tool_context().model_id or settings.LLM_MODEL
                     pending_spans[run_id] = {
                         "span_id": tracing._new_span_id(),
                         "name": "llm.chat",
@@ -1176,7 +1343,9 @@ class GraphRuntime:
                             tool_name, out, pending["references"]
                         )
                         if pending["references"]:
-                            pending.setdefault("attributes", {})["references"] = pending["references"]
+                            pending.setdefault("attributes", {})["references"] = pending[
+                                "references"
+                            ]
                     closed = _close_span(run_id)
                     frame = _step_end_frame(closed)
                     if frame:
@@ -1221,6 +1390,10 @@ class GraphRuntime:
                         )
                 elif etype == "on_chain_end":
                     node_name = event.get("name", "") or "agent"
+                    output = data.get("output")
+                    answer = _extract_graph_answer(output)
+                    if answer:
+                        final_answer = answer
                     if node_name and node_name not in {"__start__", "__end__"}:
                         frame = _step_end_frame(_close_span(run_id))
                         if frame:
@@ -1241,26 +1414,78 @@ class GraphRuntime:
                     frame = _step_end_frame(_close_span(run_id, status="error"))
                     if frame:
                         yield frame
+            pending_approval = await self.pending_approval(thread_id, tenant_id)
+            if run_status == "ok" and pending_approval is not None:
+                run_status = "interrupted"
+            if run_status == "ok" and not msg_id:
+                answer = final_answer.strip()
+                if answer:
+                    msg_id = "msg_resume"
+                    _pending_reply.append(answer)
+                    yield ev.message_start()
+                    yield ev.message_delta(msg_id, answer)
+                else:
+                    run_status = "error"
+                    run_error = "resume produced no assistant response"
+                    yield ev.error(
+                        50002,
+                        "恢复执行未生成回复，请稍后重试",
+                        retry_after_ms=1_000,
+                    )
+        except _GraphIdleTimeout:
+            run_status = "timeout"
+            run_error = "graph execution timeout"
+            response_timeout = LLMResponseTimeoutError()
+            if request_id:
+                cancel_request(request_id)
+            for rid in list(pending_spans):
+                pending_spans[rid]["error"] = run_error
+                frame = _step_end_frame(_close_span(rid, status="timeout"))
+                if frame:
+                    yield frame
+            error_frame = _guard_error_frame(response_timeout)
+            assert error_frame is not None
+            yield error_frame
+        except (asyncio.CancelledError, GeneratorExit):
+            run_status = "canceled"
+            run_error = "client disconnected"
+            if request_id:
+                cancel_request(request_id)
+            for rid in list(pending_spans):
+                pending_spans[rid]["error"] = run_error
+                _close_span(rid, status="canceled")
+            raise
         except Exception as exc:  # noqa: BLE001
             run_status = "error"
-            yield ev.error(50001, f"resume failed: {exc}")
+            run_error = tracing.sanitize_error(exc)
+            for rid in list(pending_spans):
+                pending_spans[rid]["error"] = run_error
+                frame = _step_end_frame(_close_span(rid, status="error"))
+                if frame:
+                    yield frame
+            guard_frame = _guard_error_frame(exc)
+            yield guard_frame or ev.error(50001, f"resume failed: {exc}")
+            return
+        finally:
             root_span.finalize(
-                status="error",
+                status=run_status,
+                token_usage=token_usage,
+                error=run_error,
                 attributes={"reply": "".join(_pending_reply).strip() or None},
             )
-            return
 
         duration_ms = int((time.monotonic() - start) * 1000)
+        if pending_approval is not None:
+            yield ev.interrupt_requested(
+                pending_approval["reason"],
+                pending_approval["state"],
+                interrupt_id=pending_approval["id"],
+            )
         yield ev.message_end(token_usage)
         yield ev.run_end(
             status="success" if run_status == "ok" else run_status,
             duration_ms=duration_ms,
             tool_calls=tool_calls_count,
-        )
-        root_span.finalize(
-            status=run_status,
-            token_usage=token_usage,
-            attributes={"reply": "".join(_pending_reply).strip() or None},
         )
 
 
@@ -1415,7 +1640,7 @@ def _extract_knowledge_references(tool_name: str, out: Any) -> list[dict[str, An
             continue
         line_match = _REFERENCE_LINE_RE.search(fields.get("位置", ""))
         excerpt_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        excerpt = text[match.end():excerpt_end].strip()
+        excerpt = text[match.end() : excerpt_end].strip()
         score_raw = fields.get("相关度")
         try:
             score = float(score_raw) if score_raw is not None else None
@@ -1497,9 +1722,7 @@ def _public_step_summary(pending: dict) -> str | None:
         return tracing.redact_text(pending.get("output_summary"), 512)
     if pending.get("type") != "tool":
         return None
-    return tracing.redact_text(
-        pending.get("output_summary") or pending.get("error"), 240
-    )
+    return tracing.redact_text(pending.get("output_summary") or pending.get("error"), 240)
 
 
 def _is_public_stream_event(event: dict) -> bool:
@@ -1527,5 +1750,24 @@ def _extract_text(chunk: Any) -> str:
     return ""
 
 
-def _dummy_reply() -> str:
-    return "（未收到模型回复，请检查 LLM_API_KEY 配置）"
+def _extract_graph_answer(output: Any) -> str:
+    """Extract a user-visible final answer from common LangGraph outputs."""
+    if isinstance(output, dict):
+        final_answer = output.get("final_answer")
+        if final_answer:
+            return str(final_answer).strip()
+        messages = output.get("messages")
+        if isinstance(messages, (list, tuple)):
+            for message in reversed(messages):
+                message_type = str(
+                    getattr(message, "type", None)
+                    or getattr(message, "role", None)
+                    or ""
+                ).lower()
+                if message_type not in {"ai", "assistant"}:
+                    continue
+                text = _extract_text(message).strip()
+                if text:
+                    return text
+        return ""
+    return _extract_text(output).strip()

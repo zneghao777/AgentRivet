@@ -10,7 +10,7 @@ from typing import Any
 
 from ..config import settings
 from ..observability.metrics import metrics
-from .connection import OBS_EXCHANGE, SESSION_EXCHANGE, mq_connection
+from .connection import CHAT_EXCHANGE, OBS_EXCHANGE, SESSION_EXCHANGE, mq_connection
 from .envelopes import MessageEnvelope, make_envelope
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,8 @@ def _route(message_type: str) -> tuple[str, str]:
         return OBS_EXCHANGE, message_type
     if message_type == "session.postprocess":
         return SESSION_EXCHANGE, "postprocess"
+    if message_type in {"run.requested", "run.resume"}:
+        return CHAT_EXCHANGE, message_type
     raise ValueError(f"不支持的 MQ 消息类型: {message_type}")
 
 

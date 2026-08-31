@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 
-import pytest
 import pytest_asyncio
 
 # 测试环境强制使用非生产配置，避免读取真实 .env
@@ -18,6 +17,13 @@ os.environ.setdefault("OBSERVABILITY_ENABLED", "false")
 os.environ.setdefault("GLM_FILES_API_KEY", "")
 # 测试禁用真实 Rerank 服务探测（AGENTIC_RAG_UPGRADE_SPEC §3.4 降级路径单测另行 mock）
 os.environ.setdefault("RERANK_ENABLED", "false")
+# 普通 API 测试不连接真实 LLM；专项 guard 用例显式构造或开启防护实例。
+os.environ.setdefault("GUARD_ENABLED", "false")
+# 全套 API 用例复用少量测试 Key，避免默认入口限流造成跨用例串扰；专项限流用例
+# 会构造启用状态的独立应用验证配额和 429 协议。
+os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
+# 旧 SSE/语义缓存测试显式固定兼容路径；ChatRun 专项用例单独开启新路径。
+os.environ.setdefault("CHAT_RUN_ENABLED", "false")
 
 
 @pytest_asyncio.fixture(scope="session", autouse=True)

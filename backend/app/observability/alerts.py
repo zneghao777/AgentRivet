@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import statistics
 from datetime import UTC, datetime, timedelta
 
 from ..config import settings
@@ -85,6 +84,51 @@ _DEFAULT_RULES = [
         "window_minutes": 5,
         "min_samples": 1,
     },
+    {
+        "name": "guard-queue-wait-p95",
+        "metric": "guard_queue_wait_p95_ms",
+        "threshold": 30_000,
+        "comparison": ">",
+        "window_minutes": 15,
+        "min_samples": 1,
+        "severity": "warning",
+    },
+    {
+        "name": "guard-queue-full-rate",
+        "metric": "guard_queue_full_rate",
+        "threshold": 10,
+        "comparison": ">",
+        "window_minutes": 5,
+        "min_samples": 1,
+        "severity": "critical",
+    },
+    {
+        "name": "guard-circuit-open",
+        "metric": "guard_cb_open_seconds",
+        "threshold": 300,
+        "comparison": ">",
+        "window_minutes": 5,
+        "min_samples": 1,
+        "severity": "critical",
+    },
+    {
+        "name": "guard-degrade-sustained",
+        "metric": "guard_degrade_seconds",
+        "threshold": 1800,
+        "comparison": ">",
+        "window_minutes": 30,
+        "min_samples": 1,
+        "severity": "warning",
+    },
+    {
+        "name": "guard-upstream-429-rate",
+        "metric": "guard_upstream_429_rate",
+        "threshold": 10,
+        "comparison": ">",
+        "window_minutes": 5,
+        "min_samples": 1,
+        "severity": "warning",
+    },
 ]
 
 
@@ -123,16 +167,21 @@ async def _evaluate_rule(db, rule, tenant_id: str) -> float | None:
 
     if metric in ("p95_latency_ms", "p95_ttft_ms"):
         col = AgentSpan.duration_ms if metric == "p95_latency_ms" else AgentSpan.ttft_ms
+        span_type = "root" if metric == "p95_latency_ms" else "llm"
         rows = (
-            await db.execute(
-                select(col).where(
-                    AgentSpan.tenant_id == tenant_id,
-                    AgentSpan.span_type == "root",
-                    col.isnot(None),
-                    AgentSpan.started_at >= window_start,
+            (
+                await db.execute(
+                    select(col).where(
+                        AgentSpan.tenant_id == tenant_id,
+                        AgentSpan.span_type == span_type,
+                        col.isnot(None),
+                        AgentSpan.started_at >= window_start,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         if len(rows) < rule.min_samples:
             return None
         return float(_percentile(list(rows), 95))
@@ -184,6 +233,31 @@ async def _evaluate_rule(db, rule, tenant_id: str) -> float | None:
 
         return metrics.mq_publish_fallback_ratio_recent(rule.window_minutes)
 
+    if metric == "guard_queue_wait_p95_ms":
+        from ..observability.metrics import metrics
+
+        return metrics.guard_queue_wait_p95_recent(rule.window_minutes)
+
+    if metric == "guard_queue_full_rate":
+        from ..observability.metrics import metrics
+
+        return metrics.guard_rejected_rate_recent("queue_full", rule.window_minutes)
+
+    if metric == "guard_cb_open_seconds":
+        from ..observability.metrics import metrics
+
+        return metrics.guard_cb_open_seconds()
+
+    if metric == "guard_degrade_seconds":
+        from ..observability.metrics import metrics
+
+        return metrics.guard_degrade_seconds()
+
+    if metric == "guard_upstream_429_rate":
+        from ..observability.metrics import metrics
+
+        return metrics.guard_upstream_429_rate_recent(rule.window_minutes)
+
     if metric == "cost_total":
         from ..storage.models import AgentSpan as SpanModel
 
@@ -223,9 +297,7 @@ async def _evaluate_all() -> None:
 
         from ..storage.models import AgentSpan
 
-        tenant_ids = set(
-            (await db.execute(select(AgentSpan.tenant_id).distinct())).scalars().all()
-        )
+        tenant_ids = set((await db.execute(select(AgentSpan.tenant_id).distinct())).scalars().all())
         # 无租户可评估
         rules = await repo.list_alert_rules(db, tenant_id="__all__")
         existing_names = {rule.name for rule in rules}
@@ -235,9 +307,27 @@ async def _evaluate_all() -> None:
             for r in missing_defaults:
                 await repo.create_alert_rule(db, values={**r, "tenant_id": "__all__"})
             rules = await repo.list_alert_rules(db, tenant_id="__all__")
+        default_severities = {
+            rule["name"]: rule.get("severity", "warning") for rule in _DEFAULT_RULES
+        }
+        for rule in rules:
+            expected_severity = default_severities.get(rule.name)
+            if expected_severity and rule.severity != expected_severity:
+                await repo.update_alert_rule(
+                    db,
+                    rule.id,
+                    values={"severity": expected_severity},
+                )
+                rule.severity = expected_severity
 
-        for tenant_id in tenant_ids or {"default"}:
-            await _evaluate_for_tenant(db, tenant_id, rules)
+        guard_rules = [rule for rule in rules if rule.metric.startswith("guard_")]
+        tenant_rules = [rule for rule in rules if not rule.metric.startswith("guard_")]
+        for tenant_id in tenant_ids or {settings.DEFAULT_TENANT}:
+            await _evaluate_for_tenant(db, tenant_id, tenant_rules)
+        # Guard metrics are process/system-level rather than tenant-labelled. Evaluate
+        # them once to avoid duplicating the same incident into every active tenant.
+        if guard_rules:
+            await _evaluate_for_tenant(db, settings.DEFAULT_TENANT, guard_rules)
 
 
 async def _evaluate_for_tenant(db, tenant_id: str, rules) -> None:
@@ -255,7 +345,9 @@ async def _evaluate_for_tenant(db, tenant_id: str, rules) -> None:
         try:
             value = await _evaluate_rule(db, target, tenant_id)
         except Exception:  # noqa: BLE001
-            logger.warning("告警指标评估失败 rule=%s tenant=%s", target.name, tenant_id, exc_info=True)
+            logger.warning(
+                "告警指标评估失败 rule=%s tenant=%s", target.name, tenant_id, exc_info=True
+            )
             continue
         if value is None:
             continue
@@ -280,15 +372,19 @@ async def _evaluate_for_tenant(db, tenant_id: str, rules) -> None:
                         "tenant_id": tenant_id,
                         "rule_id": target.id,
                         "status": "firing",
+                        "severity": target.severity,
                         "metric": target.metric,
                         "threshold": target.threshold,
                         "current_value": round(value, 6),
                         "window_minutes": target.window_minutes,
-                        "message": f"{target.name}: {target.metric}={value:.4f} (阈值 {target.threshold})",
+                        "message": (
+                            f"{target.name}: {target.metric}={value:.4f} (阈值 {target.threshold})"
+                        ),
                         "related_trace_ids": related,
                     },
                 )
-                logger.warning("告警触发 tenant=%s rule=%s value=%.4f", tenant_id, target.name, value)
+                log = logger.critical if target.severity == "critical" else logger.warning
+                log("告警触发 tenant=%s rule=%s value=%.4f", tenant_id, target.name, value)
             else:
                 inc = open_incidents[0]
                 await repo.update_alert_incident(
@@ -310,17 +406,27 @@ async def _related_trace_ids(db, tenant_id: str, metric: str) -> list[str]:
     from ..storage.models import AgentSpan
 
     if metric == "tool_error_rate":
-        stmt = select(AgentSpan.trace_id).where(
-            AgentSpan.tenant_id == tenant_id,
-            AgentSpan.span_type == "tool",
-            AgentSpan.status == "error",
-        ).order_by(AgentSpan.started_at.desc()).limit(5)
+        stmt = (
+            select(AgentSpan.trace_id)
+            .where(
+                AgentSpan.tenant_id == tenant_id,
+                AgentSpan.span_type == "tool",
+                AgentSpan.status == "error",
+            )
+            .order_by(AgentSpan.started_at.desc())
+            .limit(5)
+        )
     else:
-        stmt = select(AgentSpan.trace_id).where(
-            AgentSpan.tenant_id == tenant_id,
-            AgentSpan.span_type == "root",
-            AgentSpan.status.in_(["error", "timeout", "canceled"]),
-        ).order_by(AgentSpan.started_at.desc()).limit(5)
+        stmt = (
+            select(AgentSpan.trace_id)
+            .where(
+                AgentSpan.tenant_id == tenant_id,
+                AgentSpan.span_type == "root",
+                AgentSpan.status.in_(["error", "timeout", "canceled"]),
+            )
+            .order_by(AgentSpan.started_at.desc())
+            .limit(5)
+        )
     return list((await db.execute(stmt)).scalars().all())
 
 

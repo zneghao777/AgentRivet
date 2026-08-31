@@ -109,10 +109,15 @@ def run_step_end(
     )
 
 
-def interrupt_requested(reason: str, state: dict[str, Any]) -> str:
+def interrupt_requested(
+    reason: str,
+    state: dict[str, Any],
+    *,
+    interrupt_id: str | None = None,
+) -> str:
     return sse_frame(
         "interrupt_requested",
-        {"id": _new_id("it"), "reason": reason, "state": state},
+        {"id": interrupt_id or _new_id("it"), "reason": reason, "state": state},
     )
 
 
@@ -127,5 +132,8 @@ def run_end(*, status: str, duration_ms: int, tool_calls: int) -> str:
     )
 
 
-def error(code: int, message: str) -> str:
-    return sse_frame("error", {"code": code, "message": message})
+def error(code: int, message: str, retry_after_ms: int | None = None) -> str:
+    payload: dict[str, Any] = {"code": code, "message": message}
+    if retry_after_ms is not None:
+        payload["retry_after_ms"] = max(0, int(retry_after_ms))
+    return sse_frame("error", payload)

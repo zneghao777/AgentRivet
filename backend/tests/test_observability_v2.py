@@ -7,9 +7,11 @@ import json
 import uuid
 
 import pytest
+from langchain_core.messages import AIMessage, AIMessageChunk
 from sqlalchemy import select
 
 from app.harness.graph_runtime import GraphRuntime
+from app.harness.llm_guard import LLMResponseTimeoutError
 from app.observability import tracing
 from app.storage.db import AsyncSessionLocal
 from app.storage.models import AgentSpan
@@ -107,6 +109,79 @@ def _usage_value(span: AgentSpan, canonical: str, legacy: str) -> int | None:
     return usage.get(canonical, usage.get(legacy))
 
 
+class _EmptyThenTextStreamApp:
+    """Emit an empty provider chunk before the first user-visible token."""
+
+    async def astream_events(self, *_args, **_kwargs):
+        run_id = "llm-empty-then-text"
+        base = {
+            "name": "empty-then-text",
+            "run_id": run_id,
+            "parent_ids": [],
+            "metadata": {"langgraph_node": "agent"},
+        }
+        yield {
+            **base,
+            "event": "on_chat_model_start",
+            "data": {"input": [[("human", "hello")]], "model": MODEL_NAME},
+        }
+        yield {
+            **base,
+            "event": "on_chat_model_stream",
+            "data": {"chunk": AIMessageChunk(content="")},
+        }
+        await asyncio.sleep(0.03)
+        yield {
+            **base,
+            "event": "on_chat_model_stream",
+            "data": {"chunk": AIMessageChunk(content="visible")},
+        }
+        yield {
+            **base,
+            "event": "on_chat_model_end",
+            "data": {
+                "output": AIMessage(
+                    content="visible",
+                    usage_metadata={
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                )
+            },
+        }
+
+
+class _StartThenStallApp:
+    """Start one observable node, then stop producing graph events."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.state_reads = 0
+
+    async def astream_events(self, *_args, **_kwargs):
+        yield {
+            "event": "on_chain_start",
+            "name": "slow_node",
+            "run_id": "slow-node-run",
+            "parent_ids": [],
+            "data": {"input": {"messages": [("human", "hello")]}},
+        }
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        if False:  # pragma: no cover - keep this an async generator
+            yield {}
+
+    async def aget_state(self, *_args, **_kwargs):
+        self.state_reads += 1
+        raise AssertionError("a timed-out run must not wait for a state snapshot")
+
+
 @pytest.mark.asyncio
 async def test_trace_context_and_status_contract(observability_enabled):
     assert hasattr(tracing, "TraceContext")
@@ -155,6 +230,22 @@ async def test_sse_emits_trace_start_with_request_id(observability_enabled):
 
 
 @pytest.mark.asyncio
+async def test_ttft_ignores_empty_provider_chunks(observability_enabled):
+    tenant_id = f"tenant-ttft-{uuid.uuid4().hex}"
+    frames = await _stream(GraphRuntime(_EmptyThenTextStreamApp()), tenant_id)
+
+    updates = _event_payloads(frames, "run_step_update")
+    assert len(updates) == 1
+    assert updates[0]["phase"] == "first_token"
+    assert updates[0]["detail"]["ttft_ms"] >= 20
+
+    spans = await _tenant_spans(tenant_id)
+    llm = next(span for span in spans if span.span_type == "llm")
+    assert llm.ttft_ms is not None
+    assert llm.ttft_ms >= 20
+
+
+@pytest.mark.asyncio
 async def test_sse_emits_stable_auditable_run_steps(observability_enabled):
     frames = await _stream(
         GraphRuntime(build_tool_loop_graph()),
@@ -167,9 +258,7 @@ async def test_sse_emits_stable_auditable_run_steps(observability_enabled):
     assert {item["id"] for item in starts} == {item["id"] for item in ends}
     assert all(item["phase"] == "first_token" for item in updates)
     kind_by_id = {item["id"]: item["kind"] for item in starts}
-    llm_summaries = [
-        item["summary"] for item in ends if kind_by_id[item["id"]] == "llm"
-    ]
+    llm_summaries = [item["summary"] for item in ends if kind_by_id[item["id"]] == "llm"]
     assert any(summary and "observability_lookup" in summary for summary in llm_summaries)
     assert "deterministic final answer" in llm_summaries
     tool_start = _event_payload(frames, "tool_start")
@@ -274,6 +363,173 @@ async def test_timeout_and_error_close_real_graph_spans(observability_enabled, m
     assert any(
         span.status == "error" and span.error for span in error_spans if span.span_type != "root"
     )
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_idle_timeout_cancels_request_and_closes_spans(
+    observability_enabled,
+    monkeypatch,
+):
+    from app.harness import graph_runtime as graph_runtime_module
+
+    app = _StartThenStallApp()
+    request_id = f"request-invoke-timeout-{uuid.uuid4().hex}"
+    tenant_id = f"tenant-invoke-timeout-{uuid.uuid4().hex}"
+    cancelled_request_ids: list[str] = []
+    monkeypatch.setattr(observability_enabled, "AGENT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        graph_runtime_module,
+        "cancel_request",
+        lambda value: cancelled_request_ids.append(value) or 0,
+    )
+
+    with pytest.raises(LLMResponseTimeoutError) as error:
+        await asyncio.wait_for(
+            GraphRuntime(app).ainvoke(
+                f"thread-{uuid.uuid4().hex}",
+                "exercise timeout",
+                tenant_id,
+                "user-v2",
+                [],
+                request_id=request_id,
+            ),
+            timeout=0.2,
+        )
+
+    assert error.value.code == 50402
+    assert error.value.reason == "model_response_timeout"
+    assert cancelled_request_ids == [request_id]
+    assert app.cancelled.is_set()
+    assert app.state_reads == 0
+    spans = await _tenant_spans(tenant_id)
+    assert _root(spans).status == "timeout"
+    assert any(span.status == "timeout" for span in spans if span.span_type != "root")
+
+
+@pytest.mark.asyncio
+async def test_resume_idle_timeout_cancels_request_and_closes_spans(
+    observability_enabled,
+    monkeypatch,
+):
+    from app.harness import graph_runtime as graph_runtime_module
+
+    app = _StartThenStallApp()
+    request_id = f"request-resume-timeout-{uuid.uuid4().hex}"
+    tenant_id = f"tenant-resume-timeout-{uuid.uuid4().hex}"
+    cancelled_request_ids: list[str] = []
+    monkeypatch.setattr(observability_enabled, "AGENT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        graph_runtime_module,
+        "cancel_request",
+        lambda value: cancelled_request_ids.append(value) or 0,
+    )
+
+    async def collect_frames() -> list[str]:
+        return [
+            frame
+            async for frame in GraphRuntime(app).resume(
+                f"thread-{uuid.uuid4().hex}",
+                "approved",
+                tenant_id=tenant_id,
+                user_id="user-v2",
+                request_id=request_id,
+            )
+        ]
+
+    frames = await asyncio.wait_for(collect_frames(), timeout=0.2)
+
+    assert cancelled_request_ids == [request_id]
+    assert app.cancelled.is_set()
+    error = _event_payload(frames, "error")
+    assert error == {
+        "code": 50402,
+        "message": "模型响应超时，请稍后重试",
+        "retry_after_ms": 5000,
+    }
+    assert _event_payload(frames, "run_end")["status"] == "timeout"
+    spans = await _tenant_spans(tenant_id)
+    assert _root(spans).status == "timeout"
+    assert any(span.status == "timeout" for span in spans if span.span_type != "root")
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_cancellation_cancels_request_and_closes_spans(
+    observability_enabled,
+    monkeypatch,
+):
+    from app.harness import graph_runtime as graph_runtime_module
+
+    app = _StartThenStallApp()
+    request_id = f"request-invoke-cancel-{uuid.uuid4().hex}"
+    tenant_id = f"tenant-invoke-cancel-{uuid.uuid4().hex}"
+    cancelled_request_ids: list[str] = []
+    monkeypatch.setattr(observability_enabled, "AGENT_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(
+        graph_runtime_module,
+        "cancel_request",
+        lambda value: cancelled_request_ids.append(value) or 0,
+    )
+    task = asyncio.create_task(
+        GraphRuntime(app).ainvoke(
+            f"thread-{uuid.uuid4().hex}",
+            "exercise cancellation",
+            tenant_id,
+            "user-v2",
+            [],
+            request_id=request_id,
+        )
+    )
+    await asyncio.wait_for(app.started.wait(), timeout=0.2)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cancelled_request_ids == [request_id]
+    assert app.cancelled.is_set()
+    spans = await _tenant_spans(tenant_id)
+    assert _root(spans).status == "canceled"
+    assert any(span.status == "canceled" for span in spans if span.span_type != "root")
+
+
+@pytest.mark.asyncio
+async def test_resume_cancellation_cancels_request_and_closes_spans(
+    observability_enabled,
+    monkeypatch,
+):
+    from app.harness import graph_runtime as graph_runtime_module
+
+    app = _StartThenStallApp()
+    request_id = f"request-resume-cancel-{uuid.uuid4().hex}"
+    tenant_id = f"tenant-resume-cancel-{uuid.uuid4().hex}"
+    cancelled_request_ids: list[str] = []
+    monkeypatch.setattr(observability_enabled, "AGENT_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(
+        graph_runtime_module,
+        "cancel_request",
+        lambda value: cancelled_request_ids.append(value) or 0,
+    )
+    stream = GraphRuntime(app).resume(
+        f"thread-{uuid.uuid4().hex}",
+        "approved",
+        tenant_id=tenant_id,
+        user_id="user-v2",
+        request_id=request_id,
+    )
+    assert _event_payload([await anext(stream)], "trace_start") is not None
+    assert _event_payload([await anext(stream)], "run_step_start") is not None
+    next_frame = asyncio.create_task(anext(stream))
+    await asyncio.wait_for(app.started.wait(), timeout=0.2)
+
+    next_frame.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await next_frame
+
+    assert cancelled_request_ids == [request_id]
+    assert app.cancelled.is_set()
+    spans = await _tenant_spans(tenant_id)
+    assert _root(spans).status == "canceled"
+    assert any(span.status == "canceled" for span in spans if span.span_type != "root")
 
 
 @pytest.mark.asyncio

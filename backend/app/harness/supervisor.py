@@ -13,7 +13,15 @@ from ..config import settings
 from ..observability.metrics import metrics
 from ..tools.registry import ToolRegistry
 from .context import get_tool_context
-from .graph_builder import make_tools_node, resolve_request_tools, should_continue
+from .conversation_context import format_contextual_request, project_conversation_context
+from .graph_builder import (
+    make_tools_node,
+    request_tool_approval,
+    resolve_request_tools,
+    route_after_approval,
+    should_continue,
+)
+from .llm_guard import LLMGuardError
 from .models import TaskCard
 from .orchestration_events import emit
 from .planner import create_plan
@@ -39,6 +47,24 @@ def build_supervisor_graph(tool_reg: ToolRegistry, *, checkpointer=None):
 
     async def router_node(state: dict) -> dict:
         message = _last_user_text(state)
+        conversation_context = project_conversation_context(
+            state.get("messages", []),
+            exclude_latest_user=True,
+        )
+        if state.get("approval_mode") == "manual":
+            payload = {
+                "mode": "direct",
+                "target_agent": "main",
+                "confidence": 1.0,
+                "reason": "请求审批模式使用可恢复的主 Agent 工具环路",
+                "needs_clarification": False,
+            }
+            await emit("orchestration.router_decision", payload)
+            return {
+                "router_decision": payload,
+                "route": "main",
+                "conversation_context": conversation_context,
+            }
         context = get_tool_context()
         candidates = available_agents(
             state.get("tenant_id") or context.tenant_id,
@@ -48,10 +74,15 @@ def build_supervisor_graph(tool_reg: ToolRegistry, *, checkpointer=None):
             message,
             tenant_id=state.get("tenant_id") or context.tenant_id,
             agents=candidates,
+            conversation_context=conversation_context,
         )
         payload = decision.model_dump()
         await emit("orchestration.router_decision", payload)
-        update = {"router_decision": payload, "route": decision.mode}
+        update = {
+            "router_decision": payload,
+            "route": decision.mode,
+            "conversation_context": conversation_context,
+        }
         if decision.needs_clarification:
             clarification = {
                 "question": decision.clarification_question,
@@ -65,7 +96,7 @@ def build_supervisor_graph(tool_reg: ToolRegistry, *, checkpointer=None):
             task = TaskCard(
                 target_agent=decision.target_agent,
                 goal=message,
-                context_brief=message[:2000],
+                context_brief=(conversation_context or message)[-2000:],
                 expected_output="直接回答用户请求",
             )
             update.update(
@@ -81,7 +112,11 @@ def build_supervisor_graph(tool_reg: ToolRegistry, *, checkpointer=None):
             state.get("tenant_id") or context.tenant_id,
             context.orchestration_agents or {},
         )
-        plan = await create_plan(_last_user_text(state), agents=candidates)
+        plan = await create_plan(
+            _last_user_text(state),
+            agents=candidates,
+            conversation_context=state.get("conversation_context", ""),
+        )
         if plan is None:
             logger.warning("Planner 连续失败，降级到 main")
             return {"route": "main", "plan": []}
@@ -153,7 +188,13 @@ def build_supervisor_graph(tool_reg: ToolRegistry, *, checkpointer=None):
         aggregated = aggregate_outputs(
             state.get("verified_outputs") or state.get("agent_outputs", [])
         )
-        answer, degraded = await synthesize(aggregated)
+        answer, degraded = await synthesize(
+            aggregated,
+            request_context=format_contextual_request(
+                _last_user_text(state),
+                state.get("conversation_context", ""),
+            ),
+        )
         if degraded == "all_workers_failed":
             await emit(
                 "orchestration.error",
@@ -172,6 +213,8 @@ def build_supervisor_graph(tool_reg: ToolRegistry, *, checkpointer=None):
         state["_tools"] = [*resolve_request_tools(tools), *dynamic, *delegates]
         try:
             return agent_node(state)
+        except LLMGuardError:
+            raise
         except Exception:  # noqa: BLE001
             logger.exception("main Agent 执行失败")
             answer = "模型服务暂时不可用，请检查模型配置或稍后重试。"
@@ -190,6 +233,7 @@ def build_supervisor_graph(tool_reg: ToolRegistry, *, checkpointer=None):
     graph.add_node("verifier", verifier_node)
     graph.add_node("synthesizer", synthesizer_node)
     graph.add_node("main", main_agent_node)
+    graph.add_node("main_approval", request_tool_approval)
     graph.add_node("main_tools", make_tools_node(tools))
 
     graph.add_edge(START, "router")
@@ -206,7 +250,12 @@ def build_supervisor_graph(tool_reg: ToolRegistry, *, checkpointer=None):
     graph.add_conditional_edges(
         "main",
         should_continue,
-        {"tools": "main_tools", "end": END},
+        {"tools": "main_approval", "end": END},
+    )
+    graph.add_conditional_edges(
+        "main_approval",
+        route_after_approval,
+        {"tools": "main_tools", "agent": "main"},
     )
     graph.add_edge("main_tools", "main")
     graph.add_edge("direct_worker", END)
@@ -219,7 +268,6 @@ def build_supervisor_graph(tool_reg: ToolRegistry, *, checkpointer=None):
 
     return graph.compile(
         checkpointer=checkpointer,
-        interrupt_before=["main_tools"] if settings.GRAPH_INTERRUPT_TOOLS else None,
     )
 
 
@@ -234,6 +282,7 @@ def _dispatch_plan(state: dict):
         "session_id": state.get("session_id", ""),
         "message_id": state.get("message_id"),
         "request_id": state.get("request_id", ""),
+        "conversation_context": state.get("conversation_context", ""),
     }
     return [Send("worker", {**base, "task": task}) for task in state.get("plan", [])]
 

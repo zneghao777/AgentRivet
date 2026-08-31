@@ -22,7 +22,12 @@ async def test_send_message_non_stream(app_client):
 
 
 @pytest.mark.asyncio
-async def test_stream_message(app_client):
+async def test_stream_message(app_client, monkeypatch):
+    from app.api import router_chat
+
+    # 本用例验证旧流式端点的错误落库契约；Run API 默认链路由
+    # test_chat_runs.py 覆盖。
+    monkeypatch.setattr(router_chat.settings, "CHAT_RUN_ENABLED", False)
     resp = await app_client.post("/api/v1/sessions", headers=AUTH, json={})
     session_id = resp.json()["data"]["session_id"]
 
@@ -38,12 +43,14 @@ async def test_stream_message(app_client):
         async for chunk in resp.aiter_text():
             body += chunk
         assert "run_end" in body
+        assert "event: error" in body
 
     history = await app_client.get(
         f"/api/v1/sessions/{session_id}/messages", headers=AUTH
     )
     messages = history.json()["data"]
-    assert [message["role"] for message in messages] == ["user", "assistant"]
+    # 模型错误只保留已提交的用户消息，不持久化伪造 assistant 回复。
+    assert [message["role"] for message in messages] == ["user"]
     assert messages[-1]["content"]
     assert messages[0]["trace_id"]
     assert messages[-1]["trace_id"] == messages[0]["trace_id"]

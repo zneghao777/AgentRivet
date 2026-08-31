@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .api import (
     router_admin,
@@ -18,12 +20,15 @@ from .api import (
     router_mcp,
     router_memory,
     router_observability,
+    router_runs,
     router_sessions,
     router_skills,
     router_tools,
 )
+from .api.rate_limit import install_rate_limiting
 from .config import settings
 from .harness.app_runtime import harness_app
+from .harness.llm_guard import LLMGuardError
 from .memory.cleanup import start_ttl_scan, stop_ttl_scan
 from .observability import audit
 from .observability.aggregation import start_metric_worker, stop_metric_worker
@@ -46,13 +51,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """启动钩子：建表、初始化工具/Skill/Agent、编译图、初始化观测。"""
     # 配置校验
     _validate_config()
+    if settings.GUARD_ENABLED and settings.DEGRADE_ENABLED:
+        from .harness.llm_guard import start_degrade_monitor
+
+        start_degrade_monitor()
+    from .api.router_chat import start_semantic_cache_tasks
+
+    start_semantic_cache_tasks()
 
     # 建表
     await create_tables()
     async with AsyncSessionLocal() as db:
         recovered_tasks = await repo.fail_running_agent_tasks(db)
         if recovered_tasks:
-            logger.warning("已将 %d 个进程重启前的 running AgentTask 标记为 failed", recovered_tasks)
+            logger.warning(
+                "已将 %d 个进程重启前的 running AgentTask 标记为 failed", recovered_tasks
+            )
 
     # KBX：恢复进程中断前已持久化的排队/超时任务。
     if settings.KB_INDEX_JOBS_ENABLED:
@@ -124,6 +138,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         checkpointer = None
     harness_app.build(tool_registry, checkpointer=checkpointer)
 
+    # ChatRun 执行生命周期独立于任何 HTTP Subscriber。
+    if settings.CHAT_RUN_ENABLED:
+        from .harness.chat_run_maintenance import start_chat_run_maintenance
+        from .harness.chat_run_outbox import start_chat_run_outbox
+        from .harness.run_coordinator import run_coordinator
+
+        await run_coordinator.start()
+        start_chat_run_outbox()
+        start_chat_run_maintenance()
+
     # 观测（OBSERVABILITY_SPEC）
     init_tracing(lambda: AsyncSessionLocal())
     audit.init_audit(lambda: AsyncSessionLocal())
@@ -154,6 +178,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # 长期记忆 TTL 过期扫描（后台常驻，MEMORY_SPEC §6.3.1）
     start_ttl_scan()
+    from .harness.guard_metrics_bridge import start_guard_metrics_bridge
+
+    start_guard_metrics_bridge(collect_remote=True)
     # 可观测性：指标聚合 + span 保留清理（OBSERVABILITY_SPEC §2.4/§2.7）
     if settings.OBSERVABILITY_ENABLED:
         start_metric_worker()
@@ -166,6 +193,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await stop_alert_worker()
     await stop_metric_worker()
     await stop_ttl_scan()
+    if settings.CHAT_RUN_ENABLED:
+        from .harness.chat_run_maintenance import stop_chat_run_maintenance
+        from .harness.chat_run_outbox import stop_chat_run_outbox
+        from .harness.run_coordinator import run_coordinator
+
+        await stop_chat_run_maintenance()
+        await stop_chat_run_outbox()
+        await run_coordinator.stop()
+    from .api.router_chat import shutdown_semantic_cache_tasks
+    from .harness.guard_metrics_bridge import stop_guard_metrics_bridge
+    from .harness.llm_guard import close_degrade_monitor
+    from .harness.semantic_cache import semantic_cache
+    from .harness.stream_gate import user_stream_lock
+
+    close_degrade_monitor()
+    await stop_guard_metrics_bridge()
+    await shutdown_semantic_cache_tasks()
+    await semantic_cache.close()
+    await user_stream_lock.close()
     # 采集器 flush（§5.5：进程关闭最多等 5 秒）
     from .observability import tracing
 
@@ -202,6 +248,34 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+@app.exception_handler(LLMGuardError)
+async def llm_guard_error_handler(_request: Request, exc: LLMGuardError) -> JSONResponse:
+    """Expose the same stable guard contract for non-streaming model calls."""
+    if not exc.rejection_recorded:
+        from .observability.metrics import metrics
+
+        metrics.record_guard_rejected(exc.reason)
+        exc.rejection_recorded = True
+    retry_after_ms = exc.retry_after_ms if exc.retry_after_ms is not None else 5_000
+    payload: dict[str, int | str] = {
+        "code": exc.code,
+        "message": str(exc),
+    }
+    headers: dict[str, str] = {}
+    if retry_after_ms is not None:
+        payload["retry_after_ms"] = retry_after_ms
+        headers["Retry-After"] = str(max(1, math.ceil(retry_after_ms / 1000)))
+    return JSONResponse(
+        status_code=504 if exc.code in {50400, 50401, 50402} else 503,
+        content=payload,
+        headers=headers,
+    )
+
+
+# L1 入口限流先安装，随后安装的 CORS 位于外层，确保 429 也携带跨域头。
+install_rate_limiting(app, settings)
+
 # CORS（生产需限制白名单）
 ALLOWED_ORIGINS = ["*"] if settings.APP_ENV != "prod" else []
 app.add_middleware(
@@ -216,6 +290,7 @@ API = settings.API_PREFIX
 app.include_router(router_sessions.router, prefix=API)
 app.include_router(router_agents.router, prefix=API)
 app.include_router(router_chat.router, prefix=API)
+app.include_router(router_runs.router, prefix=API)
 app.include_router(router_skills.router, prefix=API)
 app.include_router(router_tools.router, prefix=API)
 app.include_router(router_knowledge.router, prefix=API)

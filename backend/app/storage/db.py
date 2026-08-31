@@ -42,6 +42,16 @@ async def create_tables() -> None:
         # 确保 pgvector 扩展存在
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
+        # 异步 ChatRun：正式环境使用 Alembic；开发旧库由此幂等补齐 nullable 关联。
+        for ddl in (
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS run_id UUID",
+            "CREATE INDEX IF NOT EXISTS ix_messages_run_id ON messages (run_id)",
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+            "WHERE conname = 'fk_messages_run_id') THEN ALTER TABLE messages "
+            "ADD CONSTRAINT fk_messages_run_id FOREIGN KEY (run_id) "
+            "REFERENCES chat_runs(id); END IF; END $$",
+        ):
+            await conn.execute(text(ddl))
         # MQ 消费幂等：旧库补消息键；唯一索引封住“DB 已提交但 ack 前崩溃”的重复窗口。
         for ddl in (
             "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS mq_message_id VARCHAR(36)",
@@ -65,6 +75,10 @@ async def create_tables() -> None:
             "ALTER TABLE agent_traces ADD COLUMN IF NOT EXISTS agent_id UUID",
             "ALTER TABLE agent_traces ADD COLUMN IF NOT EXISTS agent_name VARCHAR(128)",
             "CREATE INDEX IF NOT EXISTS ix_agent_traces_agent_id ON agent_traces (agent_id)",
+            "ALTER TABLE alert_rules ADD COLUMN IF NOT EXISTS severity "
+            "VARCHAR(16) NOT NULL DEFAULT 'warning'",
+            "ALTER TABLE alert_incidents ADD COLUMN IF NOT EXISTS severity "
+            "VARCHAR(16) NOT NULL DEFAULT 'warning'",
         ):
             await conn.execute(text(ddl))
         # 向量维度迁移：旧库 embedding 为 1536 维（OpenAI），BGE-M3 为 1024 维。

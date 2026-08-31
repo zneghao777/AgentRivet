@@ -3,7 +3,13 @@
 所有配置项必须在此定义，禁止在业务代码中散落读取 os.environ。
 """
 
+import logging
+from typing import Self
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -26,6 +32,82 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.7
     LLM_MAX_TOKENS: int = 4096
     LLM_ALLOWED_BASE_HOSTS: str = "api.deepseek.com"
+
+    # --- 并发防护（CONCURRENCY_GUARD_SPEC）---
+    GUARD_ENABLED: bool = True
+
+    # L3 LLM 闸门与 SSE 排队
+    LLM_MAX_CONCURRENCY: int = 200
+    LLM_BG_MAX_CONCURRENCY: int = 8
+    STREAM_MAX_CONCURRENCY: int = 240
+    LLM_SLOT_WAIT_TIMEOUT_SECONDS: float = 90.0
+    QUEUE_ENABLED: bool = True
+    QUEUE_CAPACITY: int = 50
+    QUEUE_TIMEOUT_SECONDS: float = 30.0
+    QUEUE_POSITION_PUSH_INTERVAL_S: float = 5.0
+    GUARD_OUTCOME_DEADLINE_SECONDS: float = Field(default=60.0, gt=0)
+
+    # L2 会话级单流约束
+    USER_STREAM_LOCK_ENABLED: bool = True
+    USER_STREAM_LOCK_TTL_S: int = 180
+
+    # --- 异步并发会话（ASYNC_CONVERSATION_RUN_SPEC）---
+    # 新前端默认使用 Run API；仅在显式回滚时关闭并使用旧流式端点。
+    CHAT_RUN_ENABLED: bool = True
+    CHAT_RUN_DURABLE_ENABLED: bool = False
+    CHAT_RUN_MAX_ACTIVE_PER_USER: int = Field(default=3, ge=1)
+    CHAT_RUN_MAX_QUEUED_PER_USER: int = Field(default=10, ge=0)
+    CHAT_RUN_MAX_QUEUED_GLOBAL: int = Field(default=10_000, ge=1)
+    CHAT_RUN_MAX_ACTIVE_PER_TENANT: int = Field(default=100, ge=1)
+    CHAT_RUN_TIMEOUT_SECONDS: int = Field(default=900, ge=1)
+    CHAT_RUN_QUEUE_TIMEOUT_SECONDS: int = Field(default=0, ge=0)
+    CHAT_RUN_MAX_ATTEMPTS: int = Field(default=3, ge=1)
+    CHAT_RUN_WORKER_LEASE_SECONDS: int = Field(default=60, ge=4)
+    CHAT_RUN_WORKER_HEARTBEAT_SECONDS: int = Field(default=20, ge=1)
+    CHAT_RUN_APPROVAL_TIMEOUT_SECONDS: int = Field(default=86_400, ge=60)
+    CHAT_RUN_EVENT_RETENTION_DAYS: int = Field(default=7, ge=1)
+    CHAT_RUN_EVENT_BATCH_MS: int = Field(default=50, ge=10, le=500)
+    CHAT_RUN_EVENT_BATCH_CHARS: int = Field(default=512, ge=1)
+    CHAT_RUN_EVENT_POLL_INTERVAL_MS: int = Field(default=1000, ge=100)
+    CHAT_RUN_REDIS_NOTIFY_ENABLED: bool = True
+
+    # L1 入口限流
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_STREAM_PER_KEY: str = "10/minute"
+    RATE_LIMIT_REST_PER_KEY: str = "60/minute"
+    RATE_LIMIT_PER_IP: str = "120/minute"
+    RATE_LIMIT_TRUSTED_PROXY_HOPS: int = 0
+
+    # L4 端点熔断、AIMD 与降级模型
+    CB_ENABLED: bool = True
+    CB_WINDOW_SECONDS: int = 60
+    CB_MIN_SAMPLES: int = 10
+    CB_ERROR_RATE_THRESHOLD: float = 0.5
+    CB_COOLDOWN_SECONDS: int = 30
+    CB_429_ADAPTIVE_ENABLED: bool = True
+    LLM_FALLBACK_MODELS: str = ""
+    LLM_CALL_TIMEOUT_SECONDS: float = 120.0
+
+    # L5 过载降级
+    DEGRADE_ENABLED: bool = True
+    DEGRADE_HIGH_WATERMARK: float = 0.8
+    DEGRADE_LOW_WATERMARK: float = 0.7
+    DEGRADE_ENTER_HOLD_S: int = 60
+    DEGRADE_EXIT_HOLD_S: int = 120
+
+    # 阶段四语义缓存
+    SEMANTIC_CACHE_ENABLED: bool = False
+    SEMANTIC_CACHE_SIMILARITY_THRESHOLD: float = Field(
+        default=0.95,
+        ge=0.95,
+        le=1.0,
+    )
+    SEMANTIC_CACHE_TTL_SECONDS: int = 86_400
+    SEMANTIC_CACHE_MAX_ENTRIES: int = 1_000
+    SEMANTIC_CACHE_OPERATION_TIMEOUT_SECONDS: float = 5.0
+    SEMANTIC_CACHE_STORE_CONCURRENCY: int = 4
+    SEMANTIC_CACHE_MAX_PENDING_STORES: int = 100
+    SEMANTIC_CACHE_SCHEMA_VERSION: str = "v1"
 
     # --- 聊天附件 ---
     CHAT_ATTACHMENT_MAX_SIZE_MB: int = 20
@@ -196,7 +278,8 @@ class Settings(BaseSettings):
     GRAPH_ENABLED: bool = True                  # 图谱总开关
     GRAPH_EXTRACT_MODEL: str = "glm-4-flash"    # 抽取模型（默认低成本模型）
     GRAPH_EXTRACT_BASE_URL: str = "https://open.bigmodel.cn/api/paas/v4"  # 智谱 GLM chat
-    GRAPH_EXTRACT_API_KEY: str = ""             # 智谱 key，空则回退本地 LLM（LLM_BASE_URL/LLM_API_KEY）
+    # 智谱 key，空则回退本地 LLM（LLM_BASE_URL/LLM_API_KEY）
+    GRAPH_EXTRACT_API_KEY: str = ""
     GRAPH_BATCH_SIZE: int = 4                   # 每批合并 chunk 数（小批量提升抽取成功率）
     GRAPH_MAX_ENTITIES_PER_CHUNK: int = 30      # 单 chunk 实体上限（防爆炸）
     GRAPH_ENTITY_VECTOR_MODEL: str = "text-embedding-bge-m3"  # 复用现有向量模型
@@ -253,6 +336,33 @@ class Settings(BaseSettings):
         if self.LANGSMITH_PROJECT and "-" not in self.LANGSMITH_PROJECT:
             return f"{self.APP_NAME}-{self.APP_ENV}"
         return self.LANGSMITH_PROJECT
+
+    @model_validator(mode="after")
+    def warn_guard_capacity_mismatch(self) -> Self:
+        """Warn when configured stream fan-out can exceed the online LLM pool."""
+        if (
+            self.CHAT_RUN_WORKER_HEARTBEAT_SECONDS
+            >= self.CHAT_RUN_WORKER_LEASE_SECONDS / 2
+        ):
+            raise ValueError(
+                "CHAT_RUN_WORKER_HEARTBEAT_SECONDS 必须小于 "
+                "CHAT_RUN_WORKER_LEASE_SECONDS 的一半"
+            )
+        if self.CHAT_RUN_DURABLE_ENABLED and not self.DATABASE_URL.startswith(
+            "postgresql"
+        ):
+            raise ValueError("Durable ChatRun 必须使用 PostgreSQL")
+        parallelism = self.MAX_PARALLEL_WORKERS if self.MULTI_AGENT_ENABLED else 1
+        required_slots = self.STREAM_MAX_CONCURRENCY * parallelism
+        if self.GUARD_ENABLED and required_slots > self.LLM_MAX_CONCURRENCY:
+            logger.warning(
+                "并发防护配置可能失衡：STREAM_MAX_CONCURRENCY(%s) * 并行度(%s) "
+                "> LLM_MAX_CONCURRENCY(%s)",
+                self.STREAM_MAX_CONCURRENCY,
+                parallelism,
+                self.LLM_MAX_CONCURRENCY,
+            )
+        return self
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"

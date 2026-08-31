@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -11,6 +12,8 @@ from ..agents.models import OrchestrationAgent
 from ..config import settings
 from ..observability.metrics import metrics
 from .agent_circuit_breaker import agent_circuit_breaker
+from .conversation_context import format_contextual_request
+from .llm_guard import LLMGuardError
 from .models import RouterDecision
 
 logger = logging.getLogger(__name__)
@@ -21,12 +24,16 @@ ROUTER_SYSTEM_PROMPT = """你是任务路由器。根据用户消息与候选 Ag
 {agent_cards}
 
 # 规则
-1. 只能路由到列出的 Agent；均不合适时 target_agent="main"。
+1. target_agent 必须逐字复制候选的 machine_name，不能拼接 scope；均不合适时使用 "main"。
 2. 任务需要至少两个 Agent 的能力或可拆为独立子任务时 mode="orchestrate"。
 3. confidence < {threshold} 时 needs_clarification=true，并提供问题和最多 3 个选项。
-4. reason 必须引用候选 Agent description 中的具体能力。
+4. 选择专用 Agent 或 orchestrate 时，reason 必须引用候选能力；
+   选择 main 时说明为何应延续普通对话即可。
 5. 单 Agent 能完成的简单任务一律 direct。
-6. 只输出符合 JSON Schema 的 JSON，不要输出 Markdown。
+6. 普通问答、闲聊、工具续接、参数补充、确认或对既有任务的追问，优先 direct 到 main。
+7. 不得仅因候选 Agent 的领域描述猜测用户主题；先根据最近会话上下文消解省略和指代。
+8. 仅当当前请求明确要求多 Agent，或客观上必须由至少两个不同专长协作时才 orchestrate。
+9. 只输出符合 JSON Schema 的 JSON，不要输出 Markdown。
 
 # JSON Schema
 {schema}
@@ -44,12 +51,39 @@ def available_agents(
 
 
 def render_agent_cards(agents: dict[str, OrchestrationAgent]) -> str:
-    cards = ["- main: 通用助手；未找到更合适的专用 Agent 时使用。"]
+    cards = [
+        '- machine_name: "main"\n'
+        '  scope: "system"\n'
+        '  description: "通用助手；未找到更合适的专用 Agent 时使用。"'
+    ]
     cards.extend(
-        f"- {item.name} [{item.scope}]: {item.description}\n  能力: {item.capability_summary}"
-        for item in agents.values()
+        "\n".join(
+            (
+                f"- machine_name: {json.dumps(machine_name, ensure_ascii=False)}",
+                f"  scope: {json.dumps(item.scope, ensure_ascii=False)}",
+                f"  description: {json.dumps(item.description, ensure_ascii=False)}",
+                f"  capabilities: {json.dumps(item.capability_summary, ensure_ascii=False)}",
+            )
+        )
+        for machine_name, item in agents.items()
     )
     return "\n".join(cards)
+
+
+def normalize_agent_name(
+    value: str,
+    agents: dict[str, OrchestrationAgent],
+) -> str:
+    """Normalize only an exact alias emitted by the former ``name [scope]`` prompt."""
+
+    if value in agents:
+        return value
+    matches = [
+        machine_name
+        for machine_name, item in agents.items()
+        if value == f"{item.name} [{item.scope}]"
+    ]
+    return matches[0] if len(matches) == 1 else value
 
 
 async def decide_route(
@@ -57,6 +91,7 @@ async def decide_route(
     *,
     tenant_id: str,
     agents: dict[str, OrchestrationAgent],
+    conversation_context: str = "",
     llm=None,
 ) -> RouterDecision:
     candidates = available_agents(tenant_id, agents)
@@ -83,11 +118,14 @@ async def decide_route(
     for attempt in range(2):
         prompt = [
             SystemMessage(content=system + error_hint),
-            HumanMessage(content=message),
+            HumanMessage(content=format_contextual_request(message, conversation_context)),
         ]
         try:
             response = await model.ainvoke(prompt)
             decision = RouterDecision.model_validate_json(_content(response))
+            normalized_target = normalize_agent_name(decision.target_agent, candidates)
+            if normalized_target != decision.target_agent:
+                decision = decision.model_copy(update={"target_agent": normalized_target})
             if decision.target_agent != "main" and decision.target_agent not in candidates:
                 raise ValueError("target_agent 不在候选列表")
             if decision.confidence < settings.ROUTER_CONFIDENCE_THRESHOLD:
@@ -99,6 +137,8 @@ async def decide_route(
                     decision.clarification_options = list(candidates)[:3]
             metrics.record_orch_router_decision(tenant_id, decision.model_dump())
             return decision
+        except LLMGuardError:
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("Router 输出校验失败 attempt=%d: %s", attempt + 1, exc)
             error_hint = f"\n上一次输出无效：{str(exc)[:300]}。请仅返回合法 JSON。"

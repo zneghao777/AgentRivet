@@ -56,6 +56,11 @@ services:
       APP_ENV: prod
       DATABASE_URL: postgresql+psycopg://harness:${POSTGRES_PASSWORD}@postgres:5432/harness
       REDIS_URL: redis://redis:6379/0
+      # API 和 chat-worker 各保留 45 个 online 槽，总计 90；后台池另行限流。
+      LLM_MAX_CONCURRENCY: "45"
+      LLM_BG_MAX_CONCURRENCY: "4"
+      # backend 仅由同一 compose 内的 Nginx 访问，可信代理链恰好一跳。
+      RATE_LIMIT_TRUSTED_PROXY_HOPS: "1"
       MQ_ENABLED: "true"
       RABBITMQ_URL: amqp://harness:${RABBITMQ_PASSWORD}@rabbitmq:5672/
       RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
@@ -113,6 +118,42 @@ services:
       APP_ENV: prod
       DATABASE_URL: postgresql+psycopg://harness:${POSTGRES_PASSWORD}@postgres:5432/harness
       REDIS_URL: redis://redis:6379/0
+      # session-worker 只允许 background channel；online 设为1作为误用保险。
+      LLM_MAX_CONCURRENCY: "1"
+      LLM_BG_MAX_CONCURRENCY: "4"
+      MQ_ENABLED: "true"
+      RABBITMQ_URL: amqp://harness:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    restart: unless-stopped
+
+  chat-worker:
+    image: ghcr.io/${GHCR_OWNER}/${GHCR_REPO}/backend:latest
+    container_name: harness-chat-worker
+    command: ["python", "-m", "app.workers.chat_worker"]
+    healthcheck:
+      test: ["CMD-SHELL", "ps -o args= 1 | grep -q 'app.workers.chat_worker'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    env_file:
+      - .env.prod
+    environment:
+      APP_ENV: prod
+      DATABASE_URL: postgresql+psycopg://harness:${POSTGRES_PASSWORD}@postgres:5432/harness
+      REDIS_URL: redis://redis:6379/0
+      CHAT_RUN_ENABLED: "true"
+      CHAT_RUN_DURABLE_ENABLED: "true"
+      LLM_MAX_CONCURRENCY: "45"
+      LLM_BG_MAX_CONCURRENCY: "4"
       MQ_ENABLED: "true"
       RABBITMQ_URL: amqp://harness:${RABBITMQ_PASSWORD}@rabbitmq:5672/
     depends_on:

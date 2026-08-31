@@ -203,13 +203,14 @@ def test_build_span_tree():
 @pytest.mark.asyncio
 async def test_traces_list_and_filter(app_client):
     trace_id = f"trace-api-{uuid.uuid4().hex[:6]}"
+    keyword = f"查询关键词-{trace_id}"
     await _write_span(
         trace_id=trace_id,
         span_id=uuid.uuid4().hex[:16],
         span_type="root",
         span_name="agent.run",
         status="error",
-        input_summary="我的查询关键词ABC",
+        input_summary=keyword,
         error="ValueError: boom",
         started_at=_mk_datetime(-1),
     )
@@ -217,7 +218,12 @@ async def test_traces_list_and_filter(app_client):
     resp = await app_client.get(
         "/api/v1/observability/traces",
         headers={"X-API-Key": "test-key-1", "X-Tenant-Id": "tenant-a"},
-        params={"page": 1, "page_size": 10, "status": "error"},
+        params={
+            "page": 1,
+            "page_size": 10,
+            "status": "error",
+            "keyword": keyword,
+        },
     )
     assert resp.status_code == 200
     body = resp.json()["data"]

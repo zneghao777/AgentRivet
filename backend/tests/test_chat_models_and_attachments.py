@@ -87,6 +87,39 @@ async def test_model_connection_allows_custom_endpoint_without_key(app_client, m
     assert response.json()["data"]["connected"] is True
 
 
+@pytest.mark.asyncio
+async def test_model_connection_helper_uses_online_guard(monkeypatch):
+    from app.agents import base_agent
+    from app.api.router_admin import _call_model_connection
+
+    captured: dict = {}
+
+    class FakeLLM:
+        async def ainvoke(self, messages):
+            captured["messages"] = messages
+            return type(
+                "Response",
+                (),
+                {"response_metadata": {"model_name": "resolved-model"}},
+            )()
+
+    def fake_create_llm(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return FakeLLM()
+
+    monkeypatch.setattr(base_agent, "create_llm", fake_create_llm)
+    result = await _call_model_connection(
+        "http://model.test/v1",
+        "requested-model",
+        "provider-key",
+    )
+
+    assert result == {"resolved_model": "resolved-model"}
+    assert captured["kwargs"]["call_channel"] == "online"
+    assert captured["kwargs"]["max_tokens"] == 1
+
+
 def test_custom_model_runtime_config_is_request_scoped(monkeypatch):
     from app.agents import base_agent
     from app.harness.context import ToolContext, reset_tool_context, set_tool_context

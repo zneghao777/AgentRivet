@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import ValidationError
 
 from app.agents.models import OrchestrationAgent
@@ -14,10 +15,11 @@ from app.config import settings
 from app.harness import supervisor
 from app.harness.agent_circuit_breaker import agent_circuit_breaker
 from app.harness.context import ToolContext, reset_tool_context, set_tool_context
+from app.harness.conversation_context import project_conversation_context
 from app.harness.graph_runtime import GraphRuntime
 from app.harness.models import Plan, RouterDecision, TaskCard
 from app.harness.planner import create_plan
-from app.harness.router import decide_route
+from app.harness.router import decide_route, render_agent_cards
 from app.harness.synthesizer import synthesize
 from app.harness.verifier import verify_outputs, verify_result
 from app.harness.worker import execute_task
@@ -31,11 +33,16 @@ class SequenceLlm:
     def __init__(self, outputs: list[str]) -> None:
         self.outputs = outputs
         self.calls = 0
+        self.prompts = []
 
-    async def ainvoke(self, _prompt):
+    async def ainvoke(self, prompt):
+        self.prompts.append(prompt)
         value = self.outputs[min(self.calls, len(self.outputs) - 1)]
         self.calls += 1
         return AIMessage(content=value)
+
+    def bind_tools(self, _tools):
+        return self
 
 
 def _agent(name: str, scope: str = "internal") -> OrchestrationAgent:
@@ -53,6 +60,162 @@ def _agent(name: str, scope: str = "internal") -> OrchestrationAgent:
     )
 
 
+def test_conversation_context_projection_is_recent_bounded_and_tool_aware():
+    messages = [HumanMessage(content=f"旧消息-{index}") for index in range(12)]
+    messages.extend(
+        [
+            AIMessage(
+                content="正在识别快递公司",
+                tool_calls=[
+                    {
+                        "name": "express_lookup",
+                        "args": {"number": "73669911731687"},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content="中通快递，需要手机号后四位",
+                tool_call_id="call-1",
+                name="express_lookup",
+            ),
+            AIMessage(content="请提供手机号后四位"),
+            HumanMessage(content="2030"),
+        ]
+    )
+
+    context = project_conversation_context(
+        messages,
+        exclude_latest_user=True,
+        max_messages=5,
+        max_chars=1000,
+    )
+
+    assert "旧消息-0" not in context
+    assert "express_lookup" in context
+    assert "73669911731687" in context
+    assert "中通快递，需要手机号后四位" in context
+    assert "请提供手机号后四位" in context
+    assert "2030" not in context
+    assert len(context) <= 1000
+
+
+@pytest.mark.asyncio
+async def test_router_receives_recent_conversation_context():
+    llm = SequenceLlm(
+        [
+            '{"mode":"direct","target_agent":"main","confidence":0.95,'
+            '"reason":"这是对现有快递任务的参数补充，应由通用助手继续",'
+            '"needs_clarification":false,"clarification_question":null,'
+            '"clarification_options":[]}'
+        ]
+    )
+
+    decision = await decide_route(
+        "2030",
+        tenant_id="tenant-a",
+        agents={"analyst": _agent("analyst")},
+        conversation_context="- 助手：请提供手机号后四位",
+        llm=llm,
+    )
+
+    prompt = llm.prompts[0][-1].content
+    assert "请提供手机号后四位" in prompt
+    assert "# 当前用户请求\n2030" in prompt
+    assert decision.target_agent == "main"
+    assert decision.needs_clarification is False
+
+
+@pytest.mark.asyncio
+async def test_planner_receives_prior_task_context():
+    llm = SequenceLlm(
+        [
+            '{"tasks":[{"target_agent":"analyst","goal":"分析合同付款风险",'
+            '"context_brief":"付款周期30天，违约金上限10%"}],'
+            '"execution":"parallel","summary":"分析已确认合同约束"}'
+        ]
+    )
+
+    plan = await create_plan(
+        "现在用多 Agent 分析风险",
+        agents={"analyst": _agent("analyst")},
+        conversation_context="- 用户：付款周期30天，违约金上限10%",
+        llm=llm,
+    )
+
+    assert plan is not None
+    assert "付款周期30天，违约金上限10%" in llm.prompts[0][-1].content
+    assert plan.tasks[0].context_brief == "付款周期30天，违约金上限10%"
+
+
+@pytest.mark.asyncio
+async def test_worker_receives_projected_conversation_context(monkeypatch):
+    agent = _agent("analyst")
+    llm = SequenceLlm(["已结合付款周期30天和违约金上限10%完成风险分析。"])
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("app.harness.worker.create_llm", lambda *_args, **_kwargs: llm)
+    monkeypatch.setattr("app.harness.worker._persist_start", noop)
+    monkeypatch.setattr("app.harness.worker._persist_finish", noop)
+    monkeypatch.setattr("app.harness.worker.emit", noop)
+    set_tool_context(
+        ToolContext(tenant_id="tenant-a", orchestration_agents={"analyst": agent})
+    )
+    try:
+        output = await execute_task(
+            {
+                "tenant_id": "tenant-a",
+                "conversation_context": "- 用户：付款周期30天，违约金上限10%",
+            },
+            TaskCard(target_agent="analyst", goal="分析合同风险").model_dump(),
+            [],
+        )
+    finally:
+        reset_tool_context()
+
+    assert output["status"] == "done"
+    assert "付款周期30天，违约金上限10%" in llm.prompts[0][0].content
+
+
+@pytest.mark.asyncio
+async def test_synthesizer_receives_original_conversation_task(monkeypatch):
+    llm = SequenceLlm(["综合结论"])
+    monkeypatch.setattr(
+        "app.harness.synthesizer.create_llm",
+        lambda *_args, **_kwargs: llm,
+    )
+
+    answer, error = await synthesize(
+        {
+            "results": [
+                {
+                    "task_id": "a",
+                    "target_agent": "analyst",
+                    "goal": "分析付款风险",
+                    "status": "done",
+                    "result": "付款风险结果足够完整，可以参与最终综合。",
+                },
+                {
+                    "task_id": "b",
+                    "target_agent": "writer",
+                    "goal": "形成建议",
+                    "status": "done",
+                    "result": "建议结果足够完整，可以参与最终综合。",
+                },
+            ],
+            "failures": [],
+        },
+        request_context="付款周期30天，违约金上限10%",
+    )
+
+    assert answer == "综合结论"
+    assert error is None
+    assert "付款周期30天，违约金上限10%" in llm.prompts[0][-1].content
+
+
 def test_task_models_forbid_extra_fields_and_bound_plan():
     with pytest.raises(ValidationError):
         TaskCard(target_agent="a", goal="x", unexpected=True)
@@ -61,6 +224,14 @@ def test_task_models_forbid_extra_fields_and_bound_plan():
             tasks=[TaskCard(target_agent="a", goal=str(index)) for index in range(6)],
             summary="too many",
         )
+
+
+def test_agent_cards_separate_machine_name_from_scope():
+    cards = render_agent_cards({"analyst": _agent("analyst")})
+
+    assert '- machine_name: "analyst"' in cards
+    assert 'scope: "internal"' in cards
+    assert "analyst [internal]" not in cards
 
 
 @pytest.mark.asyncio
@@ -86,6 +257,50 @@ async def test_router_retries_invalid_json_and_forces_low_confidence_clarificati
 
 
 @pytest.mark.asyncio
+async def test_router_accepts_exact_legacy_agent_display_alias_without_retry():
+    llm = SequenceLlm(
+        [
+            '{"mode":"direct","target_agent":"analyst [internal]",'
+            '"confidence":0.9,"reason":"analyst 负责分析",'
+            '"needs_clarification":false,"clarification_question":null,'
+            '"clarification_options":[]}'
+        ]
+    )
+
+    decision = await decide_route(
+        "分析销售数据",
+        tenant_id="tenant-a",
+        agents={"analyst": _agent("analyst")},
+        llm=llm,
+    )
+
+    assert llm.calls == 1
+    assert decision.target_agent == "analyst"
+
+
+@pytest.mark.asyncio
+async def test_router_does_not_fuzzy_match_legacy_agent_display_alias():
+    invalid = (
+        '{"mode":"direct","target_agent":"analyst [internal] extra",'
+        '"confidence":0.9,"reason":"analyst 负责分析",'
+        '"needs_clarification":false,"clarification_question":null,'
+        '"clarification_options":[]}'
+    )
+    valid = invalid.replace("analyst [internal] extra", "analyst")
+    llm = SequenceLlm([invalid, valid])
+
+    decision = await decide_route(
+        "分析销售数据",
+        tenant_id="tenant-a",
+        agents={"analyst": _agent("analyst")},
+        llm=llm,
+    )
+
+    assert llm.calls == 2
+    assert decision.target_agent == "analyst"
+
+
+@pytest.mark.asyncio
 async def test_planner_retries_unknown_agent_then_returns_valid_plan():
     invalid = (
         '{"tasks":[{"target_agent":"missing","goal":"分析数据"}],'
@@ -102,6 +317,139 @@ async def test_planner_retries_unknown_agent_then_returns_valid_plan():
         agents={"analyst": _agent("analyst")},
         llm=llm,
     )
+    assert plan is not None
+    assert llm.calls == 2
+    assert plan.tasks[0].target_agent == "analyst"
+
+
+@pytest.mark.asyncio
+async def test_planner_accepts_exact_legacy_agent_display_alias_without_retry():
+    llm = SequenceLlm(
+        [
+            '{"tasks":[{"target_agent":"analyst [internal]",'
+            '"goal":"分析数据","context_brief":"销售数据",'
+            '"constraints":[]}],"execution":"parallel","summary":"并行分析"}'
+        ]
+    )
+
+    plan = await create_plan(
+        "分析销售数据",
+        agents={"analyst": _agent("analyst")},
+        llm=llm,
+    )
+
+    assert plan is not None
+    assert llm.calls == 1
+    assert plan.tasks[0].target_agent == "analyst"
+
+
+@pytest.mark.asyncio
+async def test_planner_replaces_invalid_model_task_id_without_retry():
+    model_task_id = "a" * 31
+    llm = SequenceLlm(
+        [
+            '{"tasks":[{"task_id":"'
+            + model_task_id
+            + '","target_agent":"analyst","goal":"分析数据",'
+            '"context_brief":"销售数据","constraints":[]}],'
+            '"execution":"parallel","summary":"并行分析"}'
+        ]
+    )
+
+    plan = await create_plan(
+        "分析销售数据",
+        agents={"analyst": _agent("analyst")},
+        llm=llm,
+    )
+
+    assert plan is not None
+    assert llm.calls == 1
+    generated_id = plan.tasks[0].task_id
+    assert generated_id != model_task_id
+    assert uuid.UUID(generated_id).hex == generated_id
+
+
+@pytest.mark.asyncio
+async def test_planner_replaces_all_model_task_ids_with_unique_server_ids():
+    model_task_ids = {"b" * 32, "c" * 31}
+    llm = SequenceLlm(
+        [
+            json.dumps(
+                {
+                    "tasks": [
+                        {
+                            "task_id": "b" * 32,
+                            "target_agent": "analyst",
+                            "goal": "分析数据",
+                        },
+                        {
+                            "task_id": "c" * 31,
+                            "target_agent": "writer",
+                            "goal": "撰写报告",
+                        },
+                    ],
+                    "execution": "parallel",
+                    "summary": "并行处理",
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+
+    plan = await create_plan(
+        "分析并撰写报告",
+        agents={"analyst": _agent("analyst"), "writer": _agent("writer")},
+        llm=llm,
+    )
+
+    assert plan is not None
+    assert llm.calls == 1
+    generated_ids = [task.task_id for task in plan.tasks]
+    assert len(generated_ids) == len(set(generated_ids)) == 2
+    assert model_task_ids.isdisjoint(generated_ids)
+    assert all(uuid.UUID(value).hex == value for value in generated_ids)
+
+
+@pytest.mark.asyncio
+async def test_planner_still_retries_other_unknown_task_fields():
+    invalid = (
+        '{"tasks":[{"task_id":"not-trusted","target_agent":"analyst",'
+        '"goal":"分析数据","unexpected":"must-fail"}],'
+        '"execution":"parallel","summary":"分析"}'
+    )
+    valid = (
+        '{"tasks":[{"task_id":"also-not-trusted","target_agent":"analyst",'
+        '"goal":"分析数据"}],"execution":"parallel","summary":"分析"}'
+    )
+    llm = SequenceLlm([invalid, valid])
+
+    plan = await create_plan(
+        "分析销售数据",
+        agents={"analyst": _agent("analyst")},
+        llm=llm,
+    )
+
+    assert plan is not None
+    assert llm.calls == 2
+    assert plan.tasks[0].task_id not in {"not-trusted", "also-not-trusted"}
+
+
+@pytest.mark.asyncio
+async def test_planner_does_not_normalize_legacy_alias_with_wrong_scope():
+    invalid = (
+        '{"tasks":[{"target_agent":"analyst [user]","goal":"分析数据",'
+        '"context_brief":"销售数据","constraints":[]}],'
+        '"execution":"parallel","summary":"并行分析"}'
+    )
+    valid = invalid.replace("analyst [user]", "analyst")
+    llm = SequenceLlm([invalid, valid])
+
+    plan = await create_plan(
+        "分析销售数据",
+        agents={"analyst": _agent("analyst")},
+        llm=llm,
+    )
+
     assert plan is not None
     assert llm.calls == 2
     assert plan.tasks[0].target_agent == "analyst"
@@ -205,8 +553,13 @@ async def test_parallel_graph_fanout_and_synthesis(monkeypatch):
     agents = {"analyst": _agent("analyst"), "writer": _agent("writer")}
     active = 0
     max_active = 0
+    route_context = ""
+    plan_context = ""
+    worker_contexts: list[str] = []
 
-    async def route(*_args, **_kwargs):
+    async def route(*_args, **kwargs):
+        nonlocal route_context
+        route_context = kwargs.get("conversation_context", "")
         return RouterDecision(
             mode="orchestrate",
             target_agent="main",
@@ -214,7 +567,9 @@ async def test_parallel_graph_fanout_and_synthesis(monkeypatch):
             reason="analyst 与 writer 分别负责分析和写作",
         )
 
-    async def plan(*_args, **_kwargs):
+    async def plan(*_args, **kwargs):
+        nonlocal plan_context
+        plan_context = kwargs.get("conversation_context", "")
         return Plan(
             tasks=[
                 TaskCard(target_agent="analyst", goal="分析数据"),
@@ -226,6 +581,7 @@ async def test_parallel_graph_fanout_and_synthesis(monkeypatch):
 
     async def worker(_state, task, _tools, **_kwargs):
         nonlocal active, max_active
+        worker_contexts.append(_state.get("conversation_context", ""))
         active += 1
         max_active = max(max_active, active)
         await asyncio.sleep(.02)
@@ -244,7 +600,7 @@ async def test_parallel_graph_fanout_and_synthesis(monkeypatch):
     async def verify(state, _tools):
         return state["agent_outputs"]
 
-    async def synthesize(_aggregated):
+    async def synthesize(_aggregated, **_kwargs):
         return "综合后的最终回答", None
 
     monkeypatch.setattr(supervisor, "decide_route", route)
@@ -256,13 +612,23 @@ async def test_parallel_graph_fanout_and_synthesis(monkeypatch):
     set_tool_context(ToolContext(tenant_id="tenant-a", orchestration_agents=agents))
     try:
         result = await graph.ainvoke(
-            {"messages": [("user", "分析并写报告")], "tenant_id": "tenant-a"}
+            {
+                "messages": [
+                    ("user", "销售额是120万元，成本是80万元"),
+                    ("assistant", "已记录销售与成本数据"),
+                    ("user", "现在请用多 Agent 分析并写报告"),
+                ],
+                "tenant_id": "tenant-a",
+            }
         )
     finally:
         reset_tool_context()
     assert result["final_answer"] == "综合后的最终回答"
     assert len(result["agent_outputs"]) == 2
     assert max_active == 2
+    assert "销售额是120万元，成本是80万元" in route_context
+    assert route_context == plan_context
+    assert worker_contexts == [route_context, route_context]
 
 
 @pytest.mark.asyncio
