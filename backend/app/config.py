@@ -249,8 +249,8 @@ class Settings(BaseSettings):
     RRF_K: int = 60                            # RRF 融合常数（标准 60）
 
     RERANK_ENABLED: bool = True                # Rerank 总开关（服务不可达自动跳过）
-    RERANK_BASE_URL: str = "http://192.168.31.185:1234/v1"   # OpenAI 兼容 /rerank
-    RERANK_MODEL: str = "bge-reranker-v2-m3"
+    RERANK_BASE_URL: str = "http://127.0.0.1:1235/v1"         # 本地 FastAPI /rerank
+    RERANK_MODEL: str = "text-embedding-bge-reranker-v2-m3"
     RERANK_TOP_N: int = 5                      # 精排后返回条数
     RERANK_HTTP_TIMEOUT_SECONDS: int = 30
     RERANK_USE_FLAG_EMBEDDING: bool = False    # 进程内 FlagEmbedding fallback（可选依赖）

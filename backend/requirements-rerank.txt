@@ -1,0 +1,8 @@
+# 独立 macOS Rerank 服务依赖，不并入主后端运行环境。
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2.7,<3
+torch>=2.6
+transformers>=4.48,<6
+sentencepiece>=0.2,<1
+safetensors>=0.4

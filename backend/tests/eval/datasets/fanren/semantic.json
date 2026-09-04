@@ -1,0 +1,67 @@
+[
+  {
+    "query": "韩立捡到的绿色瓶子每隔数日凝成的液滴，可以怎样改变药材？",
+    "expected_chunk_ids": [4600, 4601],
+    "reference_answer": "液滴能显著增加药材年份；直接使用可把普通药材催生成百年药材，重复滴加还能继续提升年份。"
+  },
+  {
+    "query": "韩立十岁时，哪位亲属给了他走出山村、参加江湖门派选拔的机会？",
+    "expected_chunk_ids": [4528, 4529],
+    "reference_answer": "他的亲三叔。"
+  },
+  {
+    "query": "七玄门那位医师培养韩立达到功法第四层，背后的真正目的是什么？",
+    "expected_chunk_ids": [4698],
+    "reference_answer": "他要培养一个身具灵根、已有法力的肉身，再通过夺舍重获新生。"
+  },
+  {
+    "query": "从金光上人处得到的黑色令牌，最终让韩立进入了哪个修仙宗门？",
+    "expected_chunk_ids": [4950, 4959],
+    "reference_answer": "黄枫谷。"
+  },
+  {
+    "query": "为了减少与各派弟子争斗并得到炼丹主药，韩立在禁地中采用了什么采药策略？",
+    "expected_chunk_ids": [5147],
+    "reference_answer": "他优先采集别人不重视的灵药幼苗，带出禁地后再用小瓶绿液催熟。"
+  },
+  {
+    "query": "血色试炼地下洞窟中的女修，猎杀蛟类后为何保留其元神？",
+    "expected_chunk_ids": [6128],
+    "reference_answer": "她想把蛟类元神封入法宝，作为器灵。"
+  },
+  {
+    "query": "哪套秘术能强化神识，并让修士同时操纵大量机关傀儡？",
+    "expected_chunk_ids": [5290, 5421, 5422],
+    "reference_answer": "大衍诀。"
+  },
+  {
+    "query": "藏在祭坛洞底、连元婴都能炼化的至阴至寒之火叫什么？",
+    "expected_chunk_ids": [6282, 6326, 7849, 8732, 8778],
+    "reference_answer": "乾蓝冰焰。"
+  },
+  {
+    "query": "由上古巨鸟骨翅和其他灵禽材料炼成、兼具风雷之力的宝物是什么？",
+    "expected_chunk_ids": [6543, 6558],
+    "reference_answer": "风雷翅。"
+  },
+  {
+    "query": "韩立用来吞噬鬼物、能从鼻中喷出霞光的灵兽是什么？",
+    "expected_chunk_ids": [6122, 7523, 9674, 9908, 10151],
+    "reference_answer": "啼魂兽。"
+  },
+  {
+    "query": "韩立花费二十多年炼成的成套飞剑共有多少口，叫什么名字？",
+    "expected_chunk_ids": [6022, 10235, 10438, 10923],
+    "reference_answer": "共有七十二口，名为青竹蜂云剑。"
+  },
+  {
+    "query": "星宫双圣修炼某种神光到最后一步失败，缺少的关键资质是什么？",
+    "expected_chunk_ids": [8896],
+    "reference_answer": "他们缺少五行灵根；该功法修炼到最后一步要求修士身具完整五行灵根。"
+  },
+  {
+    "query": "陪伴韩立的白狐器灵自称来自哪个族群？",
+    "expected_chunk_ids": [7188],
+    "reference_answer": "银月狼族。"
+  }
+]

@@ -161,6 +161,51 @@ MCP_STDIO_ENABLED=false
 `knowledge_index_jobs`；应用重启后会恢复排队任务，并将超时任务重新置为
 可处理状态。
 
+#### macOS 本地 Rerank 服务
+
+Apple Silicon 开发机使用独立 FastAPI 进程加载
+`BAAI/bge-reranker-v2-m3`。该服务通过 MPS 执行 Cross-Encoder 推理，
+并提供主后端直接兼容的 `/v1/models` 和 `/v1/rerank` 接口。
+
+使用统一开发脚本时，Rerank 服务会和前后端一起启动：
+
+```bash
+./start.sh start
+```
+
+首次启动会创建 `backend/.venv-rerank` 并下载模型权重。统一脚本会等待模型
+加载完成，再启动主后端。你可以在其他终端检查全部服务状态：
+
+```bash
+./start.sh status
+curl http://127.0.0.1:1235/v1/models
+```
+
+默认后端配置为：
+
+```env
+RERANK_ENABLED=true
+RERANK_BASE_URL=http://127.0.0.1:1235/v1
+RERANK_MODEL=text-embedding-bge-reranker-v2-m3
+RERANK_USE_FLAG_EMBEDDING=false
+```
+
+`./start.sh stop` 和 `Ctrl+C` 都会同时停止前端、后端、Worker 和 Reranker。
+如果你只想管理 Rerank 服务，可以继续使用独立脚本：
+
+```bash
+./start-reranker.sh start
+./start-reranker.sh stop
+./start-reranker.sh foreground
+```
+
+可通过 `RERANK_SERVER_DEVICE=cpu` 强制使用 CPU，或通过
+`RERANK_SERVER_BATCH_SIZE` 和 `RERANK_SERVER_MAX_LENGTH` 调整内存占用。
+如果不需要本地 Reranker，可执行 `START_RERANKER=false ./start.sh start`。
+服务默认只监听 `127.0.0.1`；需要让局域网内其他机器访问时，可设置
+`RERANK_SERVER_HOST=0.0.0.0`，并通过 macOS 防火墙限制来源。
+修改主后端 `.env` 后必须重启主后端进程。
+
 ### 索引模式与 Graph RAG
 
 Graph RAG 是标准文本索引的增强通道，不是另一套互斥的知识库产品。创建

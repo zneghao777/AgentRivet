@@ -4,11 +4,11 @@
 #   - Docker 仅启动 PostgreSQL / Redis / RabbitMQ 基础设施
 #   - 自动生成 backend/.env（含 LLM_API_KEY，缺失时自动填充）
 #   - 自动安装缺失依赖（venv / node_modules）
-#   - 本机启动后端、前端、obs-worker、session-worker
+#   - 本机启动 reranker、后端、前端、obs-worker、session-worker
 #
 # 用法:
-#   ./start.sh         一键启动前后端
-#   ./start.sh stop    停止已启动的前后端
+#   ./start.sh         一键启动前后端与 reranker
+#   ./start.sh stop    停止已启动的本地应用进程
 #   ./start.sh status  查看运行状态
 # =============================================================================
 
@@ -24,6 +24,7 @@ BACKEND_LOG="$LOG_DIR/backend-$TS.log"
 FRONTEND_LOG="$LOG_DIR/frontend-$TS.log"
 OBS_WORKER_LOG="$LOG_DIR/obs-worker-$TS.log"
 SESSION_WORKER_LOG="$LOG_DIR/session-worker-$TS.log"
+RERANKER_LOG="$LOG_DIR/reranker-$TS.log"
 MAIN_LOG="$LOG_DIR/start-$TS.log"
 
 COMPOSE_FILE="$ROOT_DIR/deploy/docker-compose.yml"
@@ -31,10 +32,15 @@ BACKEND_PID_FILE="$LOG_DIR/backend.pid"
 FRONTEND_PID_FILE="$LOG_DIR/frontend.pid"
 OBS_WORKER_PID_FILE="$LOG_DIR/obs-worker.pid"
 SESSION_WORKER_PID_FILE="$LOG_DIR/session-worker.pid"
+RERANKER_PID_FILE="$LOG_DIR/reranker.pid"
 STOP_REQUEST_FILE="$LOG_DIR/stop.requested"
 
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+RERANKER_PORT="${RERANKER_PORT:-1235}"
+RERANKER_READY_TIMEOUT_SECONDS="${RERANKER_READY_TIMEOUT_SECONDS:-600}"
+START_RERANKER="${START_RERANKER:-true}"
+RERANKER_MODEL="${RERANK_SERVER_SERVED_MODEL_NAME:-text-embedding-bge-reranker-v2-m3}"
 
 # ============================ 数据库配置 ============================
 PG_HOST="${PG_HOST:-127.0.0.1}"
@@ -86,9 +92,11 @@ BACKEND_PID=""
 FRONTEND_PID=""
 OBS_WORKER_PID=""
 SESSION_WORKER_PID=""
+RERANKER_PID=""
 
 is_port_listening() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
 port_pid() { lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | tr '\n' ' '; }
+reranker_enabled() { [ "$START_RERANKER" != "false" ] && [ "$START_RERANKER" != "0" ]; }
 
 # ============================ 1. 前置检查 ============================
 check_prereqs() {
@@ -248,6 +256,15 @@ ensure_backend_env() {
     "http://127.0.0.1:$RABBITMQ_MANAGEMENT_PORT"
   ok "本地 MQ 配置已启用，应用进程将连接宿主机映射端口"
 
+  if reranker_enabled; then
+    set_env_value "$env_file" "RERANK_ENABLED" "true"
+    set_env_value "$env_file" "RERANK_BASE_URL" \
+      "http://127.0.0.1:$RERANKER_PORT/v1"
+    set_env_value "$env_file" "RERANK_MODEL" "$RERANKER_MODEL"
+    set_env_value "$env_file" "RERANK_USE_FLAG_EMBEDDING" "false"
+    ok "本地 Rerank 配置已启用: $RERANKER_MODEL@$RERANKER_PORT"
+  fi
+
   info "关键配置: LLM_MODEL=$LLM_MODEL | LLM_BASE_URL=$LLM_BASE_URL | DATABASE_URL=$(grep '^DATABASE_URL=' "$env_file" | cut -d= -f2)"
 }
 
@@ -309,6 +326,7 @@ stop_existing() {
   stop_pid_file "前端" "$FRONTEND_PID_FILE"
   stop_pid_file "观测 Worker" "$OBS_WORKER_PID_FILE"
   stop_pid_file "会话 Worker" "$SESSION_WORKER_PID_FILE"
+  stop_pid_file "Reranker" "$RERANKER_PID_FILE"
   if is_port_listening "$BACKEND_PORT"; then
     warn "端口 $BACKEND_PORT 被占用 (PID: $(port_pid "$BACKEND_PORT"))，正在停止旧后端..."
     kill $(port_pid "$BACKEND_PORT") 2>/dev/null
@@ -319,10 +337,50 @@ stop_existing() {
     kill $(port_pid "$FRONTEND_PORT") 2>/dev/null
     sleep 1
   fi
+  if is_port_listening "$RERANKER_PORT"; then
+    warn "端口 $RERANKER_PORT 被占用 (PID: $(port_pid "$RERANKER_PORT"))，正在停止旧 Reranker..."
+    kill $(port_pid "$RERANKER_PORT") 2>/dev/null
+    sleep 1
+  fi
   ok "端口已就绪"
 }
 
-# ============================ 7. 启动本地后端 ============================
+# ============================ 7. 启动本地 Reranker ============================
+start_reranker() {
+  info "===== 启动 Reranker (FastAPI :$RERANKER_PORT) ====="
+  info "日志: $RERANKER_LOG"
+  (
+    cd "$ROOT_DIR"
+    RERANK_SERVER_PORT="$RERANKER_PORT" exec "$ROOT_DIR/start-reranker.sh" foreground
+  ) > >(while IFS= read -r line; do
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" | tee -a "$RERANKER_LOG"
+  done) 2>&1 &
+  RERANKER_PID=$!
+  printf '%s\n' "$RERANKER_PID" >"$RERANKER_PID_FILE"
+}
+
+wait_reranker_ready() {
+  info "等待 Reranker 模型加载..."
+  local elapsed
+  for elapsed in $(seq 1 "$RERANKER_READY_TIMEOUT_SECONDS"); do
+    if curl -sf "http://127.0.0.1:$RERANKER_PORT/health" >/dev/null 2>&1; then
+      ok "Reranker 已就绪: http://127.0.0.1:$RERANKER_PORT/health"
+      return 0
+    fi
+    if ! kill -0 "$RERANKER_PID" >/dev/null 2>&1; then
+      error "Reranker 进程已退出，请查看日志: $RERANKER_LOG"
+      return 1
+    fi
+    if [ $((elapsed % 30)) -eq 0 ]; then
+      info "Reranker 仍在加载（已等待 ${elapsed}s）..."
+    fi
+    sleep 1
+  done
+  error "Reranker 启动超时，请查看日志: $RERANKER_LOG"
+  return 1
+}
+
+# ============================ 8. 启动本地后端 ============================
 start_backend() {
   info "===== 启动后端 (uvicorn :$BACKEND_PORT) ====="
   info "环境配置: $BACKEND_DIR/.env"
@@ -352,7 +410,7 @@ wait_backend_ready() {
   return 1
 }
 
-# ============================ 8. 启动本地 Worker ============================
+# ============================ 9. 启动本地 Worker ============================
 start_workers() {
   info "===== 启动观测 Worker ====="
   info "日志: $OBS_WORKER_LOG"
@@ -402,7 +460,7 @@ wait_workers_ready() {
   return 1
 }
 
-# ============================ 9. 启动本地前端 ============================
+# ============================ 10. 启动本地前端 ============================
 start_frontend() {
   info "===== 启动前端 (vite :$FRONTEND_PORT) ====="
   info "日志: $FRONTEND_LOG"
@@ -442,9 +500,11 @@ cleanup() {
   stop_pid_file "前端" "$FRONTEND_PID_FILE"
   stop_pid_file "观测 Worker" "$OBS_WORKER_PID_FILE"
   stop_pid_file "会话 Worker" "$SESSION_WORKER_PID_FILE"
+  stop_pid_file "Reranker" "$RERANKER_PID_FILE"
   # 兜底：清理残留监听进程
   if is_port_listening "$BACKEND_PORT"; then kill $(port_pid "$BACKEND_PORT") 2>/dev/null; fi
   if is_port_listening "$FRONTEND_PORT"; then kill $(port_pid "$FRONTEND_PORT") 2>/dev/null; fi
+  if is_port_listening "$RERANKER_PORT"; then kill $(port_pid "$RERANKER_PORT") 2>/dev/null; fi
   rm -f "$STOP_REQUEST_FILE"
   ok "全部服务已停止，日志目录: $LOG_DIR"
   exit 0
@@ -457,11 +517,15 @@ stop_all() {
   stop_pid_file "前端" "$FRONTEND_PID_FILE"
   stop_pid_file "观测 Worker" "$OBS_WORKER_PID_FILE"
   stop_pid_file "会话 Worker" "$SESSION_WORKER_PID_FILE"
+  stop_pid_file "Reranker" "$RERANKER_PID_FILE"
   if is_port_listening "$BACKEND_PORT"; then
     kill $(port_pid "$BACKEND_PORT") 2>/dev/null || true
   fi
   if is_port_listening "$FRONTEND_PORT"; then
     kill $(port_pid "$FRONTEND_PORT") 2>/dev/null || true
+  fi
+  if is_port_listening "$RERANKER_PORT"; then
+    kill $(port_pid "$RERANKER_PORT") 2>/dev/null || true
   fi
   ok "本地应用进程已停止；PostgreSQL / Redis / RabbitMQ 保持运行"
 }
@@ -477,6 +541,11 @@ show_status() {
     ok "前端  运行中  http://127.0.0.1:$FRONTEND_PORT  (PID: $(port_pid "$FRONTEND_PORT"))"
   else
     warn "前端  未运行"
+  fi
+  if is_port_listening "$RERANKER_PORT"; then
+    ok "Reranker 运行中  http://127.0.0.1:$RERANKER_PORT  (PID: $(port_pid "$RERANKER_PORT"))"
+  else
+    warn "Reranker 未运行"
   fi
   if pid_file_running "$OBS_WORKER_PID_FILE"; then
     ok "obs-worker      运行中 (PID: $(cat "$OBS_WORKER_PID_FILE"))"
@@ -512,6 +581,12 @@ main() {
   ensure_dependencies || exit 1
   stop_existing
 
+  if reranker_enabled; then
+    start_reranker
+    wait_reranker_ready || exit 1
+  else
+    warn "已通过 START_RERANKER=$START_RERANKER 跳过本地 Reranker"
+  fi
   start_backend
   wait_backend_ready || exit 1
   start_workers
@@ -524,12 +599,18 @@ main() {
   ok "前端工作台:  ${C_GREEN}http://localhost:$FRONTEND_PORT${C_RESET}"
   ok "后端 API:    ${C_GREEN}http://localhost:$BACKEND_PORT/api/v1/health${C_RESET}"
   ok "API 文档:    ${C_GREEN}http://localhost:$BACKEND_PORT/docs${C_RESET}"
+  if reranker_enabled; then
+    ok "Reranker:    ${C_GREEN}http://localhost:$RERANKER_PORT/health${C_RESET}"
+  fi
   ok "RabbitMQ:    ${C_GREEN}http://localhost:$RABBITMQ_MANAGEMENT_PORT${C_RESET} (harness / harness)"
   ok "API Key:     sk-dev-key-1 (header: X-API-Key)"
   ok "后端日志: $BACKEND_LOG"
   ok "前端日志: $FRONTEND_LOG"
   ok "观测 Worker 日志: $OBS_WORKER_LOG"
   ok "会话 Worker 日志: $SESSION_WORKER_LOG"
+  if reranker_enabled; then
+    ok "Reranker 日志: $RERANKER_LOG"
+  fi
   ok "按 Ctrl+C 停止全部服务"
   echo ""
 
@@ -549,6 +630,11 @@ main() {
     fi
     if ! kill -0 "$SESSION_WORKER_PID" 2>/dev/null; then
       error "session-worker 已退出，请查看日志: $SESSION_WORKER_LOG"
+      exit 1
+    fi
+    if reranker_enabled && ! kill -0 "$RERANKER_PID" 2>/dev/null \
+      && ! is_port_listening "$RERANKER_PORT"; then
+      error "Reranker 已退出，请查看日志: $RERANKER_LOG"
       exit 1
     fi
     sleep 2

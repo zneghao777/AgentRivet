@@ -1,0 +1,67 @@
+[
+  {
+    "query": "神秘小瓶产生的绿液如何催熟草药？",
+    "expected_chunk_ids": [4597, 4600, 4601],
+    "reference_answer": "绿液能快速增加药材年份；直接滴在药材上时，一滴可把普通药材催生成约百年药材，重复使用还能继续增加年份。"
+  },
+  {
+    "query": "是谁举荐韩立参加七玄门的内门弟子测试？",
+    "expected_chunk_ids": [4528, 4529],
+    "reference_answer": "韩立的亲三叔举荐了他。"
+  },
+  {
+    "query": "墨大夫为什么要寻找有灵根且能修炼长春功的童子？",
+    "expected_chunk_ids": [4698],
+    "reference_answer": "墨大夫想等童子修炼出法力后对其夺舍，以摆脱衰老并重获新生。"
+  },
+  {
+    "query": "韩立手中的升仙令是哪一门派发出的？",
+    "expected_chunk_ids": [4950],
+    "reference_answer": "这枚升仙令由黄枫谷发出。"
+  },
+  {
+    "query": "韩立在血色禁地为何重点采集尚未成熟的灵药幼苗？",
+    "expected_chunk_ids": [5147],
+    "reference_answer": "幼苗争夺较少，能减少与其他弟子的冲突；带回后还可用小瓶绿液催熟，作为筑基丹主药。"
+  },
+  {
+    "query": "南宫婉取走墨蛟元神的用途是什么？",
+    "expected_chunk_ids": [6128],
+    "reference_answer": "她准备把墨蛟元神用于封印法宝器灵。"
+  },
+  {
+    "query": "韩立被哪位结丹修士收为记名弟子？",
+    "expected_chunk_ids": [5211, 5216, 5287],
+    "reference_answer": "李化元收韩立为记名弟子。"
+  },
+  {
+    "query": "韩立炼制的七十二口本命法宝叫什么？",
+    "expected_chunk_ids": [6022, 10235, 10438, 10923],
+    "reference_answer": "这套本命法宝叫青竹蜂云剑。"
+  },
+  {
+    "query": "大衍诀的核心作用是什么？",
+    "expected_chunk_ids": [5290, 5421, 5422],
+    "reference_answer": "大衍诀用于强化神识和修炼分神之术，使修士能把神识附在多个傀儡上并同时操纵它们。"
+  },
+  {
+    "query": "虚天鼎周围的蓝色寒焰叫什么？",
+    "expected_chunk_ids": [6282, 6326, 7849, 8732, 8778],
+    "reference_answer": "它叫乾蓝冰焰，是至阴至寒之火。"
+  },
+  {
+    "query": "风雷翅主要以什么遗骸为核心材料炼制？",
+    "expected_chunk_ids": [6543, 6558],
+    "reference_answer": "风雷翅以化形末期雷鹏的骨翅为核心，再加入其他灵禽材料并融合风雷之力炼成。"
+  },
+  {
+    "query": "噬金虫的天赋特性是什么？",
+    "expected_chunk_ids": [5912, 6044, 6650, 7331, 11165],
+    "reference_answer": "噬金虫具有无物不噬的吞噬天赋。"
+  },
+  {
+    "query": "啼魂兽对阴魂有什么天生神通？",
+    "expected_chunk_ids": [6122, 7523, 9674, 9908, 10151],
+    "reference_answer": "啼魂兽能从鼻中喷出霞光，摄取并吞噬阴魂，对普通阴魂尤其克制。"
+  }
+]
