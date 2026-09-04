@@ -329,7 +329,7 @@ class RunCoordinator:
                 return
 
     async def _run_graph(self, run) -> None:
-        from ..api.router_chat import _retrieve_memory_context
+        from ..api.router_chat import _retrieve_memory_context, _schedule_memory_extract
         from ..chat.attachments import prepare_attachments
         from ..harness.app_runtime import harness_app
         from ..knowledge.service import knowledge_service
@@ -348,19 +348,35 @@ class RunCoordinator:
         }
         async with AsyncSessionLocal() as db:
             session = await repo.get_session(db, run.session_id)
-            if session is None or session.status == "deleted":
+            if (
+                session is None
+                or session.status == "deleted"
+                or session.tenant_id != run.tenant_id
+            ):
                 raise RuntimeError("session not found")
+            # Run.user_id 在匿名模式下是 API Key 的配额/鉴权主体。
+            # 业务上下文必须沿用会话用户，与旧聊天接口及 /memory 的归属一致。
+            user_id = session.user_id
             dynamic_tools = await mcp_manager.resolve_tools(
                 db,
                 tenant_id=run.tenant_id,
                 requested_capability_ids=requested_capability_ids or None,
             )
+            # Run 快照只保存能力 ID；每次执行（含审批恢复）重新装载 Worker 工具。
+            # 使用各 Agent 的授权集合，空集合不得回退为租户全部工具。
+            for agent in orchestration_agents.values():
+                if agent.allowed_capability_ids:
+                    agent.dynamic_tools = await mcp_manager.resolve_tools(
+                        db,
+                        tenant_id=run.tenant_id,
+                        requested_capability_ids=agent.allowed_capability_ids,
+                    )
             memory_context = ""
             if resolved_agent.memory_enabled:
                 memory_context = await _retrieve_memory_context(
                     db,
                     tenant_id=run.tenant_id,
-                    user_id=run.user_id,
+                    user_id=user_id,
                     query=str(payload.get("message") or ""),
                 )
             # 名称快照用于审计；执行时只解析创建阶段已允许的知识库名称。
@@ -382,7 +398,7 @@ class RunCoordinator:
         )
         context = ToolContext(
             tenant_id=run.tenant_id,
-            user_id=run.user_id,
+            user_id=user_id,
             allowed_kb_ids=allowed_kb_ids,
             dynamic_tools=dynamic_tools,
             model_id=payload.get("model") or settings.LLM_MODEL,
@@ -420,7 +436,7 @@ class RunCoordinator:
                     str(resume_command.get("input") or ""),
                     str(resume_command.get("decision") or "reject"),
                     tenant_id=run.tenant_id,
-                    user_id=run.user_id,
+                    user_id=user_id,
                     session_id=str(run.session_id),
                     request_id=run.request_id,
                     link_trace_id=run.trace_id,
@@ -431,7 +447,7 @@ class RunCoordinator:
                     session.thread_id,
                     str(payload.get("message") or ""),
                     run.tenant_id,
-                    run.user_id,
+                    user_id,
                     list(payload.get("skills") or []),
                     session_id=str(run.session_id),
                     memory_context=memory_context,
@@ -491,6 +507,17 @@ class RunCoordinator:
                 duration_ms=duration_ms,
                 tool_calls=tool_calls,
             )
+            # 只在回复及成功终态提交后提炼；审批恢复仍使用原始用户请求。
+            # 复用 MQ 发布与进程内降级，不阻塞回复，也不依赖 SSE 订阅者。
+            if resolved_agent.memory_enabled:
+                _schedule_memory_extract(
+                    tenant_id=run.tenant_id,
+                    user_id=user_id,
+                    user_msg=str(payload.get("message") or ""),
+                    assistant_msg=reply,
+                    session_id=run.session_id,
+                    session_title=session.title,
+                )
             if trace_id:
                 await repo.link_messages_to_trace(
                     db, request_id=run.request_id, trace_id=trace_id
