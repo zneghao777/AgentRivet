@@ -1,6 +1,6 @@
-# MyAgentDemo1 — Agent Harness
+# AgentRivet — Agent Harness
 
-MyAgentDemo1 是一个面向企业内部 Agent 应用的全栈开发底座。项目把
+AgentRivet 是一个面向企业内部 Agent 应用的全栈开发底座。项目把
 LangGraph Agent 运行时、会话与流式对话、工具和 Skill、MCP、RAG 与
 Graph RAG、长期记忆、本地可观测性，以及治理能力组合在同一套可运行的
 FastAPI + React 工作台中。
@@ -304,7 +304,7 @@ LLM 与 Embedding 接口遵循 OpenAI 兼容调用方式；Rerank 服务需要�
 仓库按运行职责划分。以下目录是二次开发时最常访问的入口。
 
 ```text
-MyAgentDemo1/
+AgentRivet/
 ├── backend/
 │   ├── app/
 │   │   ├── agents/            # Agent 抽象、注册表和演示子 Agent
